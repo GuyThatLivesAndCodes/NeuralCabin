@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(node assets/make-icon.js)",
+      "Bash(node tests/run-tests.js)",
+      "Bash(npm install *)",
+      "Bash(node -e \"const {app} = require\\('electron/main'\\); console.log\\('electron main module ok', typeof app\\);\")",
+      "Read(//tmp/**)",
+      "Bash(node_modules/.bin/electron-builder --win --x64)"
+    ]
+  }
+}

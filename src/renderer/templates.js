@@ -66,7 +66,7 @@ window.NC_TEMPLATES = [
       activation: 'gelu',
       dropout: 0.1
     },
-    training: { optimizer: 'adam', learningRate: 0.003, batchSize: 32, epochs: 30, seed: 42 },
+    training: { optimizer: 'adam', learningRate: 0.003, batchSize: 32, epochs: 30, seed: 42, workers: 0 },
     trainingData: { text: DEFAULT_CORPUS() }
   },
   {
@@ -75,7 +75,7 @@ window.NC_TEMPLATES = [
     kind: 'charLM',
     desc: 'Small LM primed on JavaScript-like text. Starting point for a toy coding agent.',
     arch: { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 24, hidden: [96, 96], activation: 'gelu', dropout: 0.1 },
-    training: { optimizer: 'adam', learningRate: 0.002, batchSize: 32, epochs: 40, seed: 11 },
+    training: { optimizer: 'adam', learningRate: 0.002, batchSize: 32, epochs: 40, seed: 11, workers: 0 },
     trainingData: { text: DEFAULT_CODE_CORPUS() }
   },
   {
@@ -83,8 +83,8 @@ window.NC_TEMPLATES = [
     name: 'Chat Assistant (pairs)',
     kind: 'charLM',
     desc: 'Train on JSON pairs like {"user":"…","assistant":"…"}. The app auto-wraps each turn with role tags so the model learns to respond.',
-    arch: { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 48, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true },
-    training: { optimizer: 'adam', learningRate: 0.002, batchSize: 32, epochs: 60, seed: 7 },
+    arch: { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 128, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true },
+    training: { optimizer: 'adam', learningRate: 0.002, batchSize: 32, epochs: 60, seed: 7, workers: 4 },
     trainingData: { samples: DEFAULT_CHAT_PAIRS() }
   }
 ];

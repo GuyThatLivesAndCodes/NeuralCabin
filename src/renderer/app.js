@@ -10,8 +10,23 @@ const state = {
   training: { running: false, history: [], logs: [] },
   apiServers: new Map(), // id -> {port, url}
   apiLogs: [],
-  currentDocId: 'welcome'
+  currentDocId: 'welcome',
+  // Per-network chat sessions for the in-app Inference tab. Keyed by network id
+  // so switching nets doesn't trample running conversations.
+  chatSessions: new Map() // id -> { history: [{role, content}], system: string, busy: bool }
 };
+
+function getChatSession(id) {
+  let s = state.chatSessions.get(id);
+  if (!s) {
+    // editingIndex: null normally; set to a turn index when the user taps
+    // [Edit] on one of their messages, and the chat-log redraws with an
+    // inline textarea in place of that turn's content bubble.
+    s = { history: [], system: '', busy: false, editingIndex: null };
+    state.chatSessions.set(id, s);
+  }
+  return s;
+}
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -193,6 +208,10 @@ function renderNetworksTab(root) {
           <label class="field"><span>Batch size</span><input id="t-bs" type="number" value="${n.training.batchSize}"></label>
           <label class="field"><span>Epochs</span><input id="t-ep" type="number" value="${n.training.epochs}"></label>
           <label class="field"><span>Seed</span><input id="t-seed" type="number" value="${n.training.seed ?? 42}"></label>
+          <label class="field"><span>Workers (parallelism)</span><input id="t-workers" type="number" min="1" value="${n.training.workers ?? 0}"></label>
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>Workers</b> = number of CPU cores to use in parallel. <code>0</code> or <code>1</code> = single-threaded (legacy). Set to your core count for ${n.architecture.kind === 'charLM' ? 'large charLMs' : 'larger models'} — effective batch becomes <code>workers × batch size</code>, gradients are averaged across workers per step.
         </div>
       </div>
 
@@ -369,7 +388,8 @@ async function saveEditor() {
       learningRate: parseFloat($('#t-lr').value),
       batchSize: parseInt($('#t-bs').value),
       epochs: parseInt($('#t-ep').value),
-      seed: parseInt($('#t-seed').value)
+      seed: parseInt($('#t-seed').value),
+      workers: Math.max(0, parseInt($('#t-workers').value) || 0)
     }
   };
   const a = { ...n.architecture };
@@ -561,6 +581,12 @@ function renderInferenceTab(root) {
     return;
   }
   const a = n.architecture;
+  // Chat models get a real conversational UI with running history, not a
+  // single-shot prompt box. Everything else still goes through the simple form.
+  if (a.kind === 'charLM' && a.isChat) {
+    renderChatTab(root, n);
+    return;
+  }
   root.innerHTML = `
     <div class="panel">
       <h2>Inference — ${escapeHtml(n.name)}</h2>
@@ -579,6 +605,268 @@ function renderInferenceTab(root) {
     </div>
   `;
   $('#btn-run').addEventListener('click', runInference);
+}
+
+function renderChatTab(root, n) {
+  const s = getChatSession(n.id);
+  root.innerHTML = `
+    <div class="panel chat-panel">
+      <h2>Chat — ${escapeHtml(n.name)}</h2>
+      <div class="row" style="gap:8px; align-items:flex-end;">
+        <label class="field" style="flex:1;"><span>System prompt (optional, applied to every turn)</span>
+          <input id="chat-system" type="text" value="${escapeHtml(s.system || '')}" placeholder="e.g. You are concise and friendly."></label>
+        <button class="btn" id="chat-reset">Reset chat</button>
+      </div>
+      <div class="section">
+        <h3>Conversation <span class="hint" id="chat-turn-count">${s.history.length} turn(s)</span></h3>
+        <div class="chat-log" id="chat-log"></div>
+      </div>
+      <div class="section">
+        <div class="row" style="gap:8px; align-items:flex-end;">
+          <label class="field" style="flex:1;"><span>Your message</span>
+            <textarea id="chat-input" rows="2" placeholder="Type a message and press Enter (Shift+Enter for newline)…"></textarea></label>
+          <button class="btn primary" id="chat-send">Send</button>
+        </div>
+        <div class="grid-3" style="margin-top:10px;">
+          <label class="field"><span>Max new tokens</span><input id="chat-max" type="number" value="200"></label>
+          <label class="field"><span>Temperature</span><input id="chat-temp" type="number" step="0.1" value="0.8"></label>
+          <label class="field"><span>Top-K (0 = off)</span><input id="chat-topk" type="number" value="0"></label>
+        </div>
+        <div class="hint" style="margin-top:6px;">Each turn includes the running history so the model can keep context. History is truncated from the oldest turn when it would overflow <code>contextLen=${n.architecture.contextLen}</code>.</div>
+      </div>
+    </div>
+  `;
+  redrawChatLog(n.id);
+
+  $('#chat-system').addEventListener('input', (e) => { s.system = e.target.value; });
+  $('#chat-reset').addEventListener('click', () => {
+    confirmModal('Reset chat?', 'Clears the running conversation for this network. The model itself is unchanged.', () => {
+      s.history = [];
+      s.editingIndex = null;
+      redrawChatLog(n.id);
+    });
+  });
+  const send = () => sendChatMessage(n.id);
+  $('#chat-send').addEventListener('click', send);
+  $('#chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+}
+
+function redrawChatLog(id) {
+  const s = getChatSession(id);
+  const log = $('#chat-log');
+  if (!log) return;
+  if (s.history.length === 0 && !s.busy) {
+    log.innerHTML = `<div class="chat-empty">No messages yet — say hi.</div>`;
+  } else {
+    log.innerHTML = s.history.map((t, i) => {
+      // Per-turn action row. Hidden while busy so the user can't queue up
+      // overlapping regenerate/edit requests against an in-flight inference.
+      // - assistant turns get [Regenerate]
+      // - user turns get [Edit]
+      // (We render the buttons even when editingIndex === i; the editor
+      // markup below replaces the content area instead of the buttons.)
+      const actions = (!s.busy && s.editingIndex !== i) ? `
+        <div class="chat-actions">
+          ${t.role === 'assistant' ? `<button class="chat-action-btn" data-act="regenerate" data-idx="${i}" title="Regenerate this reply">↻ Regenerate</button>` : ''}
+          ${t.role === 'user' ? `<button class="chat-action-btn" data-act="edit" data-idx="${i}" title="Edit this message">✎ Edit</button>` : ''}
+        </div>` : '';
+      const isEditing = s.editingIndex === i && t.role === 'user';
+      const contentMarkup = isEditing ? `
+        <div class="chat-edit">
+          <textarea class="chat-edit-input" data-idx="${i}" rows="${Math.min(8, Math.max(2, t.content.split('\n').length))}">${escapeHtml(t.content)}</textarea>
+          <div class="chat-edit-row">
+            <button class="btn primary" data-act="edit-save" data-idx="${i}">Save & regenerate</button>
+            <button class="btn" data-act="edit-cancel" data-idx="${i}">Cancel</button>
+            <span class="hint">Saving truncates later turns and regenerates the assistant reply.</span>
+          </div>
+        </div>
+      ` : `<div class="chat-content">${escapeHtml(t.content)}</div>`;
+      return `
+        <div class="chat-msg chat-msg-${t.role}">
+          <div class="chat-role">${t.role}</div>
+          ${contentMarkup}
+          ${actions}
+        </div>
+      `;
+    }).join('') + (s.busy ? `<div class="chat-msg chat-msg-assistant chat-msg-pending"><div class="chat-role">assistant</div><div class="chat-content">…</div></div>` : '');
+  }
+  // Wire up the per-turn action buttons (event delegation would also work,
+  // but the log is small and we redraw on every change anyway). Single
+  // selector — every actionable button has [data-act], including the
+  // chat-action icons and the inline editor's Save/Cancel.
+  log.querySelectorAll('[data-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const act = btn.dataset.act;
+      const idx = parseInt(btn.dataset.idx, 10);
+      if (act === 'regenerate') regenerateAssistantTurn(id, idx);
+      else if (act === 'edit') beginEditUserTurn(id, idx);
+      else if (act === 'edit-save') commitEditUserTurn(id, idx);
+      else if (act === 'edit-cancel') cancelEditUserTurn(id);
+    });
+  });
+  // Auto-focus the editor textarea when entering edit mode.
+  const activeEditor = log.querySelector('.chat-edit-input');
+  if (activeEditor) {
+    activeEditor.focus();
+    // Place cursor at end of text rather than highlighting the whole thing.
+    const v = activeEditor.value; activeEditor.value = ''; activeEditor.value = v;
+  }
+  log.scrollTop = log.scrollHeight;
+  const counter = $('#chat-turn-count');
+  if (counter) counter.textContent = `${s.history.length} turn(s)`;
+}
+
+// Read the current generation knobs from the chat tab. Pulled into a helper
+// so regenerate/edit-save use the *current* slider values, not the values
+// captured when the original turn ran — that's the whole point of regenerate.
+function readChatGenOpts() {
+  return {
+    maxTokens: parseInt($('#chat-max')?.value) || 200,
+    temperature: parseFloat($('#chat-temp')?.value) || 0.8,
+    topK: parseInt($('#chat-topk')?.value) || 0
+  };
+}
+
+// Regenerate the assistant turn at `idx`. Uses the conversation up to but
+// NOT including that turn as history, and the user message immediately
+// before it as the new prompt. Replaces the existing assistant content
+// in place; later turns (if any) are left untouched — the user might be
+// just sampling a single alternative reply mid-conversation.
+async function regenerateAssistantTurn(id, idx) {
+  const n = state.current;
+  if (!n || n.id !== id) return;
+  const s = getChatSession(id);
+  if (s.busy) return;
+  const turn = s.history[idx];
+  if (!turn || turn.role !== 'assistant') return;
+  // Find the user prompt that produced this assistant turn — normally it's
+  // the immediately preceding turn. If there is none (e.g. assistant-first
+  // conversation), bail with a hint; nothing to regenerate from.
+  let userIdx = -1;
+  for (let k = idx - 1; k >= 0; k--) {
+    if (s.history[k].role === 'user') { userIdx = k; break; }
+  }
+  if (userIdx === -1) { toast('No preceding user message to regenerate from.'); return; }
+  const userPrompt = s.history[userIdx].content;
+  const historyBefore = s.history.slice(0, userIdx);
+  s.busy = true;
+  // Show the pending bubble in place: temporarily blank the content so the
+  // user sees it's being recomputed without losing their place in the log.
+  const original = turn.content;
+  turn.content = '…';
+  redrawChatLog(id);
+  try {
+    const result = await window.nc.inference.run(id, {
+      history: historyBefore,
+      prompt: userPrompt,
+      system: s.system || '',
+      ...readChatGenOpts()
+    });
+    const reply = (result && typeof result.text === 'string') ? result.text : '';
+    s.history[idx].content = reply;
+  } catch (e) {
+    s.history[idx].content = original; // restore on failure
+    toast('Regenerate failed: ' + e.message);
+  } finally {
+    s.busy = false;
+    redrawChatLog(id);
+  }
+}
+
+function beginEditUserTurn(id, idx) {
+  const s = getChatSession(id);
+  if (s.busy) return;
+  if (!s.history[idx] || s.history[idx].role !== 'user') return;
+  s.editingIndex = idx;
+  redrawChatLog(id);
+}
+
+function cancelEditUserTurn(id) {
+  const s = getChatSession(id);
+  s.editingIndex = null;
+  redrawChatLog(id);
+}
+
+// Commit an edit to a user turn. The standard chat UX here (which the user
+// will expect) is: replace the user's message, drop everything that came
+// AFTER it, and regenerate the next assistant reply. Keeping later turns
+// would leave them referencing a question that no longer exists, which
+// is more confusing than helpful.
+async function commitEditUserTurn(id, idx) {
+  const n = state.current;
+  if (!n || n.id !== id) return;
+  const s = getChatSession(id);
+  if (s.busy) return;
+  const editor = document.querySelector(`.chat-edit-input[data-idx="${idx}"]`);
+  if (!editor) return;
+  const newText = (editor.value || '').trim();
+  if (!newText) { toast('Message cannot be empty.'); return; }
+  // Truncate to and including the edited turn, with the new content.
+  const historyBefore = s.history.slice(0, idx);
+  s.history = [...historyBefore, { role: 'user', content: newText }];
+  s.editingIndex = null;
+  s.busy = true;
+  redrawChatLog(id);
+  try {
+    const result = await window.nc.inference.run(id, {
+      history: historyBefore,
+      prompt: newText,
+      system: s.system || '',
+      ...readChatGenOpts()
+    });
+    const reply = (result && typeof result.text === 'string') ? result.text : '';
+    s.history.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    toast('Edit-regenerate failed: ' + e.message);
+  } finally {
+    s.busy = false;
+    redrawChatLog(id);
+  }
+}
+
+async function sendChatMessage(id) {
+  const n = state.current;
+  if (n.id !== id) return;
+  if (n.stateLocked) {
+    passphraseModal('Decrypt to chat', 'Passphrase required to chat with an encrypted network', async (pass) => {
+      if (!pass) return;
+      await window.nc.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
+      await loadCurrent(n.id); sendChatMessage(id);
+    });
+    return;
+  }
+  const s = getChatSession(id);
+  if (s.busy) return;
+  const inp = $('#chat-input');
+  const message = (inp?.value || '').trim();
+  if (!message) return;
+  inp.value = '';
+  s.busy = true;
+  // Optimistically render the user turn so the UI feels responsive.
+  s.history.push({ role: 'user', content: message });
+  redrawChatLog(id);
+  try {
+    const payload = {
+      history: s.history.slice(0, -1), // history *before* this turn; prompt carries the new one
+      prompt: message,
+      system: s.system || '',
+      maxTokens: parseInt($('#chat-max').value) || 200,
+      temperature: parseFloat($('#chat-temp').value) || 0.8,
+      topK: parseInt($('#chat-topk').value) || 0
+    };
+    const result = await window.nc.inference.run(id, payload);
+    const reply = (result && typeof result.text === 'string') ? result.text : '';
+    s.history.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    // Surface the failure inline; pop the optimistic user turn so retry is clean.
+    s.history.pop();
+    toast('Chat error: ' + e.message);
+  } finally {
+    s.busy = false;
+    redrawChatLog(id);
+  }
 }
 
 function inferenceInputUI(a) {
@@ -860,7 +1148,7 @@ async function createNetworkFromModal() {
 }
 
 function defaultArch(kind) {
-  if (kind === 'chat') return { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 48, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true };
+  if (kind === 'chat') return { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 128, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true };
   if (kind === 'charLM') return { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 16, hidden: [64], activation: 'gelu', dropout: 0 };
   if (kind === 'regressor') return { kind: 'regressor', inputDim: 1, outputDim: 1, hidden: [16], activation: 'tanh', dropout: 0 };
   return { kind: 'classifier', inputDim: 2, outputDim: 2, hidden: [8], activation: 'relu', dropout: 0, classes: ['A', 'B'] };

@@ -10,14 +10,40 @@ const ChatFormat = require('./chat-format');
 // network: the full stored network object.
 // hooks: { onProgress({epoch, step, totalSteps, loss, lr, elapsedMs}), shouldStop() => bool }
 // Returns: { state, metrics, tokenizer? }
+//
+// On the multi-worker path (workers > 0 in network.training), we delegate to
+// data-parallel training instead of the single-thread loop — this lets us
+// actually use multiple cores instead of pinning one at 100%.
 async function trainNetwork(network, hooks = {}) {
-  // Async wrapper that yields periodically by polling a generator.
+  const requestedWorkers = (network.training && network.training.workers) | 0;
+  if (requestedWorkers > 1) {
+    const { trainNetworkParallel } = require('./trainer-parallel');
+    try {
+      return await trainNetworkParallel(network, hooks);
+    } catch (e) {
+      // Workers can fail for environment reasons (sandbox, missing modules,
+      // etc.). Fall through to the single-thread path with a logged warning
+      // rather than failing the whole training run.
+      if (hooks.log) hooks.log(`worker pool failed (${e.message}); falling back to single-thread training`);
+    }
+  }
+  // Single-thread path. Yields occasionally so the UI thread stays responsive
+  // and the user can still hit "Stop training" — but only every ~50ms of work,
+  // not every step, since each yield costs ~0.5-1ms of event-loop overhead.
   const gen = _trainCoreGen(network, hooks);
   let result;
+  let lastYield = Date.now();
   while (true) {
     const step = gen.next();
     if (step.done) { result = step.value; break; }
-    await new Promise(r => setImmediate(r));
+    // Yield only when enough wall time has passed. The generator yields at
+    // its progress checkpoints, but we batch them into a single setImmediate
+    // round-trip when they fire close together.
+    const now = Date.now();
+    if (now - lastYield >= 16) {
+      await new Promise(r => setImmediate(r));
+      lastYield = Date.now();
+    }
   }
   return result;
 }
@@ -47,6 +73,17 @@ function* _trainCoreGen(network, hooks) {
   if (network.state && !fromScratch) {
     model = restoreFromState(network.state, network.architecture, rng);
     resumed = true;
+    // The saved state's arch is the source of truth for shape-bearing fields
+    // (vocabSize specifically — set by the trainer after the tokenizer is
+    // built from corpus). If the on-disk `network.architecture` drifted (e.g.
+    // before we persisted arch from training, the editor's vocabSize=0 was
+    // saved), align it now so downstream sanity checks don't wipe the model.
+    if (network.state.arch) {
+      const savedArch = network.state.arch;
+      if (savedArch.vocabSize && savedArch.vocabSize !== network.architecture.vocabSize) {
+        network.architecture = { ...network.architecture, vocabSize: savedArch.vocabSize };
+      }
+    }
   } else {
     model = buildFromSpec(network.architecture, rng);
   }
@@ -123,7 +160,7 @@ function* _trainCoreGen(network, hooks) {
       }
       let epLoss = 0;
       for (let s = 0; s < stepsPerEpoch; s++) {
-        if (shouldStop()) return { state: model.toJSON(), optimizerState: optim.toJSON(), metrics, stopped: true };
+        if (shouldStop()) return { state: model.toJSON(), optimizerState: optim.toJSON(), architecture: arch, metrics, stopped: true };
         const xbData = new Float32Array(batchSize * arch.inputDim);
         const ybLabels = isRegression ? new Float32Array(batchSize * arch.outputDim) : new Array(batchSize);
         for (let b = 0; b < batchSize; b++) {
@@ -164,7 +201,7 @@ function* _trainCoreGen(network, hooks) {
       log(`epoch ${ep + 1}/${epochs}  loss=${(epLoss / stepsPerEpoch).toFixed(6)}`);
     }
 
-    return { state: model.toJSON(), optimizerState: optim.toJSON(), metrics };
+    return { state: model.toJSON(), optimizerState: optim.toJSON(), architecture: arch, metrics };
   }
 
   if (arch.kind === 'charLM') {
@@ -216,7 +253,14 @@ function* _trainCoreGen(network, hooks) {
     } else {
       tokenizer = CharTokenizer.fromCorpus(text);
     }
-    if (tokenizer.vocabSize !== arch.vocabSize) {
+    // First-training-run alignment: when arch.vocabSize was 0 (from a freshly
+    // created network), set it to whatever the tokenizer produced and rebuild
+    // the model now that we know the real vocab size. We only do this when
+    // NOT resumed — on a resume path, `model` was built from the saved state
+    // which already matches `tokenizer.vocabSize` (we aligned arch above).
+    // Wiping the model on resume here was the source of the "Continue training
+    // loss spiked back to fresh-init levels" bug.
+    if (!resumed && tokenizer.vocabSize !== arch.vocabSize) {
       arch.vocabSize = tokenizer.vocabSize;
       model = buildFromSpec(arch, rng);
       const newOpt = buildOptim(optName, model.params, { lr });
@@ -235,7 +279,7 @@ function* _trainCoreGen(network, hooks) {
     for (let ep = 0; ep < epochs; ep++) {
       let epLoss = 0;
       for (let s = 0; s < stepsPerEpoch; s++) {
-        if (shouldStop()) return { state: model.toJSON(), optimizerState: optim.toJSON(), tokenizer: tokenizer.toJSON(), metrics, stopped: true };
+        if (shouldStop()) return { state: model.toJSON(), optimizerState: optim.toJSON(), tokenizer: tokenizer.toJSON(), architecture: arch, metrics, stopped: true };
         const idsBatch = [];
         const labels = [];
         for (let b = 0; b < batchSize; b++) {
@@ -265,7 +309,7 @@ function* _trainCoreGen(network, hooks) {
       metrics.push({ epoch: ep + 1, loss: epLoss / stepsPerEpoch });
       log(`epoch ${ep + 1}/${epochs}  loss=${(epLoss / stepsPerEpoch).toFixed(6)}`);
     }
-    return { state: model.toJSON(), optimizerState: optim.toJSON(), tokenizer: tokenizer.toJSON(), metrics };
+    return { state: model.toJSON(), optimizerState: optim.toJSON(), tokenizer: tokenizer.toJSON(), architecture: arch, metrics };
   }
 
   throw new Error('unknown arch kind ' + arch.kind);
@@ -305,7 +349,6 @@ function infer(network, input) {
   if (arch.kind === 'charLM') {
     if (!network.tokenizer) throw new Error('tokenizer missing');
     const tokenizer = CharTokenizer.fromJSON(network.tokenizer);
-    const userPrompt = String(input.prompt ?? input ?? '');
     const maxNew = input.maxTokens ?? 120;
     const temperature = input.temperature ?? 1.0;
     const topK = input.topK ?? 0;
@@ -313,22 +356,83 @@ function infer(network, input) {
     // If the model was trained on chat data, wrap the prompt in role tags
     // and stop generation at the assistant <|end|> tag.
     const isChat = !!arch.isChat || input.chat === true;
-    const promptText = isChat
-      ? ChatFormat.wrapPromptForChat(userPrompt, input.system || '')
-      : userPrompt;
+
+    // Three input shapes for chat-mode:
+    //   1. { prompt }                    — single-turn (legacy, still supported)
+    //   2. { history: [{role,content}] } — full conversation, last message is the new user turn
+    //   3. { messages: [...] }           — alias for history
+    //   4. { history, prompt }           — explicit running history + new user turn
+    // For non-chat models we just use prompt/string.
+    const userPrompt = String(input.prompt ?? input ?? '');
+    const history = Array.isArray(input.history) ? input.history
+                  : Array.isArray(input.messages) ? input.messages
+                  : null;
+
+    let promptText;
+    if (isChat) {
+      if (history) {
+        // If the caller passed both history and prompt, treat prompt as the new user turn.
+        // If only history, the last user message in history is the new turn (don't double it).
+        const explicitPrompt = (typeof input.prompt === 'string' && input.prompt.length > 0);
+        promptText = ChatFormat.wrapHistoryForChat(history, {
+          system: input.system || '',
+          userPrompt: explicitPrompt ? userPrompt : ''
+        });
+      } else {
+        promptText = ChatFormat.wrapPromptForChat(userPrompt, input.system || '');
+      }
+    } else {
+      promptText = userPrompt;
+    }
 
     // Encode (silently dropping unseen chars).
     const L = arch.contextLen;
+    // For chat with history, drop oldest turns to fit the context window
+    // (keeps the system anchor + the trailing <|assistant|> intact).
+    if (isChat && history) {
+      promptText = ChatFormat.truncateWrappedToFit(
+        promptText,
+        (s) => tokenizer.encodeSafe(s),
+        L
+      );
+    }
     let ids = tokenizer.encodeSafe(promptText);
     if (ids.length === 0) ids = [0];
-    while (ids.length < L) ids = [ids[0], ...ids];
+    // Left-pad to fill the context window. Padding choice matters a lot for
+    // chat models: the previous "pad with the first prompt char" produced long
+    // runs of '<' in front of '<|user|>...', which the model never saw in
+    // training (the training corpus joins conversations with '\n'), and the
+    // model would respond with confused tag-fragment garbage. Using '\n' as
+    // the pad token mirrors the training-time conversation separator, so the
+    // model sees a familiar lead-in: '\n\n\n...<|user|>actual prompt<|end|><|assistant|>'.
+    if (ids.length < L) {
+      // Prefer newline (conversation separator at training time). If the model
+      // has never seen one, fall back to space, then to the first prompt char.
+      let padChar = '\n';
+      if (tokenizer.stoi && !tokenizer.stoi.has(padChar)) padChar = ' ';
+      if (tokenizer.stoi && !tokenizer.stoi.has(padChar)) padChar = null;
+      const padId = padChar != null && tokenizer.stoi.has(padChar) ? tokenizer.stoi.get(padChar) : ids[0];
+      const pad = new Array(L - ids.length).fill(padId);
+      ids = pad.concat(ids);
+    }
 
     // Pre-encode the END tag so we can detect it byte-for-byte in the output.
     const endTag = ChatFormat.TAGS.END;
     const endIds = tokenizer.encodeSafe(endTag);
     const stopOnEnd = isChat && endIds.length > 0;
+    // For chat models we ALSO stop on the '<|' bigram. Small charLMs frequently
+    // emit corrupted end-of-turn markers ('<aend|>', '<|en|>', etc.) and an
+    // exact-match-only stop would let the model drift into the next imagined
+    // conversation, burning tokens and producing visible role-tag fragments
+    // even if extractAssistantReply() trims them after the fact. Stopping at
+    // '<|' the moment it appears keeps generation tight.
+    const tagOpenBigram = '<|';
 
     const out = [];
+    // Window of recently decoded characters used for the '<|' early-stop check.
+    // We don't want to decode the whole output every step, so we keep a small
+    // tail buffer (a couple of decoded chars is enough to span the bigram).
+    let tailDecoded = '';
     for (let step = 0; step < maxNew; step++) {
       const ctx = ids.slice(ids.length - L);
       const logits = model.forward([ctx], { training: false });
@@ -359,6 +463,29 @@ function infer(network, input) {
         }
         if (match) {
           out.length -= endIds.length; // strip the tag from output
+          break;
+        }
+      }
+      // Chat-mode early-stop on the '<|' bigram (any role-tag attempt, even
+      // corrupted). Decode just the new char and keep the last few in a tail.
+      if (isChat) {
+        tailDecoded += tokenizer.decode([pick]);
+        if (tailDecoded.length > 8) tailDecoded = tailDecoded.slice(-8);
+        const bigramAt = tailDecoded.indexOf(tagOpenBigram);
+        if (bigramAt !== -1) {
+          // We need to trim `out` so the decoded output ends just before '<|'.
+          // The simplest robust approach: decode the entire `out`, find the
+          // first '<|', then re-encode the prefix and keep only those tokens.
+          // This costs one full decode at stop time, not every step.
+          const fullDecoded = tokenizer.decode(out);
+          const cut = fullDecoded.indexOf(tagOpenBigram);
+          if (cut !== -1) {
+            const keepText = fullDecoded.slice(0, cut);
+            // Re-encode (encodeSafe drops unknowns) — for charLM this is exact.
+            const keepIds = tokenizer.encodeSafe(keepText);
+            out.length = 0;
+            for (const t of keepIds) out.push(t);
+          }
           break;
         }
       }

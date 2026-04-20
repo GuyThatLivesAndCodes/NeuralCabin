@@ -52,21 +52,31 @@ class Adam {
   }
   step() {
     this.t++;
-    const { beta1, beta2, eps, lr } = this;
+    const { beta1, beta2, eps, lr, weightDecay } = this;
     const bc1 = 1 - Math.pow(beta1, this.t);
     const bc2 = 1 - Math.pow(beta2, this.t);
+    // Hoist constants out of the inner loop so V8 doesn't reload them per
+    // element. The inner loop runs once per scalar weight every step — this
+    // is the second-most-touched code path after matmul.
+    const ombeta1 = 1 - beta1;
+    const ombeta2 = 1 - beta2;
+    const invBc1 = 1 / bc1;
+    const invSqrtBc2 = 1 / Math.sqrt(bc2);
+    const hasWD = weightDecay !== 0;
     for (let i = 0; i < this.params.length; i++) {
       const p = this.params[i];
       if (!p.grad) continue;
       const m = this.m[i], v = this.v[i];
-      for (let j = 0; j < p.size; j++) {
-        let g = p.grad[j];
-        if (this.weightDecay) g += this.weightDecay * p.data[j];
-        m[j] = beta1 * m[j] + (1 - beta1) * g;
-        v[j] = beta2 * v[j] + (1 - beta2) * g * g;
-        const mhat = m[j] / bc1;
-        const vhat = v[j] / bc2;
-        p.data[j] -= lr * mhat / (Math.sqrt(vhat) + eps);
+      const pd = p.data, pg = p.grad;
+      const sz = p.size;
+      for (let j = 0; j < sz; j++) {
+        const g = hasWD ? pg[j] + weightDecay * pd[j] : pg[j];
+        const mj = beta1 * m[j] + ombeta1 * g;
+        const vj = beta2 * v[j] + ombeta2 * g * g;
+        m[j] = mj;
+        v[j] = vj;
+        // sqrt(vj/bc2) = sqrt(vj) * invSqrtBc2
+        pd[j] -= lr * (mj * invBc1) / (Math.sqrt(vj) * invSqrtBc2 + eps);
       }
     }
   }

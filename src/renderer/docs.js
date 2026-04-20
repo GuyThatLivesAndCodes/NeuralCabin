@@ -110,7 +110,41 @@ window.NC_DOCS = [
 <p>Behind the scenes, NeuralCity flattens every conversation into a single text stream with role tags it learns to predict:</p>
 <pre><code>&lt;|user|&gt;Hello, I need help&lt;|end|&gt;&lt;|assistant|&gt;Of course, I'm here, what's up?&lt;|end|&gt;</code></pre>
 <p>At inference time the app wraps your message in the same tags and stops generation when the model emits <code>&lt;|end|&gt;</code>, so you get back just the assistant's reply.</p>
-<p>Tip: bump <b>contextLen</b> (under Architecture) so a full user+assistant turn fits in the window. <code>48</code>–<code>96</code> is a good range for short chats; longer if your replies are paragraphs.</p>
+<p>Tip: bump <b>contextLen</b> (under Architecture) so <i>multiple</i> back-and-forth turns fit in the window — the more your model can see, the better it can hold a thread. <code>96</code>–<code>256</code> is a good range for real conversations; longer if your replies are paragraphs.</p>
+<h3>Multi-turn matters at <i>training</i> time too</h3>
+<p>If every training sample is a single user→assistant exchange, the model only ever learns to respond to a fresh prompt — it never learns to <i>continue</i> a thread. To get a model that can hold context, mix in samples with multiple turns. The easiest way is the <code>messages</code> shape above: include 2, 4, 6+ alternating turns per sample. The trainer flattens each conversation into a single tag-delimited stream so the model learns the full pattern <code>user → assistant → user → assistant</code>, not just the first reply.</p>
+`
+  },
+  {
+    id: 'chat-inference',
+    title: 'Chatting with a model',
+    body: `
+<h1>Multi-turn inference</h1>
+<p>Once a network is trained on chat samples, the <b>Inference</b> tab swaps to a real chat interface — running history bubbles, a persistent system prompt field, and a <b>Reset chat</b> button. Each message you send is encoded together with every prior turn, so the model can refer back to earlier context.</p>
+
+<h2>How history is packed</h2>
+<p>Every request flattens the conversation into the same role-tagged stream the model was trained on:</p>
+<pre><code>&lt;|system|&gt;Be concise.&lt;|end|&gt;
+&lt;|user|&gt;Hi&lt;|end|&gt;&lt;|assistant|&gt;Hello!&lt;|end|&gt;
+&lt;|user|&gt;How are you?&lt;|end|&gt;&lt;|assistant|&gt;</code></pre>
+<p>The model continues from the trailing <code>&lt;|assistant|&gt;</code>. As soon as it emits <code>&lt;|end|&gt;</code> the app stops generation and you get back just the assistant's reply.</p>
+
+<h2>What if history doesn't fit in contextLen?</h2>
+<p>The app drops the <i>oldest</i> turns first, never splitting a turn in half. The system prompt (if set) is always preserved at the top — that's the whole point of having one. The current user message is always preserved at the bottom. So a long conversation gracefully degrades into "model remembers system + recent turns, forgets the very first ones," which is the same behavior every chat assistant has.</p>
+
+<h2>Programmatic access</h2>
+<p>From the <b>Script</b> tab or any external client, you can pass an explicit history to <code>predict</code>:</p>
+<pre><code>predict(thisNet(), {
+  history: [
+    { role: "user",      content: "Hi" },
+    { role: "assistant", content: "Hello!" }
+  ],
+  prompt: "How are you?",
+  system: "Be concise.",
+  maxTokens: 200,
+  temperature: 0.7
+})</code></pre>
+<p>The <code>messages</code> array (OpenAI-style) is also accepted as an alias for <code>history</code>.</p>
 `
   },
   {
@@ -187,8 +221,10 @@ print result.metrics[len(result.metrics) - 1]</code></pre>
 <h2>Endpoints</h2>
 <table>
 <tr><th>Route</th><th>Method</th><th>Description</th></tr>
-<tr><td><code>/</code> or <code>/info</code></td><td>GET</td><td>Returns network metadata and expected input shape.</td></tr>
-<tr><td><code>/predict</code></td><td>POST</td><td>JSON body matching the input spec. Returns the prediction.</td></tr>
+<tr><td><code>/</code> or <code>/info</code></td><td>GET</td><td>Returns network metadata, input spec, and (for chat models) the available chat fields.</td></tr>
+<tr><td><code>/predict</code></td><td>POST</td><td>Stateless. JSON body matching the input spec. Returns the prediction.</td></tr>
+<tr><td><code>/chat</code></td><td>POST</td><td><b>Chat models only.</b> Stateful — the server keeps the running conversation keyed by <code>sessionId</code>.</td></tr>
+<tr><td><code>/chat/reset</code></td><td>POST</td><td>Clears one chat session.</td></tr>
 </table>
 
 <h2>Examples</h2>
@@ -196,10 +232,44 @@ print result.metrics[len(result.metrics) - 1]</code></pre>
 <pre><code>curl -X POST http://localhost:PORT/predict \\
   -H "Content-Type: application/json" \\
   -d '{"input":[0,1]}'</code></pre>
-<p><b>Character LM:</b></p>
+<p><b>Character LM (single-shot):</b></p>
 <pre><code>curl -X POST http://localhost:PORT/predict \\
   -H "Content-Type: application/json" \\
   -d '{"prompt":"the ","maxTokens":80,"temperature":1.0}'</code></pre>
+
+<h2>Multi-turn chat</h2>
+<p>Two ways to do it.</p>
+<p><b>Stateless</b> — you manage the history, the server doesn't remember:</p>
+<pre><code>curl -X POST http://localhost:PORT/predict \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "history": [
+      {"role":"user","content":"Hi"},
+      {"role":"assistant","content":"Hello!"}
+    ],
+    "prompt": "How are you?",
+    "system": "Be concise.",
+    "maxTokens": 200,
+    "temperature": 0.7
+  }'</code></pre>
+<p><b>Stateful</b> — the server keeps the thread for you (in memory only, cleared on app restart):</p>
+<pre><code># first turn — server mints a sessionId for you
+curl -X POST http://localhost:PORT/chat \\
+  -H "Content-Type: application/json" \\
+  -d '{"message":"Hi","system":"Be concise."}'
+# → {"sessionId":"session-…","reply":"…","history":[…]}
+
+# subsequent turns — pass the same sessionId
+curl -X POST http://localhost:PORT/chat \\
+  -H "Content-Type: application/json" \\
+  -d '{"sessionId":"session-…","message":"How are you?"}'
+
+# done? clear it
+curl -X POST http://localhost:PORT/chat/reset \\
+  -H "Content-Type: application/json" \\
+  -d '{"sessionId":"session-…"}'</code></pre>
+<p>Sessions live for one hour of inactivity and the server caps each model at 256 concurrent sessions and 64 turns per session. Stop the API server and they're gone — nothing is written to disk.</p>
+
 <p>Share your local IP with other devices on the same network to let them call your model. Your IP is shown in the status bar.</p>
 `
   },

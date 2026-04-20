@@ -271,6 +271,236 @@ async function testOptimizerStateRoundtrip() {
   check('adam load: rejects shape mismatch', optWrong.loadFromJSON(snap) === false);
 }
 
+async function testMultiTurnChatFormat() {
+  console.log('\n== multi-turn chat format ==');
+  const ChatFormat = require('../src/engine/chat-format');
+
+  // wrapHistoryForChat with empty history + a userPrompt should match wrapPromptForChat.
+  const w1 = ChatFormat.wrapHistoryForChat([], { userPrompt: 'Hi', system: 'Be concise.' });
+  const w2 = ChatFormat.wrapPromptForChat('Hi', 'Be concise.');
+  check('chat-history: empty history matches wrapPromptForChat', w1 === w2);
+
+  // Multi-turn: produces a properly tagged stream that ends with the assistant-open tag.
+  const history = [
+    { role: 'user', content: 'Hi' },
+    { role: 'assistant', content: 'Hello!' },
+    { role: 'user', content: 'How are you?' },
+    { role: 'assistant', content: 'Doing well, thanks.' }
+  ];
+  const wrapped = ChatFormat.wrapHistoryForChat(history, { userPrompt: 'What can you do?', system: 'Be concise.' });
+  check('chat-history: starts with system anchor', wrapped.startsWith('<|system|>Be concise.<|end|>'));
+  check('chat-history: contains all user turns',
+        wrapped.includes('<|user|>Hi<|end|>') && wrapped.includes('<|user|>How are you?<|end|>') && wrapped.includes('<|user|>What can you do?<|end|>'));
+  check('chat-history: contains assistant turns',
+        wrapped.includes('<|assistant|>Hello!<|end|>') && wrapped.includes('<|assistant|>Doing well, thanks.<|end|>'));
+  check('chat-history: ends with assistant-open (model continues)',
+        wrapped.endsWith('<|assistant|>'));
+  check('chat-history: assistant-open appears once at the end (no trailing END)',
+        !wrapped.endsWith('<|end|>'));
+
+  // Inline system message in history is hoisted to the front.
+  const w3 = ChatFormat.wrapHistoryForChat([
+    { role: 'user', content: 'a' },
+    { role: 'system', content: 'inline-system' },
+    { role: 'assistant', content: 'b' }
+  ], {});
+  check('chat-history: inline system hoisted to front', w3.startsWith('<|system|>inline-system<|end|>'));
+
+  // truncateWrappedToFit: drops oldest non-system turns first, keeps system + trailing assistant-open.
+  const charEncoder = (s) => Array.from(s); // 1 char = 1 token for testing
+  const longHistory = [];
+  for (let i = 0; i < 20; i++) {
+    longHistory.push({ role: 'user', content: `q${i}` });
+    longHistory.push({ role: 'assistant', content: `a${i}` });
+  }
+  const longWrapped = ChatFormat.wrapHistoryForChat(longHistory, { userPrompt: 'final', system: 'sys' });
+  const truncated = ChatFormat.truncateWrappedToFit(longWrapped, charEncoder, 200);
+  check('truncate: result fits maxLen', charEncoder(truncated).length <= 200,
+        `len=${charEncoder(truncated).length}`);
+  check('truncate: keeps system anchor', truncated.startsWith('<|system|>sys<|end|>'));
+  check('truncate: keeps trailing assistant-open', truncated.endsWith('<|assistant|>'));
+  check('truncate: keeps the most recent user turn ("final")',
+        truncated.includes('<|user|>final<|end|>'));
+  check('truncate: drops oldest turns (q0 gone)', !truncated.includes('<|user|>q0<|end|>'));
+}
+
+async function testMultiTurnInferenceEndToEnd() {
+  console.log('\n== multi-turn inference end-to-end ==');
+  // Train a small chat model on multi-turn conversations, then verify
+  // infer() accepts {history, prompt} and returns a string reply.
+  const ChatFormat = require('../src/engine/chat-format');
+  const samples = [];
+  // Multi-turn samples (using `messages` shape).
+  const seedConvos = [
+    [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+      { role: 'user', content: 'How are you?' },
+      { role: 'assistant', content: 'I am well, thanks.' }
+    ],
+    [
+      { role: 'user', content: 'Tell me a fact' },
+      { role: 'assistant', content: 'The sky is blue.' },
+      { role: 'user', content: 'Another?' },
+      { role: 'assistant', content: 'Water is wet.' }
+    ]
+  ];
+  for (let i = 0; i < 20; i++) for (const c of seedConvos) samples.push({ messages: c });
+
+  // Sanity: chat-format should treat these as chat samples.
+  const corpus = ChatFormat.buildCorpus({ samples });
+  check('e2e: corpus marked isChat', corpus.isChat === true);
+  check('e2e: corpus contains multiple turns per sample',
+        (corpus.text.match(/<\|user\|>/g) || []).length >= 4);
+
+  const net = {
+    architecture: { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 64, hidden: [48], activation: 'gelu', dropout: 0 },
+    training: { optimizer: 'adam', learningRate: 0.005, batchSize: 16, epochs: 3, seed: 42 },
+    trainingData: { samples }
+  };
+  const r = await trainNetwork(net, {});
+  const trained = { ...net, state: r.state, tokenizer: r.tokenizer };
+
+  // Single-turn inference still works (back-compat).
+  const out1 = infer(trained, { prompt: 'Hi', maxTokens: 30, temperature: 0.6 });
+  check('e2e: single-turn infer still returns text', typeof out1.text === 'string');
+  check('e2e: single-turn flagged as chat', out1.chat === true);
+
+  // Multi-turn: pass running history + new prompt.
+  const out2 = infer(trained, {
+    history: [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' }
+    ],
+    prompt: 'How are you?',
+    maxTokens: 30,
+    temperature: 0.6
+  });
+  check('e2e: multi-turn infer returns string', typeof out2.text === 'string');
+  check('e2e: multi-turn output has no role tags',
+        !out2.text.includes('<|user|>') && !out2.text.includes('<|assistant|>') && !out2.text.includes('<|end|>'));
+
+  // `messages` alias works.
+  const out3 = infer(trained, {
+    messages: [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+      { role: 'user', content: 'How are you?' }
+    ],
+    maxTokens: 30,
+    temperature: 0.6
+  });
+  check('e2e: messages alias works', typeof out3.text === 'string');
+
+  // History longer than contextLen should still produce a result (truncation kicks in).
+  const longHistory = [];
+  for (let i = 0; i < 30; i++) {
+    longHistory.push({ role: 'user', content: 'a question that is reasonably long ' + i });
+    longHistory.push({ role: 'assistant', content: 'a reply that is also reasonably long ' + i });
+  }
+  let longOk = false, longErr = null;
+  try {
+    const out4 = infer(trained, { history: longHistory, prompt: 'final question', maxTokens: 10, temperature: 0.6 });
+    longOk = typeof out4.text === 'string';
+  } catch (e) { longErr = e.message; }
+  check('e2e: long history truncates without error', longOk, longErr);
+}
+
+async function testInferencePaddingChoice() {
+  console.log('\n== inference padding uses safe token (no <<<<<<-prefix garbage) ==');
+  // Regression: when the chat prompt is shorter than contextLen, the trainer
+  // used to left-pad with the first char of the prompt — which for chat mode
+  // meant a long run of '<' before '<|user|>', a pattern the model never saw
+  // in training. Resulted in tag-fragment garbage in the reply. The fix pads
+  // with '\n' (the conversation separator at training time) instead.
+  const ChatFormat = require('../src/engine/chat-format');
+  const samples = [];
+  const seed = [
+    { user: 'Hello, I need help', assistant: "Of course, I am here." },
+    { user: 'Hi', assistant: 'Hey!' },
+    { user: 'Thanks', assistant: 'Welcome!' }
+  ];
+  for (let i = 0; i < 30; i++) for (const s of seed) samples.push(s);
+
+  // Use a long contextLen so padding dominates a short prompt — this is the
+  // exact scenario in which the bug manifests.
+  const net = {
+    architecture: { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 96, hidden: [48], activation: 'gelu', dropout: 0 },
+    training: { optimizer: 'adam', learningRate: 0.005, batchSize: 16, epochs: 4, seed: 42 },
+    trainingData: { samples }
+  };
+  const r = await trainNetwork(net, {});
+  const trained = { ...net, state: r.state, tokenizer: r.tokenizer };
+
+  // Sanity: tokenizer learned '\n' (the trainer joins conversations with it).
+  check('padding: tokenizer includes "\\n" (the training-time separator)',
+        r.tokenizer.chars.includes('\n'),
+        'chars=' + JSON.stringify(r.tokenizer.chars.slice(0, 30)));
+
+  // Run inference with a SHORT prompt — most of the context will be padding.
+  const out = infer(trained, { prompt: 'Hi', maxTokens: 40, temperature: 0.7 });
+  check('padding: returns string', typeof out.text === 'string');
+  // We can't assert "good content" deterministically on a tiny model, but we
+  // CAN assert the model didn't degenerate into outputting role-tag fragments
+  // (which is what the buggy padding caused). Counting tag fragments in the
+  // visible output (post-extraction) is a tight proxy for the bug.
+  const tagFragments = (out.text.match(/<\|/g) || []).length + (out.text.match(/\|>/g) || []).length;
+  check('padding: output has no leaked role-tag fragments',
+        tagFragments === 0,
+        'text=' + JSON.stringify(out.text) + ' tagFragments=' + tagFragments);
+}
+
+async function testCharLMContinuePreservesWeights() {
+  console.log('\n== charLM Continue training preserves weights (regression: loss spike) ==');
+  // Reproduces a real bug: charLM trains, the trainer mutates arch.vocabSize
+  // from 0 to N during phase 1 but storage didn't persist the mutation. On
+  // continue-training, the trainer saw arch.vocabSize=0 and state.arch.vocabSize=N,
+  // detected a "mismatch", and wiped the freshly-restored model — sending loss
+  // back up to fresh-init levels.
+
+  const arch = { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 32, hidden: [48], activation: 'gelu', dropout: 0 };
+  const baseTraining = { optimizer: 'adam', learningRate: 0.005, batchSize: 16, epochs: 4, seed: 42 };
+  const text = 'The quick brown fox jumps over the lazy dog. ' .repeat(40);
+
+  // Phase 1: initial training. arch.vocabSize starts at 0 and the trainer fills it in.
+  const phase1Net = { architecture: { ...arch }, training: baseTraining, trainingData: { text } };
+  let phase1Last = null;
+  const r1 = await trainNetwork(phase1Net, { onProgress: p => phase1Last = p });
+  check('charLM-cont: phase1 produced state', !!r1.state);
+  check('charLM-cont: phase1 returned architecture with vocabSize set',
+        r1.architecture && r1.architecture.vocabSize > 0,
+        'arch.vocabSize=' + r1.architecture?.vocabSize);
+  const realVocab = r1.architecture.vocabSize;
+
+  // Now simulate the bug condition: arch.vocabSize on disk was NEVER updated
+  // (this is what older versions did). Continue training with the stale arch.
+  const continueNet = {
+    architecture: { ...arch, vocabSize: 0 },  // stale on-disk arch
+    training: { ...baseTraining, epochs: 2 },
+    trainingData: { text },
+    state: r1.state,
+    optimizerState: r1.optimizerState,
+    tokenizer: r1.tokenizer
+  };
+  let firstStepLoss = null, contLast = null;
+  const r2 = await trainNetwork(continueNet, { onProgress: p => {
+    if (firstStepLoss === null) firstStepLoss = p.loss;
+    contLast = p;
+  } });
+  check('charLM-cont: continue produced state', !!r2.state);
+  // The phase-1 final loss is our reference. If we wiped the model, the first
+  // continue step would jump back to ~log(vocabSize) ≈ 3-4 for this corpus.
+  // We assert it stays close to where we left off.
+  const phase1End = phase1Last.loss;
+  check('charLM-cont: first continue step loss stays close to phase1 final (no model wipe)',
+        firstStepLoss < phase1End + 1.0,
+        `phase1End=${phase1End?.toFixed(3)} firstContinue=${firstStepLoss?.toFixed(3)} (gap > 1.0 means weights were wiped)`);
+  // And the on-the-wire arch in r2 should now have the correct vocabSize too.
+  check('charLM-cont: continue returned arch with corrected vocabSize',
+        r2.architecture && r2.architecture.vocabSize === realVocab,
+        'got=' + r2.architecture?.vocabSize + ' expected=' + realVocab);
+}
+
 async function testTokenizerRebuildOnNewChars() {
   console.log('\n== charLM tokenizer handles new chars on retrain ==');
   // Reproduces the bug: train on a small corpus, add a sample with chars
@@ -360,6 +590,35 @@ async function testEncryption() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testParallelTrainerProducesValidModel() {
+  console.log('\n== parallel trainer (worker_threads) ==');
+  // Build a representative charLM corpus that all workers can chew through.
+  const text = ('the quick brown fox jumps over the lazy dog. ' +
+                'neural networks learn patterns from data. ' +
+                'every weight is a tiny vote.\n').repeat(20);
+  const net = {
+    architecture: { kind: 'charLM', vocabSize: 0, embDim: 12, contextLen: 12, hidden: [32], activation: 'gelu', dropout: 0 },
+    training: { optimizer: 'adam', learningRate: 0.005, batchSize: 16, epochs: 4, seed: 42, workers: 2 },
+    trainingData: { text },
+    state: null, tokenizer: null
+  };
+  const result = await trainNetwork(net);
+  check('parallel: produced state', !!result.state, 'no state returned');
+  check('parallel: produced tokenizer', !!result.tokenizer, 'no tokenizer returned');
+  check('parallel: returned architecture', !!result.architecture && result.architecture.vocabSize > 0);
+  check('parallel: metrics emitted', Array.isArray(result.metrics) && result.metrics.length === 4);
+  // Loss should drop below the random-guess baseline (≈ ln(vocabSize)).
+  const last = result.metrics[result.metrics.length - 1].loss;
+  const baseline = Math.log(result.architecture.vocabSize);
+  check('parallel: loss dropped below random baseline', last < baseline * 0.8,
+        `last=${last.toFixed(3)} baseline=${baseline.toFixed(3)}`);
+
+  // Inference round-trip — proves the saved state is valid.
+  const trained = { ...net, state: result.state, tokenizer: result.tokenizer, architecture: result.architecture };
+  const out = await infer(trained, { prompt: 'the ', maxTokens: 10 });
+  check('parallel: inference produces text', typeof out.text === 'string' && out.text.length > 0);
+}
+
 (async () => {
   console.log('NeuralCity engine tests');
   try {
@@ -371,7 +630,12 @@ async function testEncryption() {
     await testChatTrainingEndToEnd();
     await testOptimizerStateRoundtrip();
     await testContinueTrainingPreservesState();
+    await testInferencePaddingChoice();
+    await testCharLMContinuePreservesWeights();
     await testTokenizerRebuildOnNewChars();
+    await testMultiTurnChatFormat();
+    await testMultiTurnInferenceEndToEnd();
+    await testParallelTrainerProducesValidModel();
     await testEncryption();
   } catch (e) {
     console.error('Suite crashed:', e.stack || e);

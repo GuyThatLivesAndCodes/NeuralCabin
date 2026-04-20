@@ -54,6 +54,11 @@ class TrainingManager extends EventEmitter {
           state: result.state,
           optimizerState: result.optimizerState,
           tokenizer: result.tokenizer,
+          // The trainer may have mutated arch (e.g. set vocabSize after
+          // building tokenizer from corpus, or flipped isChat). Persist that
+          // so the next continue-training run sees a consistent arch ↔ state
+          // ↔ tokenizer triple.
+          architecture: result.architecture,
           metrics: result.metrics
         });
         this.emit('done', { id, stopped: !!result.stopped, metrics: result.metrics });

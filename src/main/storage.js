@@ -116,7 +116,7 @@ class Storage {
       name: payload.name || 'Untitled Network',
       description: payload.description || '',
       architecture: payload.architecture || { kind: 'classifier', inputDim: 2, outputDim: 2, hidden: [8], activation: 'relu', dropout: 0, classes: ['A', 'B'] },
-      training: payload.training || { optimizer: 'adam', learningRate: 0.01, batchSize: 32, epochs: 20, seed: 42 },
+      training: payload.training || { optimizer: 'adam', learningRate: 0.01, batchSize: 32, epochs: 20, seed: 42, workers: 0 },
       trainingData: payload.trainingData || { samples: [] },
       state: null,
       optimizerState: null,
@@ -196,7 +196,7 @@ class Storage {
   }
 
   // Used by trainer/API server to save back state after training (bypasses patch semantics).
-  saveTrainedState(id, { state, optimizerState, tokenizer, metrics }) {
+  saveTrainedState(id, { state, optimizerState, tokenizer, metrics, architecture }) {
     const existing = this._readRaw(id);
     if (!existing) throw new Error('Network not found');
     existing.state = state;
@@ -205,6 +205,13 @@ class Storage {
     if (optimizerState !== undefined) existing.optimizerState = optimizerState;
     if (tokenizer) existing.tokenizer = tokenizer;
     if (metrics) existing.metrics = (existing.metrics || []).concat(metrics);
+    // The trainer may have mutated the architecture during training (most
+    // commonly: setting vocabSize after the tokenizer was built from corpus,
+    // or flipping isChat=true). Persist the trainer's view so the next
+    // continue-training run sees a consistent (arch ↔ state ↔ tokenizer)
+    // triple. Without this, a 0-vocab arch on disk + a 47-vocab saved state
+    // would cause the trainer to detect a "mismatch" and blow away the model.
+    if (architecture) existing.architecture = architecture;
     existing.updatedAt = Date.now();
     // If it was encrypted, require re-encryption before write — in practice we don't auto-encrypt after each train.
     // For simplicity, training on an encrypted net writes decrypted state; user is prompted elsewhere to re-encrypt.

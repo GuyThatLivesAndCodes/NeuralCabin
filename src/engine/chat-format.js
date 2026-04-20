@@ -87,7 +87,7 @@ function buildCorpus(data) {
   return { text: '', isChat: false, perSampleCount: 0 };
 }
 
-// Wrap a user prompt for inference against a chat-trained model.
+// Wrap a single user prompt for inference against a chat-trained model.
 // The returned string ends right after <|assistant|> so the model continues
 // from there.
 function wrapPromptForChat(userPrompt, system) {
@@ -97,14 +97,115 @@ function wrapPromptForChat(userPrompt, system) {
   return out;
 }
 
-// Strip role tags + everything after the first END tag in the assistant span.
-// Used when post-processing generated text.
-function extractAssistantReply(generated) {
-  // generated is whatever came after wrapPromptForChat — i.e. assistant content
-  // possibly followed by <|end|> and more turns.
-  const endIdx = generated.indexOf(END);
-  if (endIdx === -1) return generated;
-  return generated.slice(0, endIdx);
+// Wrap a multi-turn conversation. `history` is the past turns (any of
+// {role:'user'|'assistant'|'system', content:string}). `opts.userPrompt` is
+// the *new* user message we're asking about; if present it's appended after
+// the history (caller normally passes both — the running history and the new
+// turn the user just typed). `opts.system`, if non-empty, is anchored at the
+// very start so the model always sees it regardless of truncation.
+//
+// Output ends with <|assistant|> so the model continues the assistant span.
+function wrapHistoryForChat(history, opts) {
+  opts = opts || {};
+  const turns = [];
+  if (Array.isArray(history)) {
+    for (const t of history) {
+      if (!t || typeof t.content !== 'string') continue;
+      const role = t.role === 'assistant' ? 'assistant' : t.role === 'system' ? 'system' : 'user';
+      turns.push({ role, content: t.content });
+    }
+  }
+  if (typeof opts.userPrompt === 'string' && opts.userPrompt.length > 0) {
+    turns.push({ role: 'user', content: opts.userPrompt });
+  }
+  // Hoist the most recent system message (if any) to the front for stable anchoring.
+  // We dedupe by removing any system turns that were inline and re-inserting at index 0.
+  let system = typeof opts.system === 'string' && opts.system.length > 0 ? opts.system : null;
+  const cleaned = [];
+  for (const t of turns) {
+    if (t.role === 'system') {
+      // Inline system messages override the outer system if no explicit one was given.
+      if (!system) system = t.content;
+      continue;
+    }
+    cleaned.push(t);
+  }
+  let out = '';
+  if (system) out += SYSTEM_OPEN + system + END;
+  for (const t of cleaned) {
+    const open = t.role === 'assistant' ? ASSISTANT_OPEN : USER_OPEN;
+    out += open + t.content + END;
+  }
+  out += ASSISTANT_OPEN;
+  return out;
 }
 
-module.exports = { TAGS, normalizeChatSample, renderTurns, buildCorpus, wrapPromptForChat, extractAssistantReply };
+// Truncate a wrapped chat prompt so its encoded length fits within `maxLen`
+// tokens, while preserving:
+//   - the system anchor (if present, always kept)
+//   - the trailing <|assistant|> suffix (so the model still continues)
+//   - whole turns (we never split mid-turn — that would make the model see a
+//     dangling open-tag with no end)
+// Drops the *oldest* user/assistant turns first.
+function truncateWrappedToFit(wrapped, encodeFn, maxLen) {
+  if (encodeFn(wrapped).length <= maxLen) return wrapped;
+
+  // Split into the system prefix (if any) + ordered list of user/assistant turns + trailing assistant-open.
+  const sysIdx = wrapped.startsWith(SYSTEM_OPEN) ? wrapped.indexOf(END) + END.length : 0;
+  const sysPrefix = wrapped.slice(0, sysIdx);
+  // The last token is the trailing ASSISTANT_OPEN (no content after).
+  const trailingIdx = wrapped.lastIndexOf(ASSISTANT_OPEN);
+  // Body between sysPrefix and trailingAssistantOpen.
+  const body = wrapped.slice(sysIdx, trailingIdx);
+  const trailing = wrapped.slice(trailingIdx); // always ASSISTANT_OPEN
+
+  // Walk body, splitting into [openTag + content + END] chunks.
+  const turns = [];
+  let i = 0;
+  while (i < body.length) {
+    let open;
+    if (body.startsWith(USER_OPEN, i)) open = USER_OPEN;
+    else if (body.startsWith(ASSISTANT_OPEN, i)) open = ASSISTANT_OPEN;
+    else if (body.startsWith(SYSTEM_OPEN, i)) open = SYSTEM_OPEN;
+    else { i++; continue; }
+    const endAt = body.indexOf(END, i + open.length);
+    if (endAt === -1) break;
+    turns.push(body.slice(i, endAt + END.length));
+    i = endAt + END.length;
+  }
+
+  // Drop oldest turns until it fits. Always keep the most recent user turn
+  // (the one we're asking about) — drop from the front.
+  let kept = turns.slice();
+  while (kept.length > 1) {
+    const candidate = sysPrefix + kept.join('') + trailing;
+    if (encodeFn(candidate).length <= maxLen) return candidate;
+    kept.shift();
+  }
+  // Even with one turn it may still not fit. Return what we have — the
+  // caller's existing window-padding logic will handle the final shape.
+  return sysPrefix + kept.join('') + trailing;
+}
+
+// Strip role tags + everything after the first END tag in the assistant span.
+// Used when post-processing generated text.
+//
+// Small charLMs frequently emit *corrupted* end-of-turn markers: instead of a
+// clean '<|end|>' they'll produce '<aend|>', '<|en|>', '<|edn|>', etc. If we
+// only cut on a perfect '<|end|>' we leak garbage and even the start of the
+// next imagined conversation into the visible reply. So we also cut on the
+// '<|' bigram, which is the unmistakable signature of *any* attempt at a
+// role tag — whether well-formed or not.
+function extractAssistantReply(generated) {
+  // Generated is whatever came after wrapPromptForChat — i.e. assistant content
+  // possibly followed by <|end|> and more turns.
+  const cutPoints = [];
+  const endIdx = generated.indexOf(END);
+  if (endIdx !== -1) cutPoints.push(endIdx);
+  const tagStartIdx = generated.indexOf('<|');
+  if (tagStartIdx !== -1) cutPoints.push(tagStartIdx);
+  if (cutPoints.length === 0) return generated;
+  return generated.slice(0, Math.min(...cutPoints));
+}
+
+module.exports = { TAGS, normalizeChatSample, renderTurns, buildCorpus, wrapPromptForChat, wrapHistoryForChat, truncateWrappedToFit, extractAssistantReply };

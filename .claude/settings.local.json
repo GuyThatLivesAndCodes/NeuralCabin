@@ -7,7 +7,15 @@
       "Bash(npm install *)",
       "Bash(node -e \"const {app} = require\\('electron/main'\\); console.log\\('electron main module ok', typeof app\\);\")",
       "Read(//tmp/**)",
-      "Bash(node_modules/.bin/electron-builder --win --x64)"
+      "Bash(node_modules/.bin/electron-builder --win --x64)",
+      "Bash(node scripts/bump-version.js --dry)",
+      "Bash(node scripts/bump-version.js minor --dry)",
+      "Bash(node scripts/bump-version.js major --dry)",
+      "Bash(node scripts/bump-version.js set 5.6.7 --dry)",
+      "Bash(node scripts/bump-version.js bogus)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(npm run *)",
+      "Bash(node scripts/bench-train.js --all)"
     ]
   }
 }

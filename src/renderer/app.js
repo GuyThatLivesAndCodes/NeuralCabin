@@ -250,7 +250,8 @@ function renderNetworksTab(root) {
   const dataArea = $('#data-json');
   dataArea.value = JSON.stringify(n.trainingData || {}, null, 2);
   updateDataStats();
-  dataArea.addEventListener('input', updateDataStats);
+  refreshHints();
+  dataArea.addEventListener('input', () => { updateDataStats(); refreshHints(); });
 
   $('#btn-import-data').addEventListener('click', async () => {
     const res = await window.nc.dialog.readTextFile({
@@ -309,6 +310,8 @@ function renderNetworksTab(root) {
 
   // layer add/remove
   bindArchEditor(a);
+  // deferred so DOM is fully painted before we query fields
+  setTimeout(refreshHints, 0);
 }
 
 function updateDataStats() {
@@ -332,6 +335,98 @@ function updateDataStats() {
       tag.textContent = `${parsed.text.length} chars`;
     } else tag.textContent = '—';
   } catch { tag.textContent = 'invalid JSON'; }
+}
+
+function getDataInfo() {
+  const area = $('#data-json');
+  if (!area) return { chars: 0, samples: 0, isChat: false };
+  try {
+    const parsed = JSON.parse(area.value);
+    if (typeof parsed.text === 'string') return { chars: parsed.text.length, samples: 0, isChat: false };
+    if (Array.isArray(parsed.samples)) {
+      const chatCount = parsed.samples.filter(s => s && (typeof s.user === 'string' || Array.isArray(s.messages) || Array.isArray(s.conversation))).length;
+      return { chars: area.value.length, samples: parsed.samples.length, isChat: chatCount > 0 };
+    }
+  } catch {}
+  return { chars: 0, samples: 0, isChat: false };
+}
+
+function archRecs(a) {
+  const di = getDataInfo();
+  const vocab = a.vocabSize || 0;
+  const recs = {};
+  if (a.kind !== 'charLM') return recs;
+
+  // embDim
+  if (vocab > 0) {
+    const suggested = vocab <= 60 ? 16 : vocab <= 150 ? 32 : vocab <= 300 ? 64 : 128;
+    recs['a-embdim'] = `suggested: ${suggested} for vocab ${vocab}`;
+  } else if (di.chars > 0) {
+    recs['a-embdim'] = di.chars < 5000 ? 'suggested: 16–32 (small corpus)' : di.chars < 50000 ? 'suggested: 32–64' : 'suggested: 64–128';
+  }
+
+  // contextLen
+  if (di.isChat && di.samples > 0) {
+    const suggested = di.samples < 50 ? 64 : di.samples < 200 ? 128 : 256;
+    recs['a-ctx'] = `suggested: ${suggested} for ${di.samples} chat pairs`;
+  } else if (di.chars > 0) {
+    const suggested = di.chars < 2000 ? 32 : di.chars < 20000 ? 64 : di.chars < 100000 ? 128 : 256;
+    recs['a-ctx'] = `suggested: ${suggested} for ${di.chars.toLocaleString()} chars`;
+  }
+
+  // hidden
+  if (vocab > 0 || di.chars > 0) {
+    const scale = vocab > 200 || di.chars > 50000 ? 'large' : di.chars > 10000 ? 'medium' : 'small';
+    recs['a-hidden'] = scale === 'large' ? 'suggested: 256,256 or 512,256' : scale === 'medium' ? 'suggested: 128,128' : 'suggested: 64,64';
+  }
+
+  // dropout
+  if (di.samples > 0 || di.chars > 0) {
+    const small = (di.isChat ? di.samples : di.chars) < (di.isChat ? 100 : 10000);
+    recs['a-drop'] = small ? 'suggested: 0.1–0.2 (small data)' : 'suggested: 0 or 0.1';
+  }
+
+  return recs;
+}
+
+function trainingRecs() {
+  const di = getDataInfo();
+  const n = state.current;
+  if (!n) return {};
+  const a = n.architecture;
+  const recs = {};
+  const size = di.isChat ? di.samples : di.chars;
+  const isSmall = size < (di.isChat ? 100 : 10000);
+  const isMed = !isSmall && size < (di.isChat ? 500 : 100000);
+
+  recs['t-lr'] = isSmall ? 'suggested: 0.001–0.003' : isMed ? 'suggested: 0.0005–0.001' : 'suggested: 0.0001–0.0005';
+  recs['t-bs'] = isSmall ? 'suggested: 4–8' : isMed ? 'suggested: 16–32' : 'suggested: 32–64';
+  recs['t-ep'] = isSmall ? 'suggested: 50–200' : isMed ? 'suggested: 20–50' : 'suggested: 5–20';
+
+  return recs;
+}
+
+function applyHints(recs) {
+  for (const [id, text] of Object.entries(recs)) {
+    const el = $('#' + id);
+    if (!el) continue;
+    const label = el.closest('label.field');
+    if (!label) continue;
+    let hint = label.querySelector('.rec-hint');
+    if (!hint) {
+      hint = document.createElement('span');
+      hint.className = 'rec-hint';
+      hint.style.cssText = 'display:block;font-size:10px;color:#666;margin-bottom:2px;font-style:italic;';
+      label.querySelector('span').after(hint);
+    }
+    hint.textContent = text;
+  }
+}
+
+function refreshHints() {
+  if (!state.current) return;
+  applyHints(archRecs(state.current.architecture));
+  applyHints(trainingRecs());
 }
 
 function dataFormatHint(arch) {

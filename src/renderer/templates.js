@@ -70,7 +70,7 @@ window.NC_TEMPLATES = [
     trainingData: { text: DEFAULT_CORPUS() }
   },
   {
-    id: 'coder',
+    id: 'code_predictor',
     name: 'Code Predictor (char)',
     kind: 'charLM',
     desc: 'Small LM primed on JavaScript-like text. Starting point for a toy coding agent.',
@@ -86,6 +86,15 @@ window.NC_TEMPLATES = [
     arch: { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 128, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true },
     training: { optimizer: 'adam', learningRate: 0.002, batchSize: 32, epochs: 60, seed: 7, workers: 4 },
     trainingData: { samples: DEFAULT_CHAT_PAIRS() }
+  },
+  {
+    id: 'coder',
+    name: 'Coding Assistant (pairs)',
+    kind: 'charLM',
+    desc: 'An language model meant to be an agent designated for coding. Settings made to already be hard to train but strong in the long run.',
+    arch: { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 128, hidden: [128, 96, 64], activation: 'gelu', dropout: 0.1, isChat: true },
+    training: { optimizer: 'adam', learningRate: 0.01, batchSize: 256, epochs: 30, seed: 22, workers: 4 },
+    trainingData: { samples: DEFAULT_CODING_PAIRS() }
   }
 ];
 
@@ -144,6 +153,68 @@ function DEFAULT_CHAT_PAIRS() {
   // Repeat to give the network enough signal at this tiny scale.
   const out = [];
   for (let i = 0; i < 12; i++) for (const s of seed) out.push(s);
+  return out;
+}
+
+function DEFAULT_CODING_PAIRS() {
+  const seed = [
+    {
+      user: "Write a python script that prints hello world",
+      assistant: "print(\"Hello World\")"
+    },
+    {
+      user: "Make a python function that adds two numbers",
+      assistant: "def add(a, b):\\n    return a + b"
+    },
+    {
+      user: "Create a python loop that prints numbers 1 to 10",
+      assistant: "for i in range(1, 11):\\n    print(i)"
+    },
+    {
+      user: "Write a python script to read a file",
+      assistant: "with open(\"file.txt\", \"r\") as f:\\n    data = f.read()\\n    print(data)"
+    },
+    {
+      user: "Make a python class for a car",
+      assistant: "class Car:\\n    def __init__(self, brand):\\n        self.brand = brand\\n\\n    def drive(self):\\n        print(self.brand + \" is driving\")"
+    },
+    {
+      user: "Write python code to check if a number is even",
+      assistant: "def is_even(n):\\n    return n % 2 == 0"
+    },
+    {
+      user: "Create a python list and loop through it",
+      assistant: "items = [1, 2, 3, 4, 5]\\nfor item in items:\\n    print(item)"
+    },
+    {
+      user: "Make a simple calculator in python",
+      assistant: "def calc(a, b, op):\\n    if op == '+':\\n        return a + b\\n    elif op == '-':\\n        return a - b\\n    elif op == '*':\\n        return a * b\\n    elif op == '/':\\n        return a / b"
+    },
+    {
+      user: "Write python code to generate random number",
+      assistant: "import random\\nprint(random.randint(1, 100))"
+    },
+    {
+      user: "Create a python dictionary example",
+      assistant: "person = {\\n    \"name\": \"John\",\\n    \"age\": 25,\\n    \"city\": \"NY\"\\n}\\nprint(person)"
+    },
+    {
+      user: "Make python code to reverse a string",
+      assistant: "def reverse_string(s):\\n    return s[::-1]"
+    },
+    {
+      user: "Write python code for fibonacci sequence",
+      assistant: "def fib(n):\\n    a, b = 0, 1\\n    for _ in range(n):\\n        print(a)\\n        a, b = b, a + b"
+    }
+  ];
+
+  // Expand dataset for stronger training signal
+  const out = [];
+  for (let i = 0; i < 20; i++) {
+    for (const s of seed) {
+      out.push(s);
+    }
+  }
   return out;
 }
 

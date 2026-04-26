@@ -4,9 +4,9 @@ window.NB_DOCS = [
     title: 'Welcome',
     body: `
 <h1>Welcome to NeuralCabin</h1>
-<p>NeuralCabin is now a hybrid neural platform: a readable JavaScript application layer plus a staged Rust/WebGPU engine migration. The JavaScript backend remains available for transparency and fallback, while the native path introduces mixed precision, kernel fusion, and GPU execution hooks.</p>
-<p>The active runtime is selected by <code>src/engine/tensor.js</code>, which can load a native backend or fall back to <code>src/engine/tensor-js.js</code>. This keeps the existing UI/API stable while the Rust engine is integrated incrementally.</p>
-<p>Select a topic from the left sidebar to explore the engine internals, learn how to design and train networks, understand the training data formats, use the HTTP API, script experiments with NeuralScript, and more.</p>
+<p>NeuralCabin is a hybrid Electron/Rust neural network workbench — build, train, and deploy networks from the ground up with no external ML frameworks. It supports three training paradigms: supervised gradient descent, deep Q-Learning (DQN) for reinforcement learning, and neuroevolution (Selective Reproduction) for gradient-free evolutionary training.</p>
+<p>The compute engine is a two-layer hybrid: a pure-JavaScript autograd system handles the backward pass and graph construction; an optional Rust native binding (<code>native/rust-engine/</code>) accelerates the forward compute with parallelised CPU kernels. The active backend is selected automatically by <code>src/engine/tensor.js</code> — the JS fallback is always available if the Rust binding is absent.</p>
+<p>Select a topic from the left sidebar to explore the engine internals, learn how to design and train networks, use Q-Learning or neuroevolution, understand the training data formats, use the production-grade HTTP API, script experiments with NeuralScript, and more.</p>
 
 <h2>Quick start</h2>
 <ol>
@@ -100,11 +100,75 @@ window.NB_DOCS = [
 `
   },
   {
+    id: 'rust-backend',
+    title: 'Rust backend',
+    body: `
+<h1>Rust backend</h1>
+<p>NeuralCabin ships with an optional native Rust acceleration layer. When available, it replaces the JS implementations of all compute-heavy tensor operations (matmul, activations, loss functions, optimizers) with parallelised Rust kernels while keeping the JavaScript autograd graph fully intact.</p>
+
+<h2>Backend selection</h2>
+<p><code>src/engine/tensor.js</code> is the runtime backend selector. At startup it reads the <code>NEURALCABIN_ENGINE_BACKEND</code> environment variable:</p>
+<table>
+<tr><th>Value</th><th>Behaviour</th></tr>
+<tr><td><code>auto</code> (default)</td><td>Tries to load the Rust binding. Falls back to JS silently if the binding is absent or incompatible.</td></tr>
+<tr><td><code>js</code></td><td>Forces the pure-JavaScript engine unconditionally.</td></tr>
+<tr><td><code>rust</code></td><td>Requires the Rust binding. Throws on startup if the binding cannot be loaded.</td></tr>
+</table>
+<p>To override the binding path (useful during development):</p>
+<pre><code>NEURALCABIN_NATIVE_BINDING=/absolute/path/to/neuralcabin_node.node</code></pre>
+
+<h2>Building the Rust engine</h2>
+<p>Requires Rust stable ≥ 1.78 and Cargo.</p>
+<pre><code># Verify the Rust crate compiles cleanly (no .node output)
+npm run engine:check:rust
+
+# Build the N-API .node binding (release mode)
+npm run engine:build:rust</code></pre>
+<p>On Windows the output is <code>neuralcabin-node.win32-x64-msvc.node</code>. On Linux it is <code>neuralcabin-node.linux-x64-gnu.node</code>. The loader tries each name automatically.</p>
+
+<h2>What Rust accelerates</h2>
+<p>All operations below delegate to Rust when the binding is loaded. The autograd backward pass and graph traversal always run in JavaScript.</p>
+<table>
+<tr><th>Module</th><th>Operations</th></tr>
+<tr><td><code>cpu.rs</code> — tensor ops</td><td>add, sub, mul, mul_scalar, matmul, relu, leaky_relu, tanh, sigmoid, gelu (+ tcache), softmax, softmax_cross_entropy (+ probs cache), mse_loss, dropout (+ mask), embedding, sum_all, randn, has_nan_or_inf</td></tr>
+<tr><td><code>layers.rs</code> — layer passes</td><td>linear_forward, embedding_forward, embedding_backward (scatter-add), sequential_forward_inference</td></tr>
+<tr><td><code>optim.rs</code> — optimizers</td><td>sgd_step, adam_step, adamw_step, clip_grad_norm</td></tr>
+<tr><td><code>rl.rs</code> — Q-Learning</td><td>ReplayBuffer, epsilon_greedy, compute_td_targets, dqn_loss, dqn_huber_loss, soft_update_target</td></tr>
+<tr><td><code>neuroevolution.rs</code> — Selective Reproduction</td><td>mutate, crossover_uniform/single_point/arithmetic, tournament/roulette/truncation_select, evolve_generation, fitness_stats</td></tr>
+</table>
+
+<h2>Performance notes</h2>
+<ul>
+  <li>All CPU kernels are parallelised with <strong>Rayon</strong>. Worker count matches available CPU cores.</li>
+  <li>Matmul and activation kernels use an <strong>AVX2 FMA</strong> inner loop when supported, scalar otherwise.</li>
+  <li>The Mulberry32 PRNG in Rust matches the JS <code>rngFromSeed</code> exactly, so switching backends does not break reproducible runs.</li>
+  <li>For tiny networks (fewer than ~1 000 parameters) the JS engine is often faster due to N-API call overhead. The Rust path pays off at medium-to-large scale.</li>
+</ul>
+
+<h2>JS/Rust hybrid pattern</h2>
+<p>The N-API wrapper (<code>native/rust-engine/neuralcabin-node/index.js</code>) spreads the full JS tensor API and then overrides individual compute functions:</p>
+<pre><code>// What happens when gelu(x) is called with the Rust backend:
+// 1. JS calls native.geluOp(x.data, x.shape)          ← Rust compute
+// 2. Rust returns { data, shape, tcache }
+// 3. JS builds a Tensor and stores tcache in _backward ← autograd in JS
+// 4. backward() uses tcache instead of re-computing tanh</code></pre>
+<p>Every op not yet implemented in Rust automatically falls back to the JS implementation — no configuration required.</p>
+
+<h2>Checking the active backend</h2>
+<p>The Training log shows the backend when training starts:</p>
+<pre><code>training started (backend=rust/binding-loaded)</code></pre>
+<p>You can also retrieve backend metadata via IPC:</p>
+<pre><code>// In renderer or NeuralScript:
+const info = await window.nb.training.backendInfo();
+// { mode: 'rust', reason: 'binding-loaded', version: '0.2.0', threads: 8 }</code></pre>
+`
+  },
+  {
     id: 'tensor-engine',
     title: 'Tensor engine internals',
     body: `
 <h1>Tensor engine internals</h1>
-<p>NeuralCabin currently supports two tensor backends: a JavaScript implementation (<code>src/engine/tensor-js.js</code>) and a staged native Rust/WebGPU path (<code>native/rust-engine/</code>). <code>src/engine/tensor.js</code> selects the backend at runtime.</p>
+<p>NeuralCabin supports two tensor backends: a pure-JavaScript implementation (<code>src/engine/tensor-js.js</code>) and a native Rust path (<code>native/rust-engine/</code>). <code>src/engine/tensor.js</code> selects the backend at runtime (see the <strong>Rust backend</strong> topic for build and configuration details). The autograd system (graph construction, backward pass) always runs in JavaScript regardless of which backend is active.</p>
 
 <h2>The Tensor class</h2>
 <p>A <code>Tensor</code> holds three things:</p>
@@ -128,8 +192,8 @@ window.NB_DOCS = [
 <h2>matmul</h2>
 <p><code>matmul(a, b)</code> — matrix multiply with shape <code>[B,K] × [K,N] → [B,N]</code>. This is the dominant operation in training and has been carefully tuned. The loop order is <strong>i-k-j</strong> rather than the naive i-j-k, which means the inner loop sweeps contiguously through both the output row and the B row — enabling V8's JIT to elide bounds checks and achieve near-linear memory access patterns. The backward pass computes <code>dA = dOut · Bᵀ</code> and <code>dB = Aᵀ · dOut</code>, each also using the i-k-j loop order.</p>
 
-<h2>add (with bias broadcast)</h2>
-<p><code>add(a, b)</code> handles two shapes: same-shape elementwise addition, and the common case of a 2D activation <code>[B, N]</code> plus a 1D bias <code>[N]</code>. In the bias-add case, the backward sums the upstream gradient across the batch dimension to produce <code>∂L/∂bias</code> — this is the standard bias gradient accumulation.</p>
+<h2>add and sub (with bias broadcast)</h2>
+<p><code>add(a, b)</code> handles two shapes: same-shape elementwise addition, and the common case of a 2D activation <code>[B, N]</code> plus a 1D bias <code>[N]</code>. In the bias-add case, the backward sums the upstream gradient across the batch dimension to produce <code>∂L/∂bias</code>. <code>sub(a, b)</code> is the elementwise subtraction equivalent with the appropriate sign flip in the backward.</p>
 
 <h2>Activation ops</h2>
 <p>Each activation stores whatever it needs from the forward pass to compute the backward cheaply:</p>
@@ -149,8 +213,17 @@ window.NB_DOCS = [
 <p><code>dropout(a, p, training, rng)</code> — during training, samples a Bernoulli mask per element (probability <code>p</code> of zeroing) and scales surviving values by <code>1/(1-p)</code> (inverted dropout). During inference (<code>training=false</code>), the op is an identity — no mask is applied. The backward simply multiplies the upstream gradient by the same mask.</p>
 
 <h2>Loss functions</h2>
-<p><strong>softmaxCrossEntropy(logits, labels)</strong> — fused softmax + NLL loss. Computes log-sum-exp in a numerically stable way, returns a scalar mean loss over the batch, and stores the softmax probabilities for the backward. The backward gradient at logit <code>[i,j]</code> is <code>(p_ij − 1{j=y_i}) / B</code>.</p>
+<p><strong>softmaxCrossEntropy(logits, labels)</strong> — fused softmax + NLL loss. Computes log-sum-exp in a numerically stable way, returns a scalar mean loss over the batch, and stores the softmax probabilities for the backward. The backward gradient at logit <code>[i,j]</code> is <code>(p_ij − 1{j=y_i}) / B</code>. In the Rust path, the probs cache is returned alongside the loss and captured in the JS backward closure to avoid recomputing softmax.</p>
 <p><strong>mseLoss(a, b)</strong> — mean squared error. Backward gradient at index <code>i</code> is <code>2(a_i − b_i) / N</code>.</p>
+
+<h2>Additional ops</h2>
+<p>Beyond the core set documented above, the engine also exposes:</p>
+<ul>
+  <li><strong>sumAll(a)</strong> — reduces the entire tensor to a scalar. Used internally for gradient norm computation.</li>
+  <li><strong>randn(shape, rng)</strong> — standard-normal initialization via Box-Muller transform. The same function exists in the Rust core using Mulberry32 PRNG, producing identical values for the same seed.</li>
+  <li><strong>hasNanOrInf(a)</strong> — fast NaN/Inf guard. The Rust path scans in parallel with early exit. Used to detect exploding gradients and unstable training before saving a checkpoint.</li>
+  <li><strong>mulScalar(a, s)</strong> — broadcast scalar multiply. Used in gradient clipping and learning rate schedules.</li>
+</ul>
 
 <h2>Extending the engine</h2>
 <p>Adding a new operation follows a consistent pattern:</p>
@@ -289,6 +362,195 @@ W ← W − v</code></pre>
 <tr><td>LARS</td><td>0.1</td><td>eta=1e-3, momentum=0.9</td><td>Very large batch / distributed</td></tr>
 <tr><td>SGD</td><td>0.01</td><td>momentum=0.9</td><td>Baseline / interpretability</td></tr>
 </table>
+`
+  },
+  {
+    id: 'rl',
+    title: 'Q-Learning / DQN',
+    body: `
+<h1>Q-Learning and Deep Q-Networks</h1>
+<p>NeuralCabin includes a complete Deep Q-Network (DQN) implementation for reinforcement learning tasks. The agent learns to choose actions that maximise long-term reward by approximating a Q-value function with a neural network.</p>
+
+<h2>Core concepts</h2>
+<ul>
+  <li><strong>Q-value</strong> — Q(s, a) is the expected discounted future reward for taking action a in state s and then following the optimal policy.</li>
+  <li><strong>Bellman target</strong> — r + γ · max_a' Q_target(s', a'), where γ (gamma) is the discount factor. The online network trains toward this target.</li>
+  <li><strong>Experience replay</strong> — transitions (s, a, r, s', done) are stored in a circular buffer and sampled randomly to break temporal correlations.</li>
+  <li><strong>Target network</strong> — a separate copy of the network updated slowly (soft update or periodic hard copy) to stabilise training.</li>
+  <li><strong>ε-greedy policy</strong> — with probability ε pick a random action (explore), otherwise pick the action with highest Q-value (exploit). ε decays over training.</li>
+</ul>
+
+<h2>DQNAgent quick start</h2>
+<pre><code>const { DQNAgent } = require('./src/engine/rl');
+
+const agent = new DQNAgent({
+  architecture: {
+    kind:      'classifier',
+    inputDim:  4,     // observation space dimension
+    outputDim: 2,     // number of discrete actions
+    hidden:    [64, 64]
+  },
+  gamma:            0.99,   // discount factor
+  lr:               1e-3,
+  batchSize:        64,
+  epsilonStart:     1.0,
+  epsilonEnd:       0.05,
+  epsilonDecay:     0.995,  // multiplicative decay per trainStep
+  targetUpdateFreq: 100,    // hard-sync every N trainSteps
+  seed:             42,
+});
+
+// Episode loop
+let state = env.reset();
+for (let step = 0; step &lt; maxSteps; step++) {
+  const action              = agent.selectAction(state);          // ε-greedy
+  const { nextState, reward, done } = env.step(action);
+  agent.observe(state, action, reward, nextState, done);          // store transition
+  const loss                = agent.trainStep();                  // null until buffer ready
+  if (done) break;
+  state = nextState;
+}</code></pre>
+
+<h2>Soft target sync</h2>
+<p>In addition to the periodic hard-copy (controlled by <code>targetUpdateFreq</code>), you can Polyak-average the target network each step:</p>
+<pre><code>agent.softSyncTarget(0.005); // θ_target ← (1−τ)·θ_target + τ·θ_online</code></pre>
+<p>Soft updates with τ ≈ 0.005 are smoother than periodic hard copies and preferred in most modern DQN variants.</p>
+
+<h2>Saving and loading</h2>
+<pre><code>const snapshot = agent.toJSON();
+
+const agent2 = DQNAgent.fromJSON(snapshot, { lr: 1e-3, seed: 42 });</code></pre>
+
+<h2>ReplayBuffer (standalone)</h2>
+<pre><code>const { ReplayBuffer } = require('./src/engine/rl');
+const buf = new ReplayBuffer(10000, 4, 1); // capacity, stateDim, actionDim
+
+buf.push(state, action, reward, nextState, done);
+const batch = buf.sample(64, seed);
+// batch: { states, actions, rewards, nextStates, dones }</code></pre>
+
+<h2>DQNAgent constructor options</h2>
+<table>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+<tr><td><code>architecture</code></td><td>required</td><td>Network spec (kind, inputDim, outputDim, hidden[])</td></tr>
+<tr><td><code>gamma</code></td><td>0.99</td><td>Discount factor for future rewards</td></tr>
+<tr><td><code>lr</code></td><td>1e-3</td><td>Learning rate for the online Q-network</td></tr>
+<tr><td><code>batchSize</code></td><td>64</td><td>Transitions sampled per trainStep</td></tr>
+<tr><td><code>epsilonStart</code></td><td>1.0</td><td>Initial ε (fully random at start)</td></tr>
+<tr><td><code>epsilonEnd</code></td><td>0.05</td><td>Minimum ε after decay</td></tr>
+<tr><td><code>epsilonDecay</code></td><td>0.995</td><td>Multiplicative decay per trainStep</td></tr>
+<tr><td><code>targetUpdateFreq</code></td><td>100</td><td>Hard-sync target every N trainSteps (0 = never)</td></tr>
+<tr><td><code>replayCapacity</code></td><td>10000</td><td>Maximum transitions in the replay buffer</td></tr>
+<tr><td><code>seed</code></td><td>null</td><td>RNG seed for deterministic action selection and buffer sampling</td></tr>
+</table>
+
+<h2>Rust acceleration</h2>
+<p>When the Rust backend is active, the following RL operations run natively:</p>
+<ul>
+  <li><code>epsilon_greedy</code> — action selection from Q-value array</li>
+  <li><code>compute_td_targets</code> — vectorised Bellman targets: r + γ · max Q(s')</li>
+  <li><code>dqn_loss</code> / <code>dqn_huber_loss</code> — MSE or Huber loss over chosen-action Q values + per-sample gradient</li>
+  <li><code>soft_update_target</code> — Polyak averaging over the full parameter vector</li>
+  <li><code>ReplayBuffer.sample</code> — random mini-batch sampling with Mulberry32 seed</li>
+</ul>
+`
+  },
+  {
+    id: 'neuroevolution',
+    title: 'Neuroevolution',
+    body: `
+<h1>Neuroevolution — Selective Reproduction</h1>
+<p>Neuroevolution trains neural networks without gradient descent. A population of networks evolves over generations: high-fitness individuals survive and reproduce; low-fitness ones are replaced. NeuralCabin implements a full evolutionary loop with three selection strategies, three crossover strategies, Gaussian or uniform mutation, and configurable elitism.</p>
+
+<h2>When to use neuroevolution</h2>
+<ul>
+  <li>The reward signal is <strong>non-differentiable</strong> — e.g. a game score, win/loss outcome, or a physics simulation you can only evaluate, not differentiate through.</li>
+  <li>The search space is <strong>multi-modal</strong> — gradient descent can get stuck in local minima; evolutionary algorithms explore broader regions.</li>
+  <li>You want to train <strong>without a loss function</strong> — just define a fitness function that scores each network's behaviour as a number.</li>
+</ul>
+
+<h2>Population quick start</h2>
+<pre><code>const { Population } = require('./src/engine/neuroevolution');
+
+const pop = new Population({
+  architecture: { kind: 'classifier', inputDim: 4, outputDim: 2, hidden: [32, 32] },
+  size:        50,    // number of individuals
+  eliteCount:  5,     // top-N survive unchanged each generation
+  pMutate:     0.1,   // per-weight mutation probability
+  mutationStd: 0.02,  // Gaussian mutation standard deviation
+  tournamentK: 3,     // tournament pool size
+  seed:        42,
+});
+
+for (let gen = 0; gen &lt; 200; gen++) {
+  // Score each individual — fitnessFn(model, index) → number (higher = better)
+  pop.evaluate((model, i) => runEpisode(model));
+
+  const stats = pop.evolve();
+  // stats: { min, max, mean, std }
+}
+
+const best = pop.getBest();</code></pre>
+
+<h2>Async convenience wrapper</h2>
+<pre><code>const { evolveNetwork } = require('./src/engine/neuroevolution');
+
+const result = await evolveNetwork(
+  pop,
+  200,                                        // max generations
+  async (model) => runEpisodeAsync(model),
+  {
+    onGeneration: ({ generation, stats }) => console.log(generation, stats.max),
+    shouldStop:   () => earlyStopFlag,        // optional early-exit predicate
+  }
+);
+// result: { best, generation, stats }</code></pre>
+
+<h2>Selection strategies</h2>
+<table>
+<tr><th>Strategy</th><th>Description</th><th>Best for</th></tr>
+<tr><td>Tournament (default)</td><td>Pick k random individuals; the fittest becomes a parent. k controls selection pressure.</td><td>Most tasks. k = 3–5 is a good starting point.</td></tr>
+<tr><td>Roulette</td><td>Probability of selection ∝ fitness (fitness-proportionate).</td><td>When fitnesses are positive and well-spread. Fails if fitness is zero or negative.</td></tr>
+<tr><td>Truncation</td><td>Only the top-N% can become parents.</td><td>High-pressure selection; converges faster but reduces diversity.</td></tr>
+</table>
+
+<h2>Crossover strategies</h2>
+<table>
+<tr><th>Strategy</th><th>Description</th></tr>
+<tr><td>Uniform (default)</td><td>Each weight is taken from parent 1 or parent 2 with equal probability (coin flip per weight).</td></tr>
+<tr><td>Single-point</td><td>A random split divides the weight vector; one half comes from each parent.</td></tr>
+<tr><td>Arithmetic</td><td>Weighted average: child = α·p1 + (1−α)·p2. Produces smooth interpolation.</td></tr>
+</table>
+
+<h2>Mutation</h2>
+<ul>
+  <li><strong>Gaussian</strong> (default) — each selected weight ← w + N(0, mutationStd). Standard deviation controls magnitude.</li>
+  <li><strong>Uniform</strong> — each selected weight ← w + Uniform(−scale, +scale). Configured via <code>mutate_uniform</code> in the Rust core.</li>
+</ul>
+
+<h2>Elitism</h2>
+<p>The top <code>eliteCount</code> individuals by fitness are copied to the next generation unchanged, before selection/crossover/mutation runs. This guarantees the best solution never regresses. Values of 1–5 are typical; higher values reduce diversity.</p>
+
+<h2>Saving and loading</h2>
+<pre><code>const snapshot = pop.toJSON();
+// { architecture, size, eliteCount, pMutate, mutationStd, seed, individuals: [...] }
+
+const restored = Population.fromJSON(snapshot);</code></pre>
+
+<h2>Population constructor options</h2>
+<table>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+<tr><td><code>architecture</code></td><td>required</td><td>Network spec shared by all individuals</td></tr>
+<tr><td><code>size</code></td><td>50</td><td>Population size</td></tr>
+<tr><td><code>eliteCount</code></td><td>2</td><td>Top-N copied unchanged each generation</td></tr>
+<tr><td><code>pMutate</code></td><td>0.05</td><td>Per-weight mutation probability</td></tr>
+<tr><td><code>mutationStd</code></td><td>0.02</td><td>Gaussian mutation standard deviation</td></tr>
+<tr><td><code>tournamentK</code></td><td>3</td><td>Tournament pool size</td></tr>
+<tr><td><code>seed</code></td><td>null</td><td>RNG seed for reproducible evolution</td></tr>
+</table>
+
+<h2>Rust acceleration</h2>
+<p>When the Rust backend is active, <code>pop.evolve()</code> runs the entire generation in Rust — selection, crossover, mutation, and elitism — as a single vectorised call over the flattened population parameter array. This is significantly faster than the JS fallback for large populations.</p>
 `
   },
   {
@@ -656,6 +918,8 @@ print reply</code></pre>
 <tr><td><code>/predict</code></td><td>POST</td><td>Stateless inference. Pass a JSON body matching the network's input format. For chat models, pass a full history each time.</td></tr>
 <tr><td><code>/chat</code></td><td>POST</td><td><strong>Chat models only.</strong> Stateful endpoint — the server maintains conversation threads keyed by <code>sessionId</code>.</td></tr>
 <tr><td><code>/chat/reset</code></td><td>POST</td><td>Clears the session history for a given <code>sessionId</code>.</td></tr>
+<tr><td><code>/health</code></td><td>GET</td><td>Liveness probe. Always <code>200 OK</code>. Never auth-gated or rate-limited.</td></tr>
+<tr><td><code>/metrics</code></td><td>GET</td><td>Prometheus text-format metrics (request count, error count, avg latency, uptime). Requires auth if enabled.</td></tr>
 </table>
 
 <h2>Classifier / Regressor</h2>
@@ -746,8 +1010,53 @@ const first = await chat(null, 'Hello');
 // Continue the thread:
 const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
 
+<h2>Authentication</h2>
+<p>When the API server is started with an <code>authSecret</code>, all endpoints except <code>/health</code> require a Bearer token. Tokens are HS256-signed JWTs issued by NeuralCabin using Node's built-in <code>crypto</code> module — no external dependencies.</p>
+<pre><code># Start with auth enabled (via API tab or IPC)
+# authSecret: any string — keep it secret
+
+# Issue a token from the app (via IPC: api:issue-token)
+# curl with the token:
+curl -X POST http://localhost:PORT/predict \\
+  -H "Authorization: Bearer &lt;token&gt;" \\
+  -H "Content-Type: application/json" \\
+  -d '{"input": [0, 1]}'</code></pre>
+<p>Tokens can be set to expire (e.g. 3600 for one hour) or last indefinitely. A request with a missing, malformed, or expired token receives <code>401 Unauthorized</code>.</p>
+<p>When no <code>authSecret</code> is configured, the server is open — any request is accepted.</p>
+
+<h2>Rate limiting</h2>
+<p>By default the server allows <strong>120 requests per minute per IP address</strong> using a sliding-window algorithm. Requests that exceed the limit receive <code>429 Too Many Requests</code>. Configure the limit when starting the server:</p>
+<pre><code># Start with a custom rate limit (30 req/min per IP)
+# via IPC: api:start with opts.rateLimit = 30</code></pre>
+<p>The <code>/health</code> endpoint is exempt from rate limiting.</p>
+
+<h2>Health endpoint</h2>
+<p><code>GET /health</code> — always returns <code>200 OK</code>, never rate-limited, never auth-gated. Use it as a liveness probe:</p>
+<pre><code>curl http://localhost:PORT/health
+{ "ok": true, "uptime": 42.3 }</code></pre>
+
+<h2>Metrics endpoint</h2>
+<p><code>GET /metrics</code> — returns Prometheus text-format metrics for the server instance. Requires auth if <code>authSecret</code> is set.</p>
+<pre><code>curl -H "Authorization: Bearer &lt;token&gt;" http://localhost:PORT/metrics
+
+# HELP neuralcabin_requests_total Total requests served
+# TYPE neuralcabin_requests_total counter
+neuralcabin_requests_total{network="my-net"} 1234
+
+# HELP neuralcabin_errors_total Total error responses
+# TYPE neuralcabin_errors_total counter
+neuralcabin_errors_total{network="my-net"} 2
+
+# HELP neuralcabin_latency_avg_ms Average request latency (ms)
+# TYPE neuralcabin_latency_avg_ms gauge
+neuralcabin_latency_avg_ms{network="my-net"} 3.7
+
+# HELP neuralcabin_uptime_seconds Server uptime in seconds
+# TYPE neuralcabin_uptime_seconds gauge
+neuralcabin_uptime_seconds{network="my-net"} 3601.2</code></pre>
+
 <h2>Security notes</h2>
-<p>The API server binds to all network interfaces by default so devices on the same LAN can reach it. No authentication is implemented. Do not expose it to the public internet. If you need to restrict access, use your OS firewall to allow only specific IP addresses to reach the chosen port.</p>
+<p>The API server binds to all network interfaces by default so devices on the same LAN can reach it. For internal use, rate limiting and no auth is usually sufficient. If you expose the server beyond your LAN, always enable <code>authSecret</code> and consider your OS firewall as a second layer of defence.</p>
 `
   },
   {
@@ -789,14 +1098,14 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
 <h1>No frameworks. No abstraction tax.</h1>
 <p>Production ML frameworks — PyTorch, TensorFlow, JAX — are built for scale and generality. That means they sit behind tens of thousands of lines of kernel dispatch code, custom CUDA ops, and multi-level JIT compilation infrastructure. The depth is appropriate when you're training billion-parameter models on distributed GPU clusters. For understanding what a network is actually doing at the arithmetic level, or for small to medium models where none of that infrastructure provides any benefit, it's just noise standing between you and the computation.</p>
 
-<p>The NeuralCabin engine (see <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">the source</a>) is a hybrid JavaScript + Rust/WebGPU implementation. You can open <code>src/engine/tensor-js.js</code> and read the full JS autograd system in one sitting, while <code>native/rust-engine/neuralcabin-core/src/</code> contains the native kernel path. You can trace a gradient backward through a specific operation, verify the chain rule application by hand, and confirm it matches what the code computes. You can add a new activation function in ten lines. You can swap in a different optimizer and watch it change the loss curve. Nothing is hidden.</p>
+<p>The NeuralCabin engine (see <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">the source</a>) is a hybrid JavaScript + Rust implementation. You can open <code>src/engine/tensor-js.js</code> and read the full JS autograd system in one sitting, while <code>native/rust-engine/neuralcabin-core/src/</code> contains the native kernel path. You can trace a gradient backward through a specific operation, verify the chain rule application by hand, and confirm it matches what the code computes. You can add a new activation function in ten lines. You can swap in a different optimizer and watch it change the loss curve. Nothing is hidden.</p>
 
 <h2>What you trade away</h2>
 <ul>
-  <li><strong>GPU path is staged.</strong> The Rust core includes WebGPU runtime scaffolding and fused kernel templates; the JS backend remains the compatibility fallback.</li>
-  <li><strong>Distributed training contracts are present.</strong> AllReduce interfaces are now part of the native core, with transport wiring staged.</li>
-  <li><strong>Mixed precision is now part of the migration path.</strong> FP16/BF16 dtypes are available in the Rust core APIs.</li>
+  <li><strong>No GPU path (yet).</strong> The Rust core runs on CPU with Rayon parallelism and AVX2 FMA. A WebGPU path is architecturally possible but not implemented.</li>
   <li><strong>No Transformer blocks out of the box.</strong> The primitives (matmul, embedding, softmax, gelu) are all present, and NeuralScript can compose them, but there is no pre-built attention layer.</li>
+  <li><strong>No distributed training.</strong> Everything runs in a single Electron process on a single machine.</li>
+  <li><strong>Mixed precision is available in the Rust dtype API but not exposed in the UI.</strong> FP16/BF16 dtypes are present in the Rust tensor type; the JS layer uses F32 throughout.</li>
 </ul>
 
 <h2>What you get in return</h2>
@@ -1230,37 +1539,50 @@ if (file) {
 
 <h2>Repository layout</h2>
 <pre><code>src/
-  engine/      tensor.js (selector), tensor-js.js (JS backend),
-               tensor-native-loader.js, layers.js, optim.js, model.js,
-               tokenizer.js, chat-format.js, trainer.js
+  engine/      tensor.js (backend selector)
+               tensor-js.js (pure-JS autograd engine)
+               tensor-native-loader.js (N-API compatibility check)
+               layers.js, optim.js, model.js, trainer.js
+               rl.js (Q-Learning / DQN agent)
+               neuroevolution.js (Selective Reproduction / Population)
+               tokenizer.js, chat-format.js
   dsl/         lexer.js, parser.js, compiler.js, typecheck.js, interpreter.js
   main/        main.js, preload.js, storage.js,
                training-manager.js, api-server.js
   renderer/    index.html, styles.css, app.js,
                templates.js, docs.js
 native/
-  rust-engine/         neuralcabin-core + neuralcabin-node
-  cpp-inference-server/ C++ serving scaffold
+  rust-engine/
+    neuralcabin-core/   Rust library (cpu, layers, optim, rl, neuroevolution)
+    neuralcabin-node/   N-API bridge (src/lib.rs + index.js)
+  cpp-inference-server/ C++ inference scaffold
 docs/          rust-migration.md
 tests/         run-tests.js
 assets/        icon.png, make-icon.js</code></pre>
 
 <h2>Running from source</h2>
 <pre><code>npm install
-npm start          # launches the Electron app
-npm test           # runs the engine test harness
-npm run build:win  # builds NeuralCabin-Setup-1.0.0.exe
+npm start               # launches the Electron app
+npm test                # runs the engine test harness
+npm run build:win       # builds NeuralCabin-Setup-x.x.x.exe
 npm run engine:check:rust
 npm run engine:build:rust
 npm run server:build:cpp</code></pre>
 
 <h2>Adding a new tensor op</h2>
+<p>There are two paths depending on whether you want Rust acceleration:</p>
+<p><strong>JS-only op</strong> (always available, no build step):</p>
 <ol>
-  <li>Open <code>src/engine/tensor-js.js</code> for JS backend ops, or <code>native/rust-engine/neuralcabin-core/src/</code> for native kernels.</li>
-  <li>Implement the forward pass into a new <code>Tensor</code> with <code>requiresGrad</code> set correctly.</li>
-  <li>Assign <code>out._parents</code> and <code>out._backward</code>. Use <code>+=</code> in all gradient accumulations.</li>
-  <li>Export from the bottom of the file.</li>
-  <li>Add a test case in <code>tests/run-tests.js</code>. Verify the gradient numerically with finite differences if in doubt.</li>
+  <li>Open <code>src/engine/tensor-js.js</code>.</li>
+  <li>Implement the forward pass, set <code>requiresGrad</code>, assign <code>out._parents</code> and <code>out._backward</code>. Use <code>+=</code> in all gradient accumulations.</li>
+  <li>Export from the bottom of the file and add a test in <code>tests/run-tests.js</code>.</li>
+</ol>
+<p><strong>Rust-accelerated op</strong>:</p>
+<ol>
+  <li>Implement the kernel in <code>native/rust-engine/neuralcabin-core/src/cpu.rs</code>.</li>
+  <li>Expose it as a <code>#[napi]</code> function in <code>native/rust-engine/neuralcabin-node/src/lib.rs</code>.</li>
+  <li>Override the JS fallback in <code>native/rust-engine/neuralcabin-node/index.js</code>, capturing any backward cache (tcache, probs, mask) from the Rust result.</li>
+  <li>Run <code>npm run engine:build:rust</code> and add a test case.</li>
 </ol>
 
 <h2>Adding a new layer type</h2>

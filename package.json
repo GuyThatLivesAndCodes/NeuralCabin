@@ -1,6 +1,6 @@
 {
   "name": "neuralcabin",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Build neural networks from the ground up. No frameworks, no fluff.",
   "main": "src/main/main.js",
   "author": "NeuralCabin",

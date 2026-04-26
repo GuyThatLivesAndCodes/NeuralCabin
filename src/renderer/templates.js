@@ -95,6 +95,15 @@ window.NC_TEMPLATES = [
     arch: { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 128, hidden: [128, 96, 64], activation: 'gelu', dropout: 0.1, isChat: true },
     training: { optimizer: 'adam', learningRate: 0.01, batchSize: 256, epochs: 30, seed: 22, workers: 4 },
     trainingData: { samples: DEFAULT_CODING_PAIRS() }
+  },
+  {
+    id: 'gpt',
+    name: 'GPT (Document-based)',
+    kind: 'gpt',
+    desc: 'Upload documents (.txt, .md, .md, etc.) to train a model that completes sentence stems with document knowledge.',
+    arch: { kind: 'gpt', vocabSize: 0, embDim: 32, contextLen: 96, hidden: [96, 96], activation: 'gelu', dropout: 0.1, tokenizerKind: 'wordpart' },
+    training: { optimizer: 'adam', learningRate: 0.002, batchSize: 32, epochs: 40, seed: 42, workers: 0 },
+    trainingData: { text: DEFAULT_CORPUS() }
   }
 ];
 

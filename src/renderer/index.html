@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline';" />
   <title>NeuralCity</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -20,6 +20,7 @@
         <button class="tab" data-tab="api">API</button>
         <button class="tab" data-tab="script">Script</button>
         <button class="tab" data-tab="docs">Docs</button>
+        <button class="tab" data-tab="plugins">Plugins</button>
       </nav>
       <div class="header-actions">
         <button class="btn ghost" id="btn-import">Import</button>
@@ -68,6 +69,8 @@
               <option value="regressor">Regressor (vector in, vector out)</option>
               <option value="charLM">Character Language Model (free-form text)</option>
               <option value="chat">Chat Assistant (user → assistant pairs)</option>
+              <option value="gpt">GPT (document-based text completion)</option>
+              <option value="plugin">Plugin Models</option>
             </select>
           </label>
           <div class="template-grid" id="template-grid"></div>

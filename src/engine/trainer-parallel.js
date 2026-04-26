@@ -132,8 +132,31 @@ async function trainNetworkParallel(network, hooks = {}) {
   let L = 0;
   let N = 0;
 
-  if (arch.kind === 'charLM') {
-    const corpus = ChatFormat.buildCorpus(data);
+  if (arch.kind === 'charLM' || arch.kind === 'gpt') {
+    let corpusInput = data;
+    if (arch.kind === 'gpt' && Array.isArray(data.documents)) {
+      const docText = data.documents.map(d => d.content || '').filter(Boolean).join('\n\n---\n\n');
+      const validStems = Array.isArray(data.samples) ? data.samples.filter(s => s.user && s.output) : [];
+      let combined;
+      if (validStems.length > 0) {
+        const chunkSize = Math.max(300, (arch.contextLen || 96) * 3);
+        const chunks = [];
+        for (let i = 0; i < docText.length; i += chunkSize) {
+          const chunk = docText.slice(i, i + chunkSize).trim();
+          if (chunk) chunks.push(chunk);
+        }
+        if (!chunks.length) chunks.push(docText);
+        combined = chunks.map((chunk, i) => {
+          const stem = validStems[i % validStems.length];
+          return `<|user|>${stem.user}<|end|><|assistant|>${stem.output} ${chunk}<|end|>`;
+        }).join('\n');
+        arch.isChat = true;
+      } else {
+        combined = docText;
+      }
+      corpusInput = { text: combined };
+    }
+    const corpus = ChatFormat.buildCorpus(corpusInput);
     const text = corpus.text;
     if (text.length < arch.contextLen + 2) {
       throw new Error(corpus.isChat
@@ -290,7 +313,7 @@ async function trainNetworkParallel(network, hooks = {}) {
   const start = Date.now();
   const metrics = [];
 
-  if (arch.kind === 'charLM') {
+  if (arch.kind === 'charLM' || arch.kind === 'gpt') {
     const stepsPerEpoch = Math.max(1, Math.floor(N / (batchSize * numWorkers)));
     const totalSteps = epochs * stepsPerEpoch;
     let globalStep = 0;

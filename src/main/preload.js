@@ -20,7 +20,15 @@ contextBridge.exposeInMainWorld('nc', {
     onError: (cb) => ipcRenderer.on('training:error', (_, p) => cb(p))
   },
   inference: {
-    run: (id, input) => ipcRenderer.invoke('inference:run', id, input)
+    run: (id, input) => ipcRenderer.invoke('inference:run', id, input),
+    streamStart: (id, input, onToken) => {
+      const listener = (_, chunk) => onToken(chunk);
+      ipcRenderer.on('inference:token', listener);
+      return ipcRenderer.invoke('inference:stream-start', id, input).finally(() => {
+        ipcRenderer.removeListener('inference:token', listener);
+      });
+    },
+    cancel: () => ipcRenderer.send('inference:cancel')
   },
   api: {
     start: (id, port) => ipcRenderer.invoke('api:start', id, port),
@@ -45,5 +53,17 @@ contextBridge.exposeInMainWorld('nc', {
   dialog: {
     openFile: (opts) => ipcRenderer.invoke('dialog:openFile', opts),
     readTextFile: (opts) => ipcRenderer.invoke('dialog:readTextFile', opts)
+  },
+  gpt: {
+    pickDocuments: () => ipcRenderer.invoke('gpt:pickDocuments')
+  },
+  plugins: {
+    list:      ()                         => ipcRenderer.invoke('plugins:list'),
+    install:   ()                         => ipcRenderer.invoke('plugins:install'),
+    uninstall: (id)                       => ipcRenderer.invoke('plugins:uninstall', id),
+    invoke:    (pluginId, channel, ...args) => ipcRenderer.invoke(`plugin:${pluginId}:${channel}`, ...args)
+  },
+  app: {
+    restart: () => ipcRenderer.invoke('app:restart')
   }
 });

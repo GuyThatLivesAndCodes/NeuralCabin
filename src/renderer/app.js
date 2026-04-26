@@ -11,9 +11,8 @@ const state = {
   apiServers: new Map(), // id -> {port, url}
   apiLogs: [],
   currentDocId: 'welcome',
-  // Per-network chat sessions for the in-app Inference tab. Keyed by network id
-  // so switching nets doesn't trample running conversations.
-  chatSessions: new Map() // id -> { history: [{role, content}], system: string, busy: bool }
+  chatSessions: new Map(), // id -> { history, system, busy, editingIndex }
+  gptEditor: { docs: [], stems: [], editingDocIdx: null }
 };
 
 function getChatSession(id) {
@@ -31,6 +30,36 @@ function getChatSession(id) {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ---------- plugin registry ----------
+
+const pluginRegistry = {
+  templates: [],
+  inferenceRenderers: {}, // pluginKind → { fn(root, net, nc), pluginId }
+  trainEditors: {}        // pluginKind → { fn(root, net, nc), pluginId }
+};
+
+async function initPlugins() {
+  let plugins;
+  try { plugins = await window.nc.plugins.list(); }
+  catch (e) { console.warn('Plugin system unavailable:', e.message); return; }
+  for (const p of plugins) {
+    if (!p.rendererCode) continue;
+    const api = {
+      registerTemplate:         t    => pluginRegistry.templates.push(t),
+      registerInferenceRenderer:(kind, fn) => { pluginRegistry.inferenceRenderers[kind] = { fn, pluginId: p.id }; },
+      registerTrainEditor:      (kind, fn) => { pluginRegistry.trainEditors[kind]       = { fn, pluginId: p.id }; },
+      invoke:                   (ch, ...a) => window.nc.plugins.invoke(p.id, ch, ...a)
+    };
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function('api', p.rendererCode)(api);
+    } catch (e) { console.error(`Plugin "${p.id}" renderer failed:`, e); }
+  }
+  for (const t of pluginRegistry.templates) {
+    if (!window.NC_TEMPLATES.find(x => x.id === t.id)) window.NC_TEMPLATES.push(t);
+  }
+}
+
 // ---------- boot ----------
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -40,6 +69,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   bindApiStreams();
   await refreshNetworks();
   await fillSystemInfo();
+  await initPlugins();
   renderActiveTab();
 });
 
@@ -164,6 +194,7 @@ function renderActiveTab() {
     case 'api': return renderApiPanel();
     case 'script': return renderScriptTab(content);
     case 'docs': return renderDocsTab(content);
+    case 'plugins': return renderPluginsTab(content);
   }
 }
 
@@ -220,19 +251,23 @@ function renderNetworksTab(root) {
           <label class="field"><span>Workers (parallelism)</span><input id="t-workers" type="number" min="1" value="${n.training.workers ?? 0}"></label>
         </div>
         <div class="hint" style="margin-top:6px;">
-          <b>Workers</b> = number of CPU cores to use in parallel. <code>0</code> or <code>1</code> = single-threaded (legacy). Set to your core count for ${n.architecture.kind === 'charLM' ? 'large charLMs' : 'larger models'} — effective batch becomes <code>workers × batch size</code>, gradients are averaged across workers per step.
+          <b>Workers</b> = number of CPU cores to use in parallel. <code>0</code> or <code>1</code> = single-threaded (legacy). Set to your core count for ${(n.architecture.kind === 'charLM' || n.architecture.kind === 'gpt') ? 'large models' : 'larger models'} — effective batch becomes <code>workers × batch size</code>, gradients are averaged across workers per step.
         </div>
       </div>
 
       <div class="section">
         <h3>Training data</h3>
-        <p class="hint">${dataFormatHint(a)}</p>
-        <div class="row" style="margin-bottom:8px;">
-          <button class="btn sm" id="btn-import-data">Import from file</button>
-          <div class="spacer"></div>
-          <span class="inline-tag" id="data-stats"></span>
-        </div>
-        <textarea class="code-editor" id="data-json" style="min-height:220px;"></textarea>
+        ${a.pluginKind && pluginRegistry.trainEditors[a.pluginKind]
+          ? `<div id="plugin-train-editor"></div>`
+          : a.kind === 'gpt' ? gptEditorHtml() : `
+            <p class="hint">${dataFormatHint(a)}</p>
+            <div class="row" style="margin-bottom:8px;">
+              <button class="btn sm" id="btn-import-data">Import from file</button>
+              <div class="spacer"></div>
+              <span class="inline-tag" id="data-stats"></span>
+            </div>
+            <textarea class="code-editor" id="data-json" style="min-height:220px;"></textarea>
+          `}
       </div>
 
       <div class="section">
@@ -256,35 +291,49 @@ function renderNetworksTab(root) {
     </div>
   `;
 
-  // populate training data textarea
-  const dataArea = $('#data-json');
-  dataArea.value = JSON.stringify(n.trainingData || {}, null, 2);
-  updateDataStats();
-  refreshHints();
-  dataArea.addEventListener('input', () => { updateDataStats(); refreshHints(); });
-
-  $('#btn-import-data').addEventListener('click', async () => {
-    const res = await window.nc.dialog.readTextFile({
-      properties: ['openFile'],
-      filters: [{ name: 'Text / JSON', extensions: ['json', 'txt', 'jsonl'] }]
-    });
-    if (!res) return;
-    const ext = (res.path.split('.').pop() || '').toLowerCase();
-    if (ext === 'json') {
-      dataArea.value = res.content;
-    } else if (a.kind === 'charLM') {
-      dataArea.value = JSON.stringify({ text: res.content }, null, 2);
-    } else {
-      // try jsonl -> array
-      try {
-        const lines = res.content.split('\n').filter(Boolean).map(l => JSON.parse(l));
-        dataArea.value = JSON.stringify({ samples: lines }, null, 2);
-      } catch (e) {
-        dataArea.value = res.content;
-      }
-    }
+  if (a.pluginKind && pluginRegistry.trainEditors[a.pluginKind]) {
+    const { fn, pluginId } = pluginRegistry.trainEditors[a.pluginKind];
+    const nc = { invoke: (ch, ...args) => window.nc.plugins.invoke(pluginId, ch, ...args) };
+    fn(document.getElementById('plugin-train-editor'), n, nc);
+  } else if (a.kind === 'gpt') {
+    // init gpt editor state from saved trainingData
+    const td = n.trainingData || {};
+    state.gptEditor = {
+      docs: Array.isArray(td.documents) ? td.documents.map(d => ({ ...d })) : [],
+      stems: Array.isArray(td.samples) ? td.samples.map(s => ({ ...s })) : [],
+      editingDocIdx: null
+    };
+    bindGptEditor();
+  } else {
+    // populate training data textarea
+    const dataArea = $('#data-json');
+    dataArea.value = JSON.stringify(n.trainingData || {}, null, 2);
     updateDataStats();
-  });
+    refreshHints();
+    dataArea.addEventListener('input', () => { updateDataStats(); refreshHints(); });
+
+    $('#btn-import-data').addEventListener('click', async () => {
+      const res = await window.nc.dialog.readTextFile({
+        properties: ['openFile'],
+        filters: [{ name: 'Text / JSON', extensions: ['json', 'txt', 'jsonl', 'md', 'docs'] }]
+      });
+      if (!res) return;
+      const ext = (res.path.split('.').pop() || '').toLowerCase();
+      if (ext === 'json') {
+        dataArea.value = res.content;
+      } else if (a.kind === 'charLM') {
+        dataArea.value = JSON.stringify({ text: res.content }, null, 2);
+      } else {
+        try {
+          const lines = res.content.split('\n').filter(Boolean).map(l => JSON.parse(l));
+          dataArea.value = JSON.stringify({ samples: lines }, null, 2);
+        } catch (e) {
+          dataArea.value = res.content;
+        }
+      }
+      updateDataStats();
+    });
+  }
 
   $('#btn-save').addEventListener('click', saveEditor);
   $('#btn-dup').addEventListener('click', async () => {
@@ -327,9 +376,17 @@ function renderNetworksTab(root) {
 }
 
 function updateDataStats() {
-  const area = $('#data-json');
   const tag = $('#data-stats');
-  if (!area || !tag) return;
+  if (!tag) return;
+  if (state.current?.architecture?.kind === 'gpt') {
+    const ed = state.gptEditor;
+    const chars = ed.docs.reduce((s, d) => s + (d.content?.length || 0), 0);
+    const stems = ed.stems.filter(s => s.user && s.output).length;
+    tag.textContent = `${ed.docs.length} doc${ed.docs.length !== 1 ? 's' : ''} · ${chars.toLocaleString()} chars · ${stems} stem${stems !== 1 ? 's' : ''}`;
+    return;
+  }
+  const area = $('#data-json');
+  if (!area) return;
   try {
     const parsed = JSON.parse(area.value);
     if (Array.isArray(parsed.samples)) {
@@ -441,10 +498,138 @@ function refreshHints() {
   applyHints(trainingRecs());
 }
 
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function gptEditorHtml() {
+  return `
+    <p class="hint">Upload documents (md, txt, etc.) as knowledge for this model. Content is stored internally — only names are shown.</p>
+    <div id="gpt-doc-list" style="margin-bottom:8px;"></div>
+    <button class="btn sm" id="btn-add-docs">+ Add documents</button>
+    <h4 style="margin:16px 0 6px;font-size:13px;color:#ccc;">Training stems</h4>
+    <p class="hint">Stems guide how the model begins its responses. Each stem's output is a response prefix — the model starts with it and continues using its document knowledge.</p>
+    <div id="gpt-stem-list" style="margin-bottom:8px;"></div>
+    <div class="row" style="margin-top:4px;">
+      <button class="btn sm" id="btn-add-stem">+ Add stem</button>
+      <div class="spacer"></div>
+      <span class="inline-tag" id="data-stats"></span>
+    </div>
+  `;
+}
+
+function renderGptDocList() {
+  const list = $('#gpt-doc-list');
+  if (!list) return;
+  const ed = state.gptEditor;
+  if (!ed.docs.length) {
+    list.innerHTML = '<div class="hint" style="padding:4px 0;">No documents added yet.</div>';
+    bindGptDocEvents();
+    return;
+  }
+  list.innerHTML = ed.docs.map((d, i) => `
+    <div style="display:flex;align-items:center;gap:6px;padding:5px 8px;background:#1a1a1a;border-radius:4px;margin-bottom:3px;">
+      <span style="flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(d.name)}">${escapeHtml(d.name)}</span>
+      <span class="inline-tag">${formatBytes(d.size)}${d.truncated ? ' · truncated' : ''}</span>
+      <button class="btn sm gpt-doc-edit" data-idx="${i}">Edit</button>
+      <button class="btn sm danger gpt-doc-remove" data-idx="${i}">✕</button>
+    </div>
+    ${ed.editingDocIdx === i ? `
+      <div style="margin-bottom:6px;padding:0 2px;">
+        <textarea class="code-editor gpt-doc-content" data-idx="${i}" style="min-height:120px;margin-bottom:4px;">${escapeHtml(d.content || '')}</textarea>
+        <div style="display:flex;gap:6px;">
+          <button class="btn sm gpt-doc-save-edit" data-idx="${i}">Save</button>
+          <button class="btn sm gpt-doc-cancel-edit" data-idx="${i}">Cancel</button>
+        </div>
+      </div>
+    ` : ''}
+  `).join('');
+  bindGptDocEvents();
+}
+
+function bindGptDocEvents() {
+  const list = $('#gpt-doc-list');
+  if (!list) return;
+  list.querySelectorAll('.gpt-doc-remove').forEach(b => b.addEventListener('click', () => {
+    state.gptEditor.docs.splice(parseInt(b.dataset.idx), 1);
+    state.gptEditor.editingDocIdx = null;
+    renderGptDocList(); updateDataStats();
+  }));
+  list.querySelectorAll('.gpt-doc-edit').forEach(b => b.addEventListener('click', () => {
+    const idx = parseInt(b.dataset.idx);
+    state.gptEditor.editingDocIdx = state.gptEditor.editingDocIdx === idx ? null : idx;
+    renderGptDocList();
+  }));
+  list.querySelectorAll('.gpt-doc-save-edit').forEach(b => b.addEventListener('click', () => {
+    const idx = parseInt(b.dataset.idx);
+    const content = list.querySelector(`.gpt-doc-content[data-idx="${idx}"]`).value;
+    state.gptEditor.docs[idx].content = content;
+    state.gptEditor.docs[idx].size = content.length;
+    state.gptEditor.docs[idx].truncated = false;
+    state.gptEditor.editingDocIdx = null;
+    renderGptDocList(); updateDataStats();
+  }));
+  list.querySelectorAll('.gpt-doc-cancel-edit').forEach(b => b.addEventListener('click', () => {
+    state.gptEditor.editingDocIdx = null;
+    renderGptDocList();
+  }));
+}
+
+function renderGptStemList() {
+  const list = $('#gpt-stem-list');
+  if (!list) return;
+  const ed = state.gptEditor;
+  if (!ed.stems.length) {
+    list.innerHTML = '<div class="hint" style="padding:4px 0;">No stems yet. Add user → output pairs to teach response behavior.</div>';
+    return;
+  }
+  list.innerHTML = ed.stems.map((s, i) => `
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+      <input class="gpt-stem-user" data-idx="${i}" type="text" placeholder="User…" value="${escapeHtml(s.user || '')}" style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:5px 8px;color:#e0e0e0;font-size:13px;">
+      <span style="color:#555;">→</span>
+      <input class="gpt-stem-output" data-idx="${i}" type="text" placeholder="Response prefix…" value="${escapeHtml(s.output || '')}" style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:5px 8px;color:#e0e0e0;font-size:13px;">
+      <button class="btn sm danger gpt-stem-remove" data-idx="${i}">✕</button>
+    </div>
+  `).join('');
+  list.querySelectorAll('.gpt-stem-user').forEach(inp => inp.addEventListener('input', () => {
+    state.gptEditor.stems[parseInt(inp.dataset.idx)].user = inp.value; updateDataStats();
+  }));
+  list.querySelectorAll('.gpt-stem-output').forEach(inp => inp.addEventListener('input', () => {
+    state.gptEditor.stems[parseInt(inp.dataset.idx)].output = inp.value; updateDataStats();
+  }));
+  list.querySelectorAll('.gpt-stem-remove').forEach(b => b.addEventListener('click', () => {
+    state.gptEditor.stems.splice(parseInt(b.dataset.idx), 1);
+    renderGptStemList(); updateDataStats();
+  }));
+}
+
+function bindGptEditor() {
+  renderGptDocList();
+  renderGptStemList();
+  updateDataStats();
+  $('#btn-add-docs').addEventListener('click', async () => {
+    const docs = await window.nc.gpt.pickDocuments();
+    if (!docs.length) return;
+    for (const d of docs) {
+      const idx = state.gptEditor.docs.findIndex(x => x.name === d.name);
+      if (idx >= 0) state.gptEditor.docs[idx] = d;
+      else state.gptEditor.docs.push(d);
+    }
+    renderGptDocList(); updateDataStats();
+  });
+  $('#btn-add-stem').addEventListener('click', () => {
+    state.gptEditor.stems.push({ user: '', output: '' });
+    renderGptStemList(); updateDataStats();
+  });
+}
+
 function dataFormatHint(arch) {
   if (arch.kind === 'classifier') return 'Format: <code>{"samples":[{"input":[…],"label":0}, …]}</code>. Input length must equal Input dim.';
   if (arch.kind === 'regressor')  return 'Format: <code>{"samples":[{"input":[…],"output":[…]}, …]}</code>.';
   if (arch.kind === 'charLM')     return 'Either <code>{"text":"…raw text…"}</code> for free text, or <code>{"samples":[{"user":"…","assistant":"…"}, …]}</code> for chat pairs. The app auto-wraps each turn with <code>&lt;|user|&gt;</code> / <code>&lt;|assistant|&gt;</code> tags so the model learns to respond.';
+  if (arch.kind === 'gpt')        return '';
   return 'See Docs → Training data for the expected format.';
 }
 
@@ -465,7 +650,7 @@ function archEditor(a) {
       </div>
     `;
   }
-  if (a.kind === 'charLM') {
+  if (a.kind === 'charLM' || a.kind === 'gpt') {
     const tok = a.tokenizerKind || 'char';
     return `
       <div class="grid-3">
@@ -515,7 +700,7 @@ async function saveEditor() {
     a.dropout = parseFloat($('#a-drop').value) || 0;
     a.hidden = $('#a-hidden').value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
     if (a.kind === 'classifier') a.classes = $('#a-classes').value.split(',').map(s => s.trim()).filter(Boolean);
-  } else if (a.kind === 'charLM') {
+  } else if (a.kind === 'charLM' || a.kind === 'gpt') {
     a.tokenizerKind = $('#a-tok').value;
     a.embDim = parseInt($('#a-embdim').value);
     a.contextLen = parseInt($('#a-ctx').value);
@@ -524,10 +709,16 @@ async function saveEditor() {
     a.hidden = $('#a-hidden').value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
   }
   patch.architecture = a;
-  let data;
-  try { data = JSON.parse($('#data-json').value); }
-  catch (e) { toast('Training data JSON invalid: ' + e.message); return; }
-  patch.trainingData = data;
+  if (a.pluginKind && pluginRegistry.trainEditors[a.pluginKind]) {
+    // Plugin manages its own trainingData — don't overwrite on save
+  } else if (a.kind === 'gpt') {
+    patch.trainingData = { documents: state.gptEditor.docs, samples: state.gptEditor.stems };
+  } else {
+    let data;
+    try { data = JSON.parse($('#data-json').value); }
+    catch (e) { toast('Training data JSON invalid: ' + e.message); return; }
+    patch.trainingData = data;
+  }
   // If arch shape changed, invalidate everything tied to the old shape:
   // weights, optimizer momentum/variance buffers, tokenizer, history.
   const shapeChanged = JSON.stringify(n.architecture) !== JSON.stringify(a);
@@ -540,7 +731,7 @@ async function saveEditor() {
   // Always clear the stored tokenizer when the tokenizer kind changes so that
   // the next training run rebuilds the vocab from scratch. This runs regardless
   // of whether the network has been trained (n.state may be null).
-  if (a.kind === 'charLM' && a.tokenizerKind !== n.architecture.tokenizerKind) {
+  if ((a.kind === 'charLM' || a.kind === 'gpt') && a.tokenizerKind !== n.architecture.tokenizerKind) {
     patch.tokenizer = null;
   }
   try {
@@ -698,11 +889,21 @@ function renderInferenceTab(root) {
     return;
   }
   const n = state.current;
+  const a = n.architecture;
+  // Plugin inference renderers always get called — they handle the untrained
+  // state themselves (e.g. showing the board but disabling AI buttons).
+  const hookKind = a.pluginKind || null;
+  if (hookKind && pluginRegistry.inferenceRenderers[hookKind]) {
+    const { fn, pluginId } = pluginRegistry.inferenceRenderers[hookKind];
+    const nc = { invoke: (ch, ...args) => window.nc.plugins.invoke(pluginId, ch, ...args) };
+    root.innerHTML = '';
+    fn(root, n, nc);
+    return;
+  }
   if (!n.state && !n.stateLocked) {
     root.innerHTML = `<div class="empty"><div class="big">Network is untrained</div><div>Train it on the Train tab first.</div></div>`;
     return;
   }
-  const a = n.architecture;
   // Chat models get a real conversational UI with running history, not a
   // single-shot prompt box. Everything else still goes through the simple form.
   if (a.kind === 'charLM' && a.isChat) {
@@ -717,6 +918,7 @@ function renderInferenceTab(root) {
         ${inferenceInputUI(a)}
         <div class="row" style="margin-top:10px;">
           <button class="btn primary" id="btn-run">Run prediction</button>
+          <button class="btn" id="btn-stop-gen" style="display:none;">Stop generating</button>
           <div class="spacer"></div>
         </div>
       </div>
@@ -727,6 +929,7 @@ function renderInferenceTab(root) {
     </div>
   `;
   $('#btn-run').addEventListener('click', runInference);
+  $('#btn-stop-gen').addEventListener('click', () => window.nc.inference.cancel());
 }
 
 function renderChatTab(root, n) {
@@ -1000,11 +1203,11 @@ function inferenceInputUI(a) {
     return `<label class="field"><span>Input vector (comma-separated, length ${a.inputDim})</span>
       <input id="inp-vec" type="text" value="${new Array(a.inputDim).fill(0).join(',')}"></label>`;
   }
-  if (a.kind === 'charLM') {
+  if (a.kind === 'charLM' || a.kind === 'gpt') {
     const isChat = !!a.isChat;
     return `
       ${isChat ? `<label class="field"><span>System (optional)</span><input id="inp-system" type="text" value=""></label>` : ''}
-      <label class="field"><span>${isChat ? 'Your message' : 'Prompt'}</span><textarea id="inp-prompt" rows="3">${isChat ? 'Hello, I need help' : 'the '}</textarea></label>
+      <label class="field"><span>${isChat ? 'Your message' : 'Sentence stem / Prompt'}</span><textarea id="inp-prompt" rows="3">${isChat ? 'Hello, I need help' : 'The future of AI is'}</textarea></label>
       <div class="grid-3">
         <label class="field"><span>Max new tokens</span><input id="inp-max" type="number" value="${isChat ? 200 : 120}"></label>
         <label class="field"><span>Temperature</span><input id="inp-temp" type="number" step="0.1" value="1.0"></label>
@@ -1028,7 +1231,7 @@ async function runInference() {
   const a = n.architecture;
   let payload;
   try {
-    if (a.kind === 'charLM') {
+    if (a.kind === 'charLM' || a.kind === 'gpt') {
       payload = {
         prompt: $('#inp-prompt').value,
         maxTokens: parseInt($('#inp-max').value) || 80,
@@ -1037,13 +1240,37 @@ async function runInference() {
       };
       const sys = document.getElementById('inp-system');
       if (sys) payload.system = sys.value;
+
+      // Streaming: show tokens as they arrive.
+      const out = $('#infer-output');
+      const runBtn = $('#btn-run');
+      const stopBtn = $('#btn-stop-gen');
+      out.textContent = '';
+      runBtn.disabled = true;
+      stopBtn.style.display = '';
+      let streamed = '';
+      try {
+        const result = await window.nc.inference.streamStart(n.id, payload, (chunk) => {
+          streamed += chunk;
+          out.textContent = streamed;
+        });
+        // Replace with final trimmed text (strips any partial end-tags that
+        // were emitted just before stop detection).
+        if (result && result.kind === 'generation') out.textContent = result.text;
+        else if (result) renderInferenceResult(result);
+      } catch (e) {
+        if (!streamed) out.textContent = 'ERROR: ' + e.message;
+      } finally {
+        runBtn.disabled = false;
+        stopBtn.style.display = 'none';
+      }
     } else {
       const vec = $('#inp-vec').value.split(',').map(v => parseFloat(v.trim()));
       if (vec.some(isNaN)) throw new Error('Vector has non-numeric value');
       payload = { input: vec };
+      const result = await window.nc.inference.run(n.id, payload);
+      renderInferenceResult(result);
     }
-    const result = await window.nc.inference.run(n.id, payload);
-    renderInferenceResult(result);
   } catch (e) { $('#infer-output').textContent = 'ERROR: ' + e.message; }
 }
 
@@ -1185,6 +1412,194 @@ print result.metrics[len(result.metrics) - 1].loss
   });
 }
 
+// ---------- plugin restart tracking ----------
+
+// Set to true whenever a plugin is installed or uninstalled this session.
+// Cleared only by a restart.
+let pluginNeedsRestart = false;
+
+// Returns true if the named plugin is currently active in the running registry.
+function isPluginActive(pluginId) {
+  if (pluginRegistry.templates.some(t => (t.id === pluginId || t.pluginKind === pluginId))) return true;
+  if (Object.values(pluginRegistry.inferenceRenderers).some(r => r.pluginId === pluginId)) return true;
+  if (Object.values(pluginRegistry.trainEditors).some(r => r.pluginId === pluginId)) return true;
+  return false;
+}
+
+// ---------- docs helpers ----------
+
+// Convert a doc page's HTML body + title to clean Markdown for LLM consumption.
+function docPageToMarkdown(title, html) {
+  const div = document.createElement('div');
+  div.innerHTML = html;
+
+  function nodeToMd(node) {
+    if (node.nodeType === 3) return node.nodeValue; // TEXT_NODE
+    if (node.nodeType !== 1) return '';              // ELEMENT_NODE only
+
+    const tag  = node.tagName.toLowerCase();
+    const inner = () => Array.from(node.childNodes).map(nodeToMd).join('');
+
+    switch (tag) {
+      case 'h1': return '\n# '   + inner().trim() + '\n\n';
+      case 'h2': return '\n## '  + inner().trim() + '\n\n';
+      case 'h3': return '\n### ' + inner().trim() + '\n\n';
+      case 'h4': return '\n#### '+ inner().trim() + '\n\n';
+      case 'p':  return '\n' + inner().trim() + '\n\n';
+      case 'strong': case 'b': return '**' + inner() + '**';
+      case 'em':     case 'i': return '_'  + inner() + '_';
+      case 'a': {
+        const href = node.getAttribute('href') || '';
+        const text = inner().trim();
+        return href ? `[${text}](${href})` : text;
+      }
+      case 'code': {
+        if (node.parentNode && node.parentNode.tagName.toLowerCase() === 'pre') return node.textContent;
+        return '`' + node.textContent + '`';
+      }
+      case 'pre': {
+        const codeEl = node.querySelector('code');
+        return '\n```\n' + (codeEl || node).textContent + '\n```\n\n';
+      }
+      case 'ul': {
+        const items = Array.from(node.querySelectorAll(':scope > li'))
+          .map(li => '- ' + li.textContent.replace(/\s+/g, ' ').trim());
+        return '\n' + items.join('\n') + '\n\n';
+      }
+      case 'ol': {
+        const items = Array.from(node.querySelectorAll(':scope > li'))
+          .map((li, i) => `${i + 1}. ` + li.textContent.replace(/\s+/g, ' ').trim());
+        return '\n' + items.join('\n') + '\n\n';
+      }
+      case 'li': return '';
+      case 'table': {
+        const rows = Array.from(node.querySelectorAll('tr'));
+        if (!rows.length) return '';
+        let md = '\n'; let sepDone = false;
+        for (const row of rows) {
+          const cells = Array.from(row.querySelectorAll('th, td'));
+          if (!cells.length) continue;
+          md += '| ' + cells.map(c => c.textContent.replace(/\s+/g, ' ').trim()).join(' | ') + ' |\n';
+          if (!sepDone && row.querySelector('th')) {
+            md += '| ' + cells.map(() => '---').join(' | ') + ' |\n';
+            sepDone = true;
+          }
+        }
+        return md + '\n';
+      }
+      case 'tr': case 'th': case 'td': case 'thead': case 'tbody': return '';
+      case 'br': return '\n';
+      case 'hr': return '\n---\n\n';
+      default:   return inner();
+    }
+  }
+
+  let md = `# ${title}\n\n`;
+  md += Array.from(div.childNodes).map(nodeToMd).join('');
+  return md.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+// Pure-JS ZIP writer — creates a STORED (no compression) ZIP archive from
+// an array of { name: string, content: string } objects.
+// Returns a Uint8Array.
+function buildZip(files) {
+  const te = new TextEncoder();
+
+  // CRC-32 lookup table
+  const crcT = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    crcT[i] = c >>> 0;
+  }
+  function crc32(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = crcT[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  function u16(n) { return [n & 0xff, (n >> 8) & 0xff]; }
+  function u32(n) { return [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff]; }
+
+  const locals  = [];
+  const central = [];
+  let   pos     = 0;
+
+  for (const file of files) {
+    const nb   = te.encode(file.name);
+    const data = te.encode(file.content);
+    const crc  = crc32(data);
+    const sz   = data.length;
+
+    // Local file header (30 bytes + filename)
+    const local = new Uint8Array([
+      0x50, 0x4b, 0x03, 0x04,      // local file header signature
+      0x14, 0x00,                   // version needed: 2.0
+      0x00, 0x00,                   // general purpose bit flag
+      0x00, 0x00,                   // compression: STORED
+      0x00, 0x00, 0x00, 0x00,       // last mod time + date
+      ...u32(crc),
+      ...u32(sz),                   // compressed size
+      ...u32(sz),                   // uncompressed size
+      ...u16(nb.length),            // filename length
+      0x00, 0x00,                   // extra field length
+      ...nb
+    ]);
+    const hdrOffset = pos;
+    locals.push(local, data);
+    pos += local.length + data.length;
+
+    // Central directory entry (46 bytes + filename)
+    central.push(new Uint8Array([
+      0x50, 0x4b, 0x01, 0x02,      // central directory signature
+      0x14, 0x00,                   // version made by
+      0x14, 0x00,                   // version needed
+      0x00, 0x00,                   // flags
+      0x00, 0x00,                   // compression: STORED
+      0x00, 0x00, 0x00, 0x00,       // last mod time + date
+      ...u32(crc),
+      ...u32(sz),                   // compressed size
+      ...u32(sz),                   // uncompressed size
+      ...u16(nb.length),            // filename length
+      0x00, 0x00,                   // extra field length
+      0x00, 0x00,                   // file comment length
+      0x00, 0x00,                   // disk number start
+      0x00, 0x00,                   // internal attributes
+      0x00, 0x00, 0x00, 0x00,       // external attributes
+      ...u32(hdrOffset),            // relative offset of local file header
+      ...nb
+    ]));
+  }
+
+  const cdOffset = pos;
+  const cdSize   = central.reduce((s, p) => s + p.length, 0);
+  const eocd = new Uint8Array([
+    0x50, 0x4b, 0x05, 0x06,        // end of central directory signature
+    0x00, 0x00, 0x00, 0x00,        // disk number / disk with start of CD
+    ...u16(files.length),           // entries on this disk
+    ...u16(files.length),           // total entries
+    ...u32(cdSize),                 // size of central directory
+    ...u32(cdOffset),               // offset of central directory
+    0x00, 0x00                      // comment length
+  ]);
+
+  const all   = [...locals, ...central, eocd];
+  const total = all.reduce((s, p) => s + p.length, 0);
+  const out   = new Uint8Array(total);
+  let   off   = 0;
+  for (const p of all) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+// Trigger a browser-style file download from a Blob or Uint8Array.
+function triggerDownload(data, filename, mimeType) {
+  const blob = data instanceof Blob ? data : new Blob([data], { type: mimeType || 'application/octet-stream' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 // Docs tab
 function renderDocsTab(root) {
   const doc = window.NC_DOCS.find(d => d.id === state.currentDocId) || window.NC_DOCS[0];
@@ -1193,15 +1608,145 @@ function renderDocsTab(root) {
       <div class="docs-layout">
         <div class="docs-nav">
           ${window.NC_DOCS.map(d => `<button data-id="${d.id}" class="${d.id === doc.id ? 'active' : ''}">${d.title}</button>`).join('')}
+          <div style="border-top:1px solid #2a2a2a;margin-top:8px;padding-top:8px;">
+            <button class="btn sm" id="btn-docs-zip" style="width:100%;font-size:11px;text-align:left;padding:5px 8px;">⬇ Download all for LLM (.zip)</button>
+          </div>
         </div>
-        <div class="docs-body" style="user-select: text;">${doc.body}</div>
+        <div style="display:flex;flex-direction:column;min-height:0;flex:1;">
+          <div style="display:flex;align-items:center;justify-content:flex-end;padding:0 0 8px 0;gap:8px;">
+            <button class="btn sm" id="btn-docs-llm" style="font-size:11px;">⬇ Download page for LLM (.md)</button>
+          </div>
+          <div class="docs-body" style="user-select:text;flex:1;">${doc.body}</div>
+        </div>
       </div>
     </div>
   `;
-  root.querySelectorAll('.docs-nav button').forEach(b => b.addEventListener('click', () => {
+
+  // Navigate between doc pages
+  root.querySelectorAll('.docs-nav button[data-id]').forEach(b => b.addEventListener('click', () => {
     state.currentDocId = b.dataset.id;
     renderDocsTab(root);
   }));
+
+  // Download current page as Markdown for LLM ingestion
+  root.querySelector('#btn-docs-llm').addEventListener('click', () => {
+    const md       = docPageToMarkdown(doc.title, doc.body);
+    const safeName = doc.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    triggerDownload(md, `neuralcity-doc-${safeName}.md`, 'text/markdown');
+  });
+
+  // Download all pages as a ZIP of Markdown files for LLM ingestion
+  root.querySelector('#btn-docs-zip').addEventListener('click', () => {
+    const files = window.NC_DOCS.map(d => {
+      const safeName = d.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      return {
+        name:    `neuralcity-docs/${safeName}.md`,
+        content: docPageToMarkdown(d.title, d.body)
+      };
+    });
+    const zipBytes = buildZip(files);
+    triggerDownload(zipBytes, 'neuralcity-docs.zip', 'application/zip');
+  });
+}
+
+// ---------- plugins tab ----------
+
+async function renderPluginsTab(root) {
+  const installed = await window.nc.plugins.list();
+
+  // Restart-required banner (shown after any install/uninstall this session)
+  const restartBanner = pluginNeedsRestart ? `
+    <div id="plugin-restart-banner" style="background:#1a1200;border:1px solid #665500;border-radius:6px;padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;">
+      <div style="flex:1;">
+        <div style="font-size:13px;font-weight:600;color:#f0b429;">⚠ Restart required</div>
+        <div style="font-size:12px;color:#aaa;margin-top:2px;">Plugin changes take effect after a full application restart.</div>
+      </div>
+      <button class="btn primary sm" id="btn-restart-now" style="white-space:nowrap;">Restart now</button>
+    </div>
+  ` : '';
+
+  root.innerHTML = `
+    <div class="panel">
+      <h2>Plugins</h2>
+      <p class="hint">Plugins add new model types, training data editors, and inference UIs. Each plugin is a <code>.ncpl</code> file — see Docs → Plugin system for the format reference.</p>
+      <div class="section">
+        ${restartBanner}
+        <div class="row" style="margin-bottom:14px;gap:8px;">
+          <button class="btn primary" id="btn-install-plugin">Install Plugin (.ncpl)</button>
+        </div>
+
+        <div id="plugin-list">
+          ${installed.length === 0
+            ? `<div class="empty" style="padding:24px 0;"><div>No plugins installed.</div><div style="font-size:12px;color:#666;margin-top:6px;">Click "Install Plugin" to add a .ncpl file.</div></div>`
+            : installed.map(p => {
+                const active = isPluginActive(p.id);
+                const badge  = active
+                  ? `<span style="font-size:10px;font-weight:700;background:#1a3320;color:#4caf50;border:1px solid #2d5c3a;border-radius:10px;padding:2px 8px;letter-spacing:0.04em;">● ACTIVE</span>`
+                  : `<span style="font-size:10px;font-weight:700;background:#1f1900;color:#f0b429;border:1px solid #4d3d00;border-radius:10px;padding:2px 8px;letter-spacing:0.04em;">↺ NEEDS RESTART</span>`;
+                return `
+                  <div class="section" style="background:#141414;border:1px solid #2a2a2a;border-radius:6px;padding:12px 16px;margin-bottom:8px;">
+                    <div class="row" style="align-items:flex-start;gap:10px;">
+                      <div style="flex:1;min-width:0;">
+                        <div class="row" style="gap:8px;align-items:center;margin-bottom:2px;">
+                          <span style="font-weight:600;font-size:14px;color:#e0e0e0;">${escapeHtml(p.manifest.name || p.id)}</span>
+                          ${badge}
+                        </div>
+                        <div style="font-size:12px;color:#666;">v${escapeHtml(p.manifest.version || '0.0.0')} · by ${escapeHtml(p.manifest.author || 'unknown')}</div>
+                        ${p.manifest.description ? `<div style="font-size:13px;color:#aaa;margin-top:5px;">${escapeHtml(p.manifest.description)}</div>` : ''}
+                        <div style="font-size:11px;color:#555;margin-top:4px;font-family:monospace;">id: ${escapeHtml(p.id)}</div>
+                      </div>
+                      <button class="btn danger sm" data-uninstall="${escapeHtml(p.id)}" style="flex-shrink:0;">Uninstall</button>
+                    </div>
+                  </div>`;
+              }).join('')}
+        </div>
+
+        <div class="hint" style="margin-top:10px;font-size:11px;">
+          Plugin changes take effect after a restart. Active plugins were loaded at startup.
+          See <strong>Docs → Plugin system</strong> for file format details.
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Restart now button
+  const restartBtn = root.querySelector('#btn-restart-now');
+  if (restartBtn) {
+    restartBtn.addEventListener('click', async () => {
+      restartBtn.disabled = true;
+      restartBtn.textContent = 'Restarting…';
+      try { await window.nc.app.restart(); } catch (e) { toast('Restart failed: ' + e.message); restartBtn.disabled = false; restartBtn.textContent = 'Restart now'; }
+    });
+  }
+
+  // Install plugin
+  root.querySelector('#btn-install-plugin').addEventListener('click', async () => {
+    let result;
+    try { result = await window.nc.plugins.install(); }
+    catch (e) { toast('Install failed: ' + e.message); return; }
+
+    if (!result) return; // user cancelled dialog
+
+    pluginNeedsRestart = true;
+    toast(`✓ "${result.name}" installed. Restart to activate.`);
+    renderPluginsTab(root);
+  });
+
+  // Uninstall plugin
+  root.querySelectorAll('[data-uninstall]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id   = btn.dataset.uninstall;
+      const name = btn.closest('.section')?.querySelector('[style*="font-weight:600"]')?.textContent?.trim() || id;
+      confirmModal('Uninstall plugin?', `Remove "${escapeHtml(name)}"? Changes take effect after restart.`, async () => {
+        try {
+          await window.nc.plugins.uninstall(id);
+          pluginNeedsRestart = true;
+          toast(`✓ "${name}" removed. Restart to apply.`);
+          renderPluginsTab(root);
+        } catch (e) { toast('Uninstall failed: ' + e.message); }
+      });
+    });
+  });
 }
 
 // ---------- backup modal ----------
@@ -1299,11 +1844,13 @@ function openNewNetworkModal() {
 
 function populateTemplates() {
   const kind = $('#new-kind').value;
-  const matches = window.NC_TEMPLATES.filter(t => {
-    if (kind === 'chat') return t.kind === 'charLM' && t.arch && t.arch.isChat;
-    if (kind === 'charLM') return t.kind === 'charLM' && !(t.arch && t.arch.isChat);
-    return t.kind === kind;
-  });
+  const matches = kind === 'plugin'
+    ? pluginRegistry.templates
+    : window.NC_TEMPLATES.filter(t => {
+        if (kind === 'chat') return t.kind === 'charLM' && t.arch && t.arch.isChat;
+        if (kind === 'charLM') return t.kind === 'charLM' && !(t.arch && t.arch.isChat);
+        return t.kind === kind;
+      });
   const grid = $('#template-grid');
   grid.innerHTML = matches.map(t => `
     <div class="template-card" data-id="${t.id}">
@@ -1342,7 +1889,7 @@ async function createNetworkFromModal() {
       training: { optimizer: 'adam', learningRate: 0.01, batchSize: 16, epochs: 20, seed: 42 },
       trainingData: kind === 'chat'
         ? { samples: [{ user: 'Hello', assistant: 'Hi! How can I help?' }] }
-        : (kind === 'charLM' ? { text: '' } : { samples: [] })
+        : ((kind === 'charLM' || kind === 'gpt') ? { text: '' } : { samples: [] })
     };
   }
   const net = await window.nc.networks.create(payload);
@@ -1353,6 +1900,7 @@ async function createNetworkFromModal() {
 
 function defaultArch(kind) {
   if (kind === 'chat') return { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 64, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true, tokenizerKind: 'wordpart' };
+  if (kind === 'gpt') return { kind: 'gpt', vocabSize: 0, embDim: 32, contextLen: 96, hidden: [96, 96], activation: 'gelu', dropout: 0.1, tokenizerKind: 'wordpart' };
   if (kind === 'charLM') return { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 32, hidden: [64], activation: 'gelu', dropout: 0, tokenizerKind: 'wordpart' };
   if (kind === 'regressor') return { kind: 'regressor', inputDim: 1, outputDim: 1, hidden: [16], activation: 'tanh', dropout: 0 };
   return { kind: 'classifier', inputDim: 2, outputDim: 2, hidden: [8], activation: 'relu', dropout: 0, classes: ['A', 'B'] };

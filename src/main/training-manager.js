@@ -1,14 +1,28 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const { trainNetwork, infer } = require('../engine/trainer');
+const { trainNetwork, infer, inferStream, buildInferenceCache } = require('../engine/trainer');
 const { runScript } = require('../dsl/interpreter');
 
 class TrainingManager extends EventEmitter {
   constructor(storage) {
     super();
     this.storage = storage;
-    this.active = new Map(); // id -> { stop: () => void, startedAt, status }
+    this.active = new Map();      // id -> { stop, startedAt, lastProgress }
+    // Model object cache: avoids rebuilding Float32Array weights + tokenizer on
+    // every inference call.  Entry shape: { updatedAt: number, cache: {model, tokenizer} }
+    // Invalidated when updatedAt changes (after training, restore, or update).
+    this._modelCache = new Map(); // id -> { updatedAt, cache }
+  }
+
+  // Returns a { model, tokenizer } cache entry for the network, rebuilding only
+  // when the network's updatedAt timestamp has changed since the last build.
+  _getOrBuildModel(net) {
+    const stored = this._modelCache.get(net.id);
+    if (stored && stored.updatedAt === net.updatedAt) return stored.cache;
+    const cache = buildInferenceCache(net);
+    this._modelCache.set(net.id, { updatedAt: net.updatedAt, cache });
+    return cache;
   }
 
   status(id) {
@@ -61,6 +75,9 @@ class TrainingManager extends EventEmitter {
           architecture: result.architecture,
           metrics: result.metrics
         });
+        // Evict the stale model cache so the next inference call picks up the
+        // freshly-trained weights instead of the pre-training snapshot.
+        this._modelCache.delete(id);
         this.emit('done', { id, stopped: !!result.stopped, metrics: result.metrics });
       } catch (e) {
         this.emit('error', { id, message: e.message, stack: e.stack });
@@ -85,7 +102,16 @@ class TrainingManager extends EventEmitter {
     const net = this.storage.getNetwork(id);
     if (!net) throw new Error('Network not found');
     if (net.stateLocked) throw new Error('Network state is encrypted; decrypt it first.');
-    return infer(net, input);
+    const cache = this._getOrBuildModel(net);
+    return infer(net, input, cache);
+  }
+
+  async inferStream(id, input, onToken, cancelRef) {
+    const net = this.storage.getNetwork(id);
+    if (!net) throw new Error('Network not found');
+    if (net.stateLocked) throw new Error('Network state is encrypted; decrypt it first.');
+    const cache = this._getOrBuildModel(net);
+    return inferStream(net, input, onToken, cancelRef, cache);
   }
 
   async runScript(id, code) {

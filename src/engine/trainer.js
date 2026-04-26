@@ -233,9 +233,37 @@ function* _trainCoreGen(network, hooks, prebuilt = null) {
     return { state: model.toJSON(), optimizerState: optim.toJSON(), architecture: arch, metrics };
   }
 
-  if (arch.kind === 'charLM') {
+  if (arch.kind === 'charLM' || arch.kind === 'gpt') {
     // text-based: data.text OR data.samples:[{text}] OR chat-shaped samples
-    const corpus = ChatFormat.buildCorpus(data);
+    // GPT with documents: combine doc content + sentence stems
+    let corpusInput = data;
+    if (arch.kind === 'gpt' && Array.isArray(data.documents)) {
+      const docText = data.documents.map(d => d.content || '').filter(Boolean).join('\n\n---\n\n');
+      const validStems = Array.isArray(data.samples) ? data.samples.filter(s => s.user && s.output) : [];
+      let combined;
+      if (validStems.length > 0) {
+        // Each stem's output is a response prefix, not a complete answer. Split
+        // the document corpus into chunks and cycle stems as prefixes so the
+        // model learns to start with the given text and then continue with
+        // document knowledge: <|user|>q<|end|><|assistant|>prefix chunk<|end|>
+        const chunkSize = Math.max(300, (arch.contextLen || 96) * 3);
+        const chunks = [];
+        for (let i = 0; i < docText.length; i += chunkSize) {
+          const chunk = docText.slice(i, i + chunkSize).trim();
+          if (chunk) chunks.push(chunk);
+        }
+        if (!chunks.length) chunks.push(docText);
+        combined = chunks.map((chunk, i) => {
+          const stem = validStems[i % validStems.length];
+          return `<|user|>${stem.user}<|end|><|assistant|>${stem.output} ${chunk}<|end|>`;
+        }).join('\n');
+        arch.isChat = true;
+      } else {
+        combined = docText;
+      }
+      corpusInput = { text: combined };
+    }
+    const corpus = ChatFormat.buildCorpus(corpusInput);
     const text = corpus.text;
     if (text.length < arch.contextLen + 2) {
       throw new Error(corpus.isChat
@@ -377,12 +405,28 @@ function* _trainCoreGen(network, hooks, prebuilt = null) {
   throw new Error('unknown arch kind ' + arch.kind);
 }
 
-// Inference entry. Returns a JSON-able result.
-function infer(network, input) {
-  const rng = T.rngFromSeed(network.training?.seed ?? 42);
+// Pre-build the model and tokenizer objects for a network and return them as a
+// reusable cache entry.  Call once, pass the result to infer() / inferStream()
+// to skip the expensive JSON → Float32Array reconstruction on every request.
+function buildInferenceCache(network) {
   if (!network.state) throw new Error('Network has no trained state');
+  const rng = T.rngFromSeed(network.training?.seed ?? 42);
   const model = restoreFromState(network.state, network.architecture, rng);
+  const tokenizer = network.tokenizer ? tokenizerFromJSON(network.tokenizer) : null;
+  return { model, tokenizer };
+}
+
+// Inference entry. Returns a JSON-able result.
+// Pass a `cache` object (from buildInferenceCache) to skip rebuilding the model.
+function infer(network, input, cache) {
   const arch = network.architecture;
+  const model = cache
+    ? cache.model
+    : (() => {
+        if (!network.state) throw new Error('Network has no trained state');
+        const rng = T.rngFromSeed(network.training?.seed ?? 42);
+        return restoreFromState(network.state, network.architecture, rng);
+      })();
 
   if (arch.kind === 'classifier' || arch.kind === 'mlp') {
     const vec = input.input || input;
@@ -408,9 +452,9 @@ function infer(network, input) {
     return { kind: 'regression', output: Array.from(out.data) };
   }
 
-  if (arch.kind === 'charLM') {
-    if (!network.tokenizer) throw new Error('tokenizer missing');
-    const tokenizer = tokenizerFromJSON(network.tokenizer);
+  if (arch.kind === 'charLM' || arch.kind === 'gpt') {
+    if (!cache?.tokenizer && !network.tokenizer) throw new Error('tokenizer missing');
+    const tokenizer = cache?.tokenizer ?? tokenizerFromJSON(network.tokenizer);
     const maxNew = input.maxTokens ?? 120;
     const temperature = input.temperature ?? 1.0;
     const topK = input.topK ?? 0;
@@ -564,4 +608,139 @@ function infer(network, input) {
   throw new Error('unknown arch kind ' + arch.kind);
 }
 
-module.exports = { trainNetwork, trainNetworkSync, infer };
+// Streaming variant of infer() for charLM/gpt. Calls onToken(decodedChunk)
+// after each generated token and yields to the Node event loop so that the
+// main process can flush IPC messages to the renderer in real time.
+// cancelRef is { cancelled: false }; set .cancelled = true to abort early.
+// Returns the same result object as infer() once generation is complete.
+// Pass a `cache` object (from buildInferenceCache) to skip rebuilding the model.
+async function inferStream(network, input, onToken, cancelRef, cache) {
+  const arch = network.architecture;
+  const model = cache
+    ? cache.model
+    : (() => {
+        if (!network.state) throw new Error('Network has no trained state');
+        const rng = T.rngFromSeed(network.training?.seed ?? 42);
+        return restoreFromState(network.state, network.architecture, rng);
+      })();
+
+  if (arch.kind !== 'charLM' && arch.kind !== 'gpt') {
+    return infer(network, input, cache);
+  }
+
+  if (!cache?.tokenizer && !network.tokenizer) throw new Error('tokenizer missing');
+  const tokenizer = cache?.tokenizer ?? tokenizerFromJSON(network.tokenizer);
+  const maxNew = input.maxTokens ?? 120;
+  const temperature = input.temperature ?? 1.0;
+  const topK = input.topK ?? 0;
+  const isChat = !!arch.isChat || input.chat === true;
+
+  const userPrompt = String(input.prompt ?? input ?? '');
+  const history = Array.isArray(input.history) ? input.history
+                : Array.isArray(input.messages) ? input.messages
+                : null;
+
+  let promptText;
+  if (isChat) {
+    if (history) {
+      const explicitPrompt = (typeof input.prompt === 'string' && input.prompt.length > 0);
+      promptText = ChatFormat.wrapHistoryForChat(history, {
+        system: input.system || '',
+        userPrompt: explicitPrompt ? userPrompt : ''
+      });
+    } else {
+      promptText = ChatFormat.wrapPromptForChat(userPrompt, input.system || '');
+    }
+  } else {
+    promptText = userPrompt;
+  }
+
+  const L = arch.contextLen;
+  if (isChat && history) {
+    promptText = ChatFormat.truncateWrappedToFit(
+      promptText, (s) => tokenizer.encodeSafe(s), L
+    );
+  }
+  let ids = tokenizer.encodeSafe(promptText);
+  if (ids.length === 0) ids = [0];
+  if (ids.length < L) {
+    let padChar = '\n';
+    if (tokenizer.stoi && !tokenizer.stoi.has(padChar)) padChar = ' ';
+    if (tokenizer.stoi && !tokenizer.stoi.has(padChar)) padChar = null;
+    const padId = padChar != null && tokenizer.stoi.has(padChar) ? tokenizer.stoi.get(padChar) : ids[0];
+    ids = new Array(L - ids.length).fill(padId).concat(ids);
+  }
+
+  const endTag = ChatFormat.TAGS.END;
+  const endIds = tokenizer.encodeSafe(endTag);
+  const stopOnEnd = isChat && endIds.length > 0;
+  const tagOpenBigram = '<|';
+
+  const out = [];
+  let tailDecoded = '';
+  let cancelled = false;
+
+  for (let step = 0; step < maxNew; step++) {
+    if (cancelRef && cancelRef.cancelled) { cancelled = true; break; }
+
+    const ctx = ids.slice(ids.length - L);
+    const logits = model.forward([ctx], { training: false });
+    const row = Array.from(logits.data);
+    for (let i = 0; i < row.length; i++) row[i] /= Math.max(temperature, 1e-6);
+    let indices = row.map((v, i) => i);
+    if (topK > 0 && topK < row.length) {
+      indices.sort((a, b) => row[b] - row[a]);
+      indices = indices.slice(0, topK);
+    }
+    const maxv = Math.max(...indices.map(i => row[i]));
+    let sum = 0;
+    const ex = indices.map(i => { const e = Math.exp(row[i] - maxv); sum += e; return e; });
+    const probs = ex.map(e => e / sum);
+    let r = Math.random();
+    let pick = indices[indices.length - 1];
+    for (let i = 0; i < indices.length; i++) {
+      r -= probs[i];
+      if (r <= 0) { pick = indices[i]; break; }
+    }
+    ids.push(pick);
+    out.push(pick);
+
+    const chunk = tokenizer.decode([pick]);
+    onToken(chunk);
+
+    if (stopOnEnd && out.length >= endIds.length) {
+      let match = true;
+      for (let k = 0; k < endIds.length; k++) {
+        if (out[out.length - endIds.length + k] !== endIds[k]) { match = false; break; }
+      }
+      if (match) { out.length -= endIds.length; break; }
+    }
+    if (isChat) {
+      tailDecoded += chunk;
+      if (tailDecoded.length > 8) tailDecoded = tailDecoded.slice(-8);
+      if (tailDecoded.indexOf(tagOpenBigram) !== -1) {
+        const fullDecoded = tokenizer.decode(out);
+        const cut = fullDecoded.indexOf(tagOpenBigram);
+        if (cut !== -1) {
+          const keepIds = tokenizer.encodeSafe(fullDecoded.slice(0, cut));
+          out.length = 0;
+          for (const t of keepIds) out.push(t);
+        }
+        break;
+      }
+    }
+
+    // Yield so the event loop can flush IPC messages to the renderer and
+    // process incoming cancel messages before the next forward pass.
+    await new Promise(resolve => setImmediate(resolve));
+  }
+
+  const generated = tokenizer.decode(out);
+  if (isChat) {
+    const reply = ChatFormat.extractAssistantReply(generated);
+    return { kind: 'generation', text: reply, raw: generated, tokens: out, chat: true, cancelled };
+  }
+  return { kind: 'generation', text: generated, tokens: out, cancelled };
+}
+
+module.exports = { trainNetwork, trainNetworkSync, infer, inferStream, buildInferenceCache };

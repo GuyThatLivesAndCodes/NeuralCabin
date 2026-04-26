@@ -5,6 +5,7 @@ const os = require('os');
 const { Storage } = require('./storage');
 const { ApiServer } = require('./api-server');
 const { TrainingManager } = require('./training-manager');
+const PluginLoader = require('./plugin-loader');
 
 const isDev = process.argv.includes('--dev');
 const userDataDir = path.join(app.getPath('userData'), 'NeuralCity');
@@ -13,6 +14,10 @@ if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 const storage = new Storage(userDataDir);
 const apiServer = new ApiServer(storage);
 const trainer = new TrainingManager(storage);
+
+const pluginLoader = new PluginLoader(path.join(userDataDir, 'plugins'));
+pluginLoader.seedBuiltins(path.join(__dirname, '..', 'plugins'));
+pluginLoader.load(ipcMain);
 
 let mainWindow = null;
 
@@ -137,6 +142,33 @@ ipcMain.handle('training:status', (_, id) => trainer.status(id));
 
 ipcMain.handle('inference:run', async (_, id, input) => trainer.infer(id, input));
 
+let _streamCancel = null;
+ipcMain.handle('inference:stream-start', async (event, id, input) => {
+  if (_streamCancel) _streamCancel.cancelled = true;
+  const cancelRef = { cancelled: false };
+  _streamCancel = cancelRef;
+  try {
+    return await trainer.inferStream(id, input, (chunk) => {
+      if (!event.sender.isDestroyed()) event.sender.send('inference:token', chunk);
+    }, cancelRef);
+  } finally {
+    if (_streamCancel === cancelRef) _streamCancel = null;
+  }
+});
+ipcMain.on('inference:cancel', () => { if (_streamCancel) _streamCancel.cancelled = true; });
+
+ipcMain.handle('plugins:list', () => pluginLoader.list());
+ipcMain.handle('plugins:install', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Install Plugin',
+    filters: [{ name: 'NeuralCity Plugin', extensions: ['ncpl'] }],
+    properties: ['openFile']
+  });
+  if (res.canceled || !res.filePaths[0]) return null;
+  return pluginLoader.install(res.filePaths[0]);
+});
+ipcMain.handle('plugins:uninstall', (_, id) => pluginLoader.uninstall(id));
+
 ipcMain.handle('api:start', (_, id, port) => apiServer.start(id, port));
 ipcMain.handle('api:stop', (_, id) => apiServer.stop(id));
 ipcMain.handle('api:status', (_, id) => apiServer.status(id));
@@ -165,6 +197,55 @@ ipcMain.handle('dialog:readTextFile', async (_, options) => {
   if (result.canceled || !result.filePaths[0]) return null;
   return { path: result.filePaths[0], content: fs.readFileSync(result.filePaths[0], 'utf-8') };
 });
+
+ipcMain.handle('gpt:pickDocuments', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Select Documents',
+    filters: [{ name: 'Documents', extensions: ['txt', 'md', 'html', 'htm', 'csv', 'json', 'ts', 'js', 'py', 'yaml', 'yml', 'xml', 'zip'] }],
+    properties: ['openFile', 'multiSelections']
+  });
+  if (result.canceled || !result.filePaths.length) return [];
+  const MAX = 500 * 1024;
+  const TEXT_EXTS = new Set(['txt', 'md', 'html', 'htm', 'csv', 'json', 'ts', 'js', 'py', 'yaml', 'yml', 'xml']);
+  const docs = [];
+  for (const p of result.filePaths) {
+    const ext = path.extname(p).slice(1).toLowerCase();
+    if (ext === 'zip') {
+      const extractZip = require('extract-zip');
+      const extractDir = path.join(os.tmpdir(), `nc-zip-${Date.now()}`);
+      fs.mkdirSync(extractDir, { recursive: true });
+      try {
+        await extractZip(p, { dir: extractDir });
+        function walkDir(dir) {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) { walkDir(full); continue; }
+            const e = entry.name.split('.').pop().toLowerCase();
+            if (!TEXT_EXTS.has(e)) continue;
+            let content = '';
+            try { content = fs.readFileSync(full, 'utf-8'); } catch {}
+            const truncated = content.length > MAX;
+            if (truncated) content = content.slice(0, MAX);
+            docs.push({ name: entry.name, content, size: content.length, truncated });
+          }
+        }
+        walkDir(extractDir);
+      } finally {
+        try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
+      }
+    } else {
+      const name = path.basename(p);
+      let content = '';
+      try { content = fs.readFileSync(p, 'utf-8'); } catch {}
+      const truncated = content.length > MAX;
+      if (truncated) content = content.slice(0, MAX);
+      docs.push({ name, content, size: content.length, truncated });
+    }
+  }
+  return docs;
+});
+
+ipcMain.handle('app:restart', () => { app.relaunch(); app.exit(0); });
 
 function getHostIp() {
   const ifaces = os.networkInterfaces();

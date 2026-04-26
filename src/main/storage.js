@@ -20,6 +20,9 @@ class Storage {
     this.rootDir = rootDir;
     this.netDir = path.join(rootDir, 'networks');
     if (!fs.existsSync(this.netDir)) fs.mkdirSync(this.netDir, { recursive: true });
+    // Parsed-JSON cache: avoids redundant readFileSync + JSON.parse when the
+    // file has not changed on disk.  Entry shape: { mtime: number, data: object }
+    this._jsonCache = new Map();
   }
 
   _netPath(id) { return path.join(this.netDir, `${id}.json`); }
@@ -27,11 +30,20 @@ class Storage {
   _readRaw(id) {
     const p = this._netPath(id);
     if (!fs.existsSync(p)) return null;
-    return JSON.parse(fs.readFileSync(p, 'utf-8'));
+    const mtime = fs.statSync(p).mtimeMs;
+    const cached = this._jsonCache.get(id);
+    if (cached && cached.mtime === mtime) return cached.data;
+    const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    this._jsonCache.set(id, { mtime, data });
+    return data;
   }
 
   _writeRaw(id, obj) {
-    fs.writeFileSync(this._netPath(id), JSON.stringify(obj, null, 2));
+    const p = this._netPath(id);
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2));
+    // Populate cache immediately so the next _readRaw skips the disk read.
+    const mtime = fs.statSync(p).mtimeMs;
+    this._jsonCache.set(id, { mtime, data: obj });
   }
 
   // Encryption helpers
@@ -175,6 +187,7 @@ class Storage {
   deleteNetwork(id) {
     const p = this._netPath(id);
     if (fs.existsSync(p)) fs.unlinkSync(p);
+    this._jsonCache.delete(id);
     return true;
   }
 

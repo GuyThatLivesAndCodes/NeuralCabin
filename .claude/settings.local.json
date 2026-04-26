@@ -15,7 +15,8 @@
       "Bash(node scripts/bump-version.js bogus)",
       "Bash(echo \"exit=$?\")",
       "Bash(npm run *)",
-      "Bash(node scripts/bench-train.js --all)"
+      "Bash(node scripts/bench-train.js --all)",
+      "Bash(gh run *)"
     ]
   }
 }

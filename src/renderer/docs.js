@@ -888,6 +888,340 @@ dropout:    0.1</code></pre>
 `
   },
   {
+    id: 'ncpl-intro',
+    title: 'Plugin system (.ncpl)',
+    body: `
+<h1>The NeuralCity Plugin System</h1>
+<p>NeuralCity's plugin system lets you extend the application with new model templates, custom training-data editors, and custom inference UIs — all delivered as a single portable file with the <code>.ncpl</code> extension. Plugins can run logic in the main (Node.js) process and render custom UI in the renderer process, communicating over Electron's IPC bridge.</p>
+
+<h2>The .ncpl file format</h2>
+<p>A <code>.ncpl</code> file is plain JSON. It requires no compression or binary packaging — open any <code>.ncpl</code> in a text editor to inspect or modify it.</p>
+<pre><code>{
+  "id":          "my-plugin",
+  "name":        "My Plugin",
+  "version":     "1.0.0",
+  "description": "A short description shown in the Plugins tab.",
+  "author":      "Your Name",
+  "mainCode":    "/* Node.js source — runs in the main process */",
+  "rendererCode":"/* Browser JS — evaluated in the renderer */",
+}</code></pre>
+
+<h2>Field reference</h2>
+<table>
+<tr><th>Field</th><th>Required</th><th>Description</th></tr>
+<tr><td><code>id</code></td><td>Yes</td><td>Unique identifier. Must match <code>/^[a-z0-9_-]+$/i</code>. Used as the directory name and IPC namespace prefix.</td></tr>
+<tr><td><code>name</code></td><td>No</td><td>Display name shown in the Plugins tab. Defaults to <code>id</code>.</td></tr>
+<tr><td><code>version</code></td><td>No</td><td>SemVer string shown next to the plugin name. Defaults to <code>"0.0.0"</code>.</td></tr>
+<tr><td><code>description</code></td><td>No</td><td>One-paragraph description shown in the Plugins tab.</td></tr>
+<tr><td><code>author</code></td><td>No</td><td>Author name shown in the Plugins tab.</td></tr>
+<tr><td><code>mainCode</code></td><td>No</td><td>A JavaScript string that will be written to <code>main.js</code> in the plugin directory and <code>require()</code>d in the main process. Must export <code>{ mainHandlers }</code> (see below).</td></tr>
+<tr><td><code>rendererCode</code></td><td>No</td><td>A JavaScript string that will be written to <code>renderer.js</code> and evaluated in the renderer process via <code>new Function('api', code)(api)</code>. Receives the plugin <code>api</code> object as its sole argument.</td></tr>
+</table>
+
+<h2>How plugins are stored</h2>
+<p>When you install a <code>.ncpl</code> file, the installer extracts the JSON fields and writes them to the user's application data directory:</p>
+<pre><code>%APPDATA%/NeuralCity/
+└── plugins/
+    └── my-plugin/
+        ├── manifest.json    ← id, name, version, description, author
+        ├── main.js          ← extracted mainCode
+        └── renderer.js      ← extracted rendererCode</code></pre>
+<p>The plugin directory layout mirrors the built-in <code>src/plugins/</code> directory in the NeuralCity source tree. Bundled example plugins (such as the Chess plugin) are seeded into this directory on every app launch, ensuring the latest version is always present.</p>
+
+<h2>Plugin loading lifecycle</h2>
+<ol>
+  <li><strong>Startup</strong> — <code>PluginLoader.load(ipcMain)</code> scans every subdirectory of the plugins folder, reads <code>manifest.json</code> and <code>renderer.js</code>, and <code>require()</code>s <code>main.js</code>. Any IPC handlers exported from <code>mainHandlers</code> are registered at this point.</li>
+  <li><strong>Renderer init</strong> — <code>initPlugins()</code> in the renderer calls <code>window.nc.plugins.list()</code>, iterates each plugin's <code>rendererCode</code>, and evaluates it via <code>new Function('api', code)(api)</code>. Templates, inference renderers, and train editors registered here become immediately usable.</li>
+  <li><strong>Install / uninstall</strong> — Installs write files to disk; uninstalls remove them. Neither operation hot-reloads plugins. A manual restart is required to apply the changes.</li>
+</ol>
+
+<h2>IPC namespacing</h2>
+<p>Each plugin's main-process handlers are registered under a namespaced channel: <code>plugin:&lt;id&gt;:&lt;channel&gt;</code>. For example, if the chess plugin exports <code>mainHandlers['chess:encodePosition']</code>, it is registered as <code>plugin:chess:chess:encodePosition</code>. From the renderer, call it via:</p>
+<pre><code>nc.invoke('chess:encodePosition', fen)
+// equivalent to: window.nc.plugins.invoke('chess', 'chess:encodePosition', fen)</code></pre>
+<p>The <code>nc</code> object is the namespaced invoke helper provided to your renderer code by the plugin registry — it automatically prepends your plugin's ID.</p>
+
+<h2>Security model</h2>
+<p>Plugin <code>mainCode</code> runs with full Node.js access in the Electron main process — treat it like any application code you install. Plugin <code>rendererCode</code> is evaluated in the renderer with <code>unsafe-eval</code> allowed in the CSP; it has access to the renderer's <code>window</code> object but not to Node.js APIs directly. All main-process calls must go through the <code>nc.invoke()</code> bridge.</p>
+`
+  },
+  {
+    id: 'ncpl-dev-guide',
+    title: 'Building a plugin',
+    body: `
+<h1>Building a NeuralCity Plugin</h1>
+<p>This guide walks through creating a complete plugin from scratch — defining main-process logic, writing a renderer UI, packaging it as a <code>.ncpl</code> file, and testing it in the app.</p>
+
+<h2>1. Plan your plugin</h2>
+<p>Every plugin can contribute up to three things:</p>
+<ul>
+  <li><strong>A model template</strong> — appears in the "New Network" modal under "Plugin Models". Defines the network architecture, training defaults, and initial training data.</li>
+  <li><strong>A training editor</strong> — replaces the default JSON textarea on the Train tab for networks created from your template. Lets you build custom data-import UI (file upload, text parsing, etc.).</li>
+  <li><strong>An inference renderer</strong> — replaces the default inference UI for your network type. Use it to build a custom interactive interface for predictions.</li>
+</ul>
+<p>You don't need all three. A plugin can register only a template, or only a training editor + inference renderer with no template.</p>
+
+<h2>2. Write the main-process code</h2>
+<p>Create <code>main.js</code>. This file is <code>require()</code>d in Node.js, so you have access to the full Node.js standard library.</p>
+<pre><code>'use strict';
+
+// main.js — main-process handlers for 'my-plugin'
+function doSomethingExpensive(data) {
+  // CPU-heavy work, file I/O, etc.
+  return { result: data.length };
+}
+
+module.exports = {
+  mainHandlers: {
+    // Channel name is a free-form string; namespaced automatically by the loader.
+    // Called from renderer via: nc.invoke('my-plugin:process', data)
+    'my-plugin:process': (_, data) => doSomethingExpensive(data),
+
+    // Handlers are plain async functions — return a Promise to resolve it.
+    'my-plugin:asyncOp': async (_, id) => {
+      const result = await someAsyncWork(id);
+      return result;
+    }
+  }
+};</code></pre>
+<p>The first argument to every handler is the Electron <code>event</code> object (from <code>ipcMain.handle</code>). Your data arguments start from the second parameter. Return any JSON-serializable value.</p>
+
+<h2>3. Write the renderer code</h2>
+<p>Create <code>renderer.js</code>. This code is evaluated inside an IIFE <code>(function(api){ ... })(api)</code>, so any variable you declare is local. You receive one argument — the <code>api</code> object — through which you register all hooks.</p>
+<pre><code>// renderer.js — evaluated in the Electron renderer process
+(function (api) {
+  'use strict';
+
+  // ── 1. Register a template ─────────────────────────────────────────────
+  api.registerTemplate({
+    id:         'my-plugin',       // must be unique across all templates
+    name:       'My Custom Model',
+    kind:       'classifier',      // underlying engine kind
+    pluginKind: 'my-plugin',       // key used by trainEditor / inferenceRenderer hooks
+    desc:       'A brief description.',
+    arch: {
+      kind:      'classifier',
+      pluginKind: 'my-plugin',
+      inputDim:   16,
+      outputDim:  8,
+      hidden:     [64, 32],
+      activation: 'relu',
+      dropout:    0.1
+    },
+    training: {
+      optimizer: 'adam', learningRate: 0.001,
+      batchSize: 32, epochs: 50, seed: 42
+    },
+    trainingData: { samples: [] }
+  });
+
+  // ── 2. Register a custom training editor ───────────────────────────────
+  // 'my-plugin' matches arch.pluginKind above
+  api.registerTrainEditor('my-plugin', function (root, network, nc) {
+    root.innerHTML = '&lt;button id="my-upload-btn"&gt;Upload data&lt;/button&gt;';
+
+    document.getElementById('my-upload-btn').addEventListener('click', async () => {
+      const file = await window.nc.dialog.readTextFile({
+        filters: [{ name: 'Text', extensions: ['txt'] }]
+      });
+      if (!file) return;
+
+      // Call a main-process handler to parse the file
+      const parsed = await nc.invoke('my-plugin:process', file.content);
+
+      // Save samples back to the network
+      await window.nc.networks.update(network.id, {
+        trainingData: { samples: parsed.samples }
+      });
+    });
+  });
+
+  // ── 3. Register a custom inference renderer ────────────────────────────
+  api.registerInferenceRenderer('my-plugin', function (root, network, nc) {
+    const isTrained = !!(network.state || network.stateLocked);
+
+    root.innerHTML = \`
+      &lt;div class="panel"&gt;
+        &lt;h2&gt;My Custom Inference&lt;/h2&gt;
+        &lt;input id="my-input" type="text" placeholder="Enter input..." /&gt;
+        &lt;button id="my-predict" \${!isTrained ? 'disabled' : ''}&gt;Predict&lt;/button&gt;
+        &lt;div id="my-result"&gt;&lt;/div&gt;
+      &lt;/div&gt;
+    \`;
+
+    document.getElementById('my-predict').addEventListener('click', async () => {
+      const rawInput = document.getElementById('my-input').value;
+      // Encode via main-process handler
+      const encoded = await nc.invoke('my-plugin:process', rawInput);
+      // Run inference through the engine
+      const result = await window.nc.inference.run(network.id, { input: encoded.vector });
+      document.getElementById('my-result').textContent = JSON.stringify(result);
+    });
+  });
+
+})(api); // api is injected by the plugin registry</code></pre>
+
+<h2>4. Package as a .ncpl file</h2>
+<p>Read <code>main.js</code> and <code>renderer.js</code>, embed them as JSON strings, and write the combined manifest:</p>
+<pre><code>// build-ncpl.js — run with: node build-ncpl.js
+const fs = require('fs');
+
+const mainCode     = fs.readFileSync('main.js', 'utf-8');
+const rendererCode = fs.readFileSync('renderer.js', 'utf-8');
+
+const ncpl = {
+  id:          'my-plugin',
+  name:        'My Custom Model',
+  version:     '1.0.0',
+  description: 'A brief description.',
+  author:      'Your Name',
+  mainCode,
+  rendererCode
+};
+
+fs.writeFileSync('my-plugin.ncpl', JSON.stringify(ncpl, null, 2));
+console.log('Wrote my-plugin.ncpl');</code></pre>
+<p>Alternatively, build the JSON manually in any text editor — it is just a JSON object with two large string fields.</p>
+
+<h2>5. Testing during development</h2>
+<p>The fastest workflow avoids packaging entirely:</p>
+<ol>
+  <li>Create a directory <code>src/plugins/my-plugin/</code> in the NeuralCity source tree.</li>
+  <li>Add <code>manifest.json</code>, <code>main.js</code>, and <code>renderer.js</code> as separate files.</li>
+  <li>The <code>seedBuiltins</code> method copies everything from <code>src/plugins/</code> to the user's plugin directory on every launch, so your changes are picked up automatically on restart.</li>
+  <li>Launch with <code>npm start</code>. Your plugin is live after the renderer initializes.</li>
+</ol>
+<p>For production, package as a <code>.ncpl</code> and install via the Plugins tab → Install Plugin.</p>
+
+<h2>Common pitfalls</h2>
+<table>
+<tr><th>Problem</th><th>Cause</th><th>Fix</th></tr>
+<tr><td>Plugin not visible after install</td><td>Needs restart</td><td>Restart the app — plugin system loads at startup only</td></tr>
+<tr><td>Inference renderer never called</td><td><code>pluginKind</code> mismatch</td><td>Ensure <code>arch.pluginKind</code> in the template matches the key passed to <code>registerInferenceRenderer()</code></td></tr>
+<tr><td>Train editor not shown</td><td>Same mismatch</td><td>Same fix — <code>registerTrainEditor('my-plugin', ...)</code> key must equal <code>arch.pluginKind</code></td></tr>
+<tr><td>Main handler returns undefined</td><td>Channel name wrong</td><td>Channel passed to <code>nc.invoke()</code> must exactly match a key in <code>mainHandlers</code></td></tr>
+<tr><td>Error: "Plugin renderer failed"</td><td>JavaScript error in rendererCode</td><td>Open DevTools (launch with <code>--dev</code> flag) and check the console for the stack trace</td></tr>
+</table>
+`
+  },
+  {
+    id: 'ncpl-api-ref',
+    title: 'Plugin API reference',
+    body: `
+<h1>Plugin API Reference</h1>
+<p>This page documents every API available to plugin code: the <code>api</code> object available in <code>rendererCode</code>, the <code>nc</code> invoke helper, the <code>window.nc</code> APIs accessible from renderer plugins, and the <code>mainHandlers</code> export format for <code>mainCode</code>.</p>
+
+<h2>api object (rendererCode)</h2>
+<p>The <code>api</code> object is the sole argument passed to your renderer code. It is the only sanctioned way to hook into the NeuralCity UI from a plugin.</p>
+
+<h3>api.registerTemplate(template)</h3>
+<p>Adds a network template to the global template list. Templates appear in the "New Network" modal under the "Plugin Models" category.</p>
+<table>
+<tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>id</code></td><td>string</td><td>Unique template ID. If a template with this ID already exists, it is silently skipped.</td></tr>
+<tr><td><code>name</code></td><td>string</td><td>Display name in the New Network modal.</td></tr>
+<tr><td><code>kind</code></td><td>string</td><td>Must match one of the engine's supported kinds: <code>'classifier'</code>, <code>'regressor'</code>, <code>'charLM'</code>, <code>'gpt'</code>.</td></tr>
+<tr><td><code>pluginKind</code></td><td>string</td><td>The key used to look up the inference renderer and train editor. Must match the keys you pass to <code>registerInferenceRenderer()</code> and <code>registerTrainEditor()</code>.</td></tr>
+<tr><td><code>desc</code></td><td>string</td><td>Short description shown below the template name.</td></tr>
+<tr><td><code>arch</code></td><td>object</td><td>Architecture object saved to the network. Must include <code>kind</code>, <code>pluginKind</code>, <code>inputDim</code>, <code>outputDim</code>, <code>hidden[]</code>, <code>activation</code>, <code>dropout</code>.</td></tr>
+<tr><td><code>training</code></td><td>object</td><td>Default training options: <code>optimizer</code>, <code>learningRate</code>, <code>batchSize</code>, <code>epochs</code>, <code>seed</code>.</td></tr>
+<tr><td><code>trainingData</code></td><td>object</td><td>Initial training data. Typically <code>{ samples: [] }</code>.</td></tr>
+</table>
+
+<h3>api.registerTrainEditor(pluginKind, fn)</h3>
+<p>Registers a custom training data editor for networks whose <code>arch.pluginKind</code> matches <code>pluginKind</code>. The editor replaces the default JSON textarea on the Train tab.</p>
+<pre><code>api.registerTrainEditor('my-plugin', function (root, network, nc) {
+  // root   — HTMLElement container to render into (empty on entry)
+  // network — the full network object (id, name, architecture, trainingData, …)
+  // nc     — the namespaced invoke helper for this plugin
+});</code></pre>
+<p>The <code>root</code> element is a <code>div</code> with id <code>plugin-train-editor</code>. Set <code>root.innerHTML</code> to render your UI. Use <code>window.nc.networks.update(network.id, patch)</code> to persist changes.</p>
+
+<h3>api.registerInferenceRenderer(pluginKind, fn)</h3>
+<p>Registers a custom inference UI for networks whose <code>arch.pluginKind</code> matches <code>pluginKind</code>. Replaces the entire Inference tab content for those networks.</p>
+<pre><code>api.registerInferenceRenderer('my-plugin', function (root, network, nc) {
+  // root   — HTMLElement to render into (cleared on entry)
+  // network — full network object; check network.state to determine if trained
+  // nc     — namespaced invoke helper
+});</code></pre>
+<p><strong>Note:</strong> The inference renderer is shown even for untrained networks. Check <code>!!(network.state || network.stateLocked)</code> to determine whether to enable AI-dependent buttons.</p>
+
+<h3>api.invoke(channel, ...args)</h3>
+<p>Calls a main-process handler registered under the plugin's own <code>mainHandlers</code>. This is a convenience alias for <code>window.nc.plugins.invoke(pluginId, channel, ...args)</code>.</p>
+<pre><code>const result = await nc.invoke('my-plugin:doWork', payload);</code></pre>
+<p>The channel string must exactly match a key in <code>mainHandlers</code>. Returns a Promise resolving to the handler's return value.</p>
+
+<hr>
+
+<h2>mainHandlers export (mainCode)</h2>
+<p>Your <code>main.js</code> must export a <code>mainHandlers</code> object. Each key is an IPC channel name and each value is the handler function.</p>
+<pre><code>module.exports = {
+  mainHandlers: {
+    // First arg is always the Electron IpcMainInvokeEvent (usually unused).
+    // Remaining args are what the renderer passed to nc.invoke().
+    'my-plugin:doWork': (event, payload) => {
+      return processPayload(payload); // return value goes back to renderer
+    },
+    'my-plugin:fetchData': async (event, url) => {
+      const data = await fetch(url).then(r => r.json());
+      return data;
+    }
+  }
+};</code></pre>
+<p>All handlers are wrapped in <code>ipcMain.handle()</code> which supports async functions natively. Thrown errors are serialized and re-thrown in the renderer as rejected Promises.</p>
+
+<hr>
+
+<h2>window.nc APIs available to renderer plugins</h2>
+<p>Plugin renderer code runs in the Electron renderer context and has access to the full <code>window.nc</code> bridge.</p>
+
+<h3>window.nc.inference.run(networkId, input)</h3>
+<p>Runs a forward pass through a trained network. Returns a Promise.</p>
+<table>
+<tr><th>input field</th><th>Used for</th><th>Type</th></tr>
+<tr><td><code>input</code></td><td>classifier / regressor</td><td><code>number[]</code> of length <code>inputDim</code></td></tr>
+<tr><td><code>prompt</code></td><td>charLM</td><td>string</td></tr>
+<tr><td><code>history</code>, <code>prompt</code></td><td>gpt/chat</td><td>message array + string</td></tr>
+</table>
+<p>Return value for classifiers: <code>{ kind: 'classification', label, labelIndex, confidence, probs: number[] }</code>. The <code>probs</code> array has one entry per output class.</p>
+
+<h3>window.nc.networks.update(networkId, patch)</h3>
+<p>Merges <code>patch</code> into the saved network object. Use this to persist training data after parsing:</p>
+<pre><code>await window.nc.networks.update(network.id, {
+  trainingData: { samples: parsedSamples }
+});</code></pre>
+
+<h3>window.nc.dialog.readTextFile(options)</h3>
+<p>Shows a native open-file dialog and returns the selected file's content as a string.</p>
+<pre><code>const file = await window.nc.dialog.readTextFile({
+  filters: [{ name: 'Text', extensions: ['txt', 'csv'] }]
+});
+if (file) {
+  const { path, content } = file; // content is a UTF-8 string
+}</code></pre>
+
+<h3>window.nc.plugins.invoke(pluginId, channel, ...args)</h3>
+<p>Low-level invoke. The <code>nc.invoke()</code> helper in your renderer code calls this automatically with your plugin's ID filled in. You can also call other plugins' handlers directly if needed.</p>
+
+<hr>
+
+<h2>Manifest fields quick reference</h2>
+<table>
+<tr><th>Field</th><th>Required</th><th>Constraints</th><th>Default</th></tr>
+<tr><td><code>id</code></td><td>Yes</td><td><code>/^[a-z0-9_-]+$/i</code></td><td>—</td></tr>
+<tr><td><code>name</code></td><td>No</td><td>Any string</td><td>Same as <code>id</code></td></tr>
+<tr><td><code>version</code></td><td>No</td><td>SemVer string</td><td><code>"0.0.0"</code></td></tr>
+<tr><td><code>description</code></td><td>No</td><td>Any string</td><td><code>""</code></td></tr>
+<tr><td><code>author</code></td><td>No</td><td>Any string</td><td><code>""</code></td></tr>
+<tr><td><code>mainCode</code></td><td>No</td><td>Valid JS; must export <code>{ mainHandlers }</code></td><td><code>""</code></td></tr>
+<tr><td><code>rendererCode</code></td><td>No</td><td>Valid JS; receives <code>api</code> arg</td><td><code>""</code></td></tr>
+</table>
+
+<h2>Built-in example plugin — Chess</h2>
+<p>The Chess Move Predictor plugin bundled with NeuralCity (<code>src/plugins/chess/</code>) demonstrates all three hooks: a template registering a 73-input → 4096-output classifier, a training editor for parsing UCI game files, and an inference renderer with a full interactive chessboard. Browse <code>src/plugins/chess/main.js</code> and <code>renderer.js</code> for a complete real-world reference implementation.</p>
+`
+  },
+  {
     id: 'contributing',
     title: 'Contributing',
     body: `

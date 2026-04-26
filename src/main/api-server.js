@@ -220,7 +220,7 @@ class ApiServer extends EventEmitter {
     const a = net.architecture;
     if (a.kind === 'classifier' || a.kind === 'mlp') return { type: 'vector', length: a.inputDim };
     if (a.kind === 'regressor') return { type: 'vector', length: a.inputDim, outputLength: a.outputDim };
-    if (a.kind === 'charLM') {
+    if (a.kind === 'charLM' || a.kind === 'gpt') {
       const base = { type: 'text', fields: ['prompt', 'maxTokens', 'temperature', 'topK'] };
       if (a.isChat) {
         base.chatFields = ['history', 'messages', 'system'];

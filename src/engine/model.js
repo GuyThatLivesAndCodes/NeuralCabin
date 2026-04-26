@@ -28,7 +28,7 @@ function buildModel(arch, rng) {
     return new Sequential(layers);
   }
 
-  if (arch.kind === 'charLM') {
+  if (arch.kind === 'charLM' || arch.kind === 'gpt') {
     // Embedding → flatten (contextLen*embDim) → MLP → vocabSize logits
     const ctx = arch.contextLen;
     const emb = arch.embDim;
@@ -118,13 +118,13 @@ class CharLM {
 }
 
 function buildFromSpec(spec, rng) {
-  if (spec.kind === 'charLM') return new CharLM(spec, rng);
+  if (spec.kind === 'charLM' || spec.kind === 'gpt') return new CharLM(spec, rng);
   return buildModel(spec, rng);
 }
 
 function restoreFromState(state, spec, rng) {
   // state.kind tells us
-  if (state.kind === 'charLM') return CharLM.fromJSON(state, rng);
+  if (state.kind === 'charLM' || state.kind === 'gpt') return CharLM.fromJSON(state, rng);
   return Sequential.fromJSON(state, rng);
 }
 

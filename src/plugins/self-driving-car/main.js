@@ -18,7 +18,6 @@ const DEFAULT_POP_SIZE = 20;
 const INPUT_DIM   = 11;   // 9 sensor rays + normalised speed + steer_memory
 const OUTPUT_DIM  = 2;    // steer (-1 to 1), throttle/brake (-1 to 1)
 const TRACK_PTS   = 8;    // Base control points before Chaikin smoothing
-const HALF_W      = 28;   // Track half-width for collision detection
 const MAX_FRAMES  = (30 * 18);  // ~18 s episode limit
 
 const RAY_ANGLES  = Array.from({length: 9}, (_, i) => -1.4 + (i * 2.8 / 14));
@@ -36,22 +35,22 @@ const GRIP_LOSS   = 0.4;    // Speed lost during hard cornering (proportional to
 const CANVAS_CX   = 350;
 const CANVAS_CY   = 285;
 
-// ── Module-level state ────────────────────────────────────────────────────────
-let _pop        = null;
-let _popSize    = DEFAULT_POP_SIZE;
-let _maxGens    = 0;       // 0 = unlimited
-let _track      = null;
-let _cars       = [];
-let _carFit     = [];
-let _generation = 0;
-let _bestFit    = 0;
-let _genBestFit = 0;
-let _running    = false;
-let _genHistory = [];      // [{gen, best, mean}]
-
-// ── Inference state ───────────────────────────────────────────────────────────
-let _inferCar   = null;
-let _inferTrack = null;
+// ── Per-instance sessions ─────────────────────────────────────────────────────
+function makeSession() {
+  return {
+    pop: null, popSize: DEFAULT_POP_SIZE, maxGens: 0,
+    track: null, cars: [], carFit: [],
+    generation: 0, bestFit: 0, genBestFit: 0,
+    running: false, genHistory: [],
+    inferCar: null, inferTrack: null,
+  };
+}
+const _sessions = new Map();
+function getSession(id) {
+  const key = id || 'default';
+  if (!_sessions.has(key)) _sessions.set(key, makeSession());
+  return _sessions.get(key);
+}
 
 // ── LCG seeded random ─────────────────────────────────────────────────────────
 function lcg(s) { return (Math.imul(s | 0, 1664525) + 1013904223) >>> 0; }
@@ -168,7 +167,6 @@ function senseCar(car, track) {
 }
 
 function stepCar(car, steerOut, throttleOut) {
-  // Grip loss bleeds speed when cornering hard at high velocity
   const gripLoss = GRIP_LOSS * Math.abs(steerOut) * (car.speed / MAX_SPEED);
   car.angle += steerOut * STEER_RATE * DT;
   const accel = throttleOut > 0 ?  throttleOut * ACCEL       * DT : 0;
@@ -194,8 +192,8 @@ function updateCarProgress(car, track) {
   car.segIdx = newSeg;
 }
 
-function carFitness(car) {
-  const progress    = car.laps + car.totalDist / Math.max(1, car.frames) * (car.frames / _track.N);
+function carFitness(car, track) {
+  const progress    = car.laps + car.totalDist / Math.max(1, car.frames) * (car.frames / track.N);
   const speedBonus  = (car.frames > 0 ? car.speed / MAX_SPEED : 0) * 0.01;
   const deathFactor = car.alive ? 1 : 0.8;
   return (progress + speedBonus) * deathFactor;
@@ -218,91 +216,86 @@ function gaussRand() {
 
 // ── Population step ───────────────────────────────────────────────────────────
 
-// opts: { ticks, mutStd, popSize, maxGens } — live settings applied at generation boundary
-function stepGeneration(opts) {
-  if (!_pop || !_track || !_running) return null;
+function stepGeneration(s, opts) {
+  if (!s.pop || !s.track || !s.running) return null;
   const ticks = Math.max(1, Math.min((typeof opts === 'number' ? opts : (opts.ticks || 2)) | 0, 6));
   const liveSettings = typeof opts === 'object' ? opts : {};
 
   for (let t = 0; t < ticks; t++) {
     let allDead = true;
 
-    for (let i = 0; i < _popSize; i++) {
-      const car = _cars[i];
+    for (let i = 0; i < s.popSize; i++) {
+      const car = s.cars[i];
       if (!car.alive) continue;
       allDead = false;
 
-      const inputs   = senseCar(car, _track);
-      const outs     = netForward(_pop.individuals[i], inputs);
+      const inputs   = senseCar(car, s.track);
+      const outs     = netForward(s.pop.individuals[i], inputs);
       const steer    = Math.max(-1, Math.min(1, outs[0]));
       const throttle = Math.max(-1, Math.min(1, outs[1]));
 
       stepCar(car, steer, throttle);
-      updateCarProgress(car, _track);
+      updateCarProgress(car, s.track);
 
-      if (!isOnTrack(car.x, car.y, _track) || car.frames >= MAX_FRAMES) {
+      if (!isOnTrack(car.x, car.y, s.track) || car.frames >= MAX_FRAMES) {
         car.alive    = false;
-        _carFit[i]   = carFitness(car);
+        s.carFit[i]  = carFitness(car, s.track);
       }
     }
 
     if (allDead) {
-      // Apply live settings before evolve so mutStd takes effect this generation
-      if (liveSettings.mutStd  != null) _pop.mutationStd = Math.max(0, liveSettings.mutStd);
-      if (liveSettings.maxGens != null) _maxGens = Math.max(0, liveSettings.maxGens | 0);
+      if (liveSettings.mutStd  != null) s.pop.mutationStd = Math.max(0, liveSettings.mutStd);
+      if (liveSettings.maxGens != null) s.maxGens = Math.max(0, liveSettings.maxGens | 0);
 
-      _pop.evaluate((_, idx) => _carFit[idx]);
-      const stats = _pop.evolve();
-      _generation++;
-      _genHistory.push({ gen: _generation, best: +_pop.bestFitness.toFixed(3), mean: +stats.mean.toFixed(3) });
-      if (_genHistory.length > 100) _genHistory.shift();
-      if (_pop.bestFitness > _bestFit) _bestFit = _pop.bestFitness;
-      _genBestFit = stats.max;
+      s.pop.evaluate((_, idx) => s.carFit[idx]);
+      const stats = s.pop.evolve();
+      s.generation++;
+      s.genHistory.push({ gen: s.generation, best: +s.pop.bestFitness.toFixed(3), mean: +stats.mean.toFixed(3) });
+      if (s.genHistory.length > 100) s.genHistory.shift();
+      if (s.pop.bestFitness > s.bestFit) s.bestFit = s.pop.bestFitness;
+      s.genBestFit = stats.max;
 
-      if (_maxGens > 0 && _generation >= _maxGens) _running = false;
+      if (s.maxGens > 0 && s.generation >= s.maxGens) s.running = false;
 
-      // Apply population size change after evolve
-      const newSize = liveSettings.popSize ? Math.max(4, Math.min(100, liveSettings.popSize | 0)) : _popSize;
-      if (newSize !== _popSize) {
-        _popSize        = newSize;
-        _pop.size       = newSize;
-        _pop.eliteCount = Math.max(1, Math.floor(newSize * 0.2));
-        _pop.fitnesses  = new Float32Array(newSize);
-        // Trim excess individuals (post-evolve, elites are first so trim from tail)
-        while (_pop.individuals.length > newSize) _pop.individuals.pop();
-        // Pad with new random explorers if growing
+      const newSize = liveSettings.popSize ? Math.max(4, Math.min(100, liveSettings.popSize | 0)) : s.popSize;
+      if (newSize !== s.popSize) {
+        s.popSize           = newSize;
+        s.pop.size          = newSize;
+        s.pop.eliteCount    = Math.max(1, Math.floor(newSize * 0.2));
+        s.pop.fitnesses     = new Float32Array(newSize);
+        while (s.pop.individuals.length > newSize) s.pop.individuals.pop();
         if (buildFromSpec) {
-          while (_pop.individuals.length < newSize) {
+          while (s.pop.individuals.length < newSize) {
             const rng = T.rngFromSeed((Math.random() * 0xFFFFFF) | 0);
-            _pop.individuals.push(buildFromSpec(_pop.arch, rng));
+            s.pop.individuals.push(buildFromSpec(s.pop.arch, rng));
           }
         }
       }
 
-      _cars   = Array.from({ length: _popSize }, () => spawnCar(_track));
-      _carFit = new Array(_popSize).fill(0);
+      s.cars   = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+      s.carFit = new Array(s.popSize).fill(0);
       break;
     }
   }
 
-  return buildVisualState();
+  return buildVisualState(s);
 }
 
-function buildVisualState() {
-  if (!_cars || !_track) return null;
+function buildVisualState(s) {
+  if (!s.cars || !s.track) return null;
   return {
-    track: _track,
-    cars: _cars.map(c => ({
+    track: s.track,
+    cars: s.cars.map(c => ({
       x: c.x, y: c.y, angle: c.angle, alive: c.alive,
       speed: c.speed, laps: c.laps,
     })),
-    generation: _generation,
-    aliveCnt:   _cars.filter(c => c.alive).length,
-    popSize:    _popSize,
-    bestFit:    +_bestFit.toFixed(3),
-    genBestFit: +_genBestFit.toFixed(3),
-    genHistory: _genHistory.slice(-60),
-    hasBestGenome: _pop !== null && _pop.bestIndividual !== null,
+    generation: s.generation,
+    aliveCnt:   s.cars.filter(c => c.alive).length,
+    popSize:    s.popSize,
+    bestFit:    +s.bestFit.toFixed(3),
+    genBestFit: +s.genBestFit.toFixed(3),
+    genHistory: s.genHistory.slice(-60),
+    hasBestGenome: s.pop !== null && s.pop.bestIndividual !== null,
   };
 }
 
@@ -311,99 +304,126 @@ module.exports = {
   mainHandlers: {
     'self-driving-car:init': (_, opts = {}) => {
       if (!Population || !T) return { error: 'Neuroevolution engine unavailable.' };
+      const id = opts.instanceId || 'default';
+      const s  = getSession(id);
 
-      _popSize = Math.max(4, Math.min(100, (opts.popSize | 0) || DEFAULT_POP_SIZE));
-      _maxGens = Math.max(0, (opts.generations | 0) || 0);
+      s.popSize = Math.max(4, Math.min(100, (opts.popSize | 0) || DEFAULT_POP_SIZE));
+      s.maxGens = Math.max(0, (opts.generations | 0) || 0);
       const seed   = (opts.seed || 0) >>> 0;
       const mutStd = Math.max(0.001, opts.mutStd || 0.05);
 
-      _track = generateTrack(seed || 0xC0FFEE);
+      s.track = generateTrack(seed || 0xC0FFEE);
 
-      _pop = new Population({
+      s.pop = new Population({
         architecture: {
           kind: 'classifier',
           inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
           hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
         },
-        size: _popSize,
-        eliteCount: Math.max(1, Math.floor(_popSize * 0.2)),
+        size: s.popSize,
+        eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
         pMutate: 0.15, mutationStd: mutStd,
         tournamentK: 3, seed: opts.seed || 42,
       });
 
-      _cars       = Array.from({ length: _popSize }, () => spawnCar(_track));
-      _carFit     = new Array(_popSize).fill(0);
-      _generation = 0;
-      _bestFit    = 0;
-      _genBestFit = 0;
-      _running    = true;
-      _genHistory = [];
+      s.cars       = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+      s.carFit     = new Array(s.popSize).fill(0);
+      s.generation = 0;
+      s.bestFit    = 0;
+      s.genBestFit = 0;
+      s.running    = true;
+      s.genHistory = [];
 
-      return { ok: true, track: _track };
+      return { ok: true, track: s.track };
     },
 
-    'self-driving-car:getState': () => buildVisualState(),
-
-    'self-driving-car:step': (_, opts = 2) => stepGeneration(opts),
-
-    'self-driving-car:start': () => { _running = true;  return { ok: true }; },
-    'self-driving-car:stop':  () => { _running = false; return { ok: true }; },
-
-    'self-driving-car:newTrack': (_, seed) => {
-      if (!Population) return { error: 'Not initialized.' };
-      _track  = generateTrack((seed || Math.floor(Math.random() * 0xFFFFFF)) >>> 0);
-      _cars   = Array.from({ length: _popSize }, () => spawnCar(_track));
-      _carFit = new Array(_popSize).fill(0);
-      return { ok: true, track: _track };
+    'self-driving-car:getState': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      return buildVisualState(getSession(id));
     },
 
-    'self-driving-car:reset': () => {
+    'self-driving-car:step': (_, opts = {}) => {
+      const id = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+      return stepGeneration(getSession(id), opts);
+    },
+
+    'self-driving-car:start': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      getSession(id).running = true;
+      return { ok: true };
+    },
+
+    'self-driving-car:stop': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      getSession(id).running = false;
+      return { ok: true };
+    },
+
+    'self-driving-car:newTrack': (_, opts = {}) => {
+      const id   = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+      const seed = (typeof opts === 'object' ? opts.seed : opts) || null;
+      const s    = getSession(id);
+      if (!s.pop) return { error: 'Not initialized.' };
+      s.track  = generateTrack((seed || Math.floor(Math.random() * 0xFFFFFF)) >>> 0);
+      s.cars   = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+      s.carFit = new Array(s.popSize).fill(0);
+      return { ok: true, track: s.track };
+    },
+
+    'self-driving-car:reset': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      const s  = getSession(id);
       if (!Population || !T) return { error: 'Not initialized.' };
       const seed = Math.floor(Math.random() * 0xFFFFFF);
-      _track = generateTrack(seed);
-      _pop   = new Population({
+      s.track = generateTrack(seed);
+      s.pop   = new Population({
         architecture: {
           kind: 'classifier',
           inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
           hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
         },
-        size: _popSize,
-        eliteCount: Math.max(1, Math.floor(_popSize * 0.2)),
+        size: s.popSize,
+        eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
         pMutate: 0.15, mutationStd: 0.05,
         tournamentK: 3, seed: seed,
       });
-      _cars       = Array.from({ length: _popSize }, () => spawnCar(_track));
-      _carFit     = new Array(_popSize).fill(0);
-      _generation = 0;
-      _bestFit    = 0;
-      _genBestFit = 0;
-      _running    = true;
-      _genHistory = [];
+      s.cars       = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+      s.carFit     = new Array(s.popSize).fill(0);
+      s.generation = 0;
+      s.bestFit    = 0;
+      s.genBestFit = 0;
+      s.running    = true;
+      s.genHistory = [];
       return { ok: true };
     },
 
     // ── Inference handlers ──────────────────────────────────────────────────
 
-    'self-driving-car:inferInit': () => {
-      if (!_pop || !_track) return { error: 'No trained model — run training first.' };
-      const genome = _pop.bestIndividual || _pop.individuals[0];
+    'self-driving-car:inferInit': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      const s  = getSession(id);
+      if (!s.pop || !s.track) return { error: 'No trained model — run training first.' };
+      const genome = s.pop.bestIndividual || s.pop.individuals[0];
       if (!genome) return { error: 'Population not ready.' };
-      _inferCar   = spawnCar(_track);
-      _inferTrack = _track;
+      s.inferCar   = spawnCar(s.track);
+      s.inferTrack = s.track;
       return {
         ok: true,
-        track: _inferTrack,
-        generation: _generation,
-        bestFit: +_bestFit.toFixed(3),
+        track: s.inferTrack,
+        generation: s.generation,
+        bestFit: +s.bestFit.toFixed(3),
       };
     },
 
-    'self-driving-car:inferStep': (_, noiseStd = 0) => {
-      if (!_inferCar || !_inferTrack || !_pop) return null;
-      const genome = _pop.bestIndividual || _pop.individuals[0];
+    'self-driving-car:inferStep': (_, opts = {}) => {
+      const id       = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+      const noiseStd = (typeof opts === 'object' ? opts.noiseStd : opts) || 0;
+      const s        = getSession(id);
+      if (!s.inferCar || !s.inferTrack || !s.pop) return null;
+      const genome = s.pop.bestIndividual || s.pop.individuals[0];
       if (!genome) return null;
 
-      const rawInputs = senseCar(_inferCar, _inferTrack);
+      const rawInputs = senseCar(s.inferCar, s.inferTrack);
       let inputs = rawInputs;
       if (noiseStd > 0) {
         inputs = new Float32Array(rawInputs.length);
@@ -415,15 +435,18 @@ module.exports = {
       const outs     = netForward(genome, inputs);
       const steer    = Math.max(-1, Math.min(1, outs[0]));
       const throttle = Math.max(-1, Math.min(1, outs[1]));
-      stepCar(_inferCar, steer, throttle);
-      updateCarProgress(_inferCar, _inferTrack);
+      stepCar(s.inferCar, steer, throttle);
+      updateCarProgress(s.inferCar, s.inferTrack);
 
-      const dead = !isOnTrack(_inferCar.x, _inferCar.y, _inferTrack) || _inferCar.frames >= MAX_FRAMES;
-      if (dead) _inferCar = spawnCar(_inferTrack);
+      const dead = !isOnTrack(s.inferCar.x, s.inferCar.y, s.inferTrack) || s.inferCar.frames >= MAX_FRAMES;
+      if (dead) s.inferCar = spawnCar(s.inferTrack);
 
       return {
-        track: _inferTrack,
-        car: { x: _inferCar.x, y: _inferCar.y, angle: _inferCar.angle, speed: _inferCar.speed, laps: _inferCar.laps },
+        track: s.inferTrack,
+        car: {
+          x: s.inferCar.x, y: s.inferCar.y,
+          angle: s.inferCar.angle, speed: s.inferCar.speed, laps: s.inferCar.laps,
+        },
         justReset: dead,
       };
     },

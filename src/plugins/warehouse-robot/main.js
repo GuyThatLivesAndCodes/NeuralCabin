@@ -16,22 +16,24 @@ const N_BOXES   = 3;
 const MAX_STEPS = 200;
 const STATE_DIM = 2 + N_BOXES * 2 + N_BOXES * 2;  // 14 floats
 const N_ACTIONS = 4;
-const DIRS      = [[-1, 0], [1, 0], [0, -1], [0, 1]];  // UP DOWN LEFT RIGHT
+const DIRS      = [[-1, 0], [1, 0], [0, -1], [0, 1]];
 
-// ── Module-level state ────────────────────────────────────────────────────────
-let _agent       = null;
-let _env         = null;
-let _running     = false;
-let _episode     = 0;
-let _epReward    = 0;
-let _totalSteps  = 0;
-let _bestReward  = -Infinity;
-let _rewardHistory = [];
-
-// ── Inference state ───────────────────────────────────────────────────────────
-let _inferEnv    = null;
-let _inferEpReward = 0;
-let _inferLapsDone = 0;  // completed inference episodes
+// ── Per-instance sessions ─────────────────────────────────────────────────────
+// Each network gets its own isolated state keyed by instanceId.
+function makeSession() {
+  return {
+    agent: null, env: null, running: false,
+    episode: 0, epReward: 0, totalSteps: 0,
+    bestReward: -Infinity, rewardHistory: [],
+    inferEnv: null, inferEpReward: 0, inferLapsDone: 0,
+  };
+}
+const _sessions = new Map();
+function getSession(id) {
+  const key = id || 'default';
+  if (!_sessions.has(key)) _sessions.set(key, makeSession());
+  return _sessions.get(key);
+}
 
 // ── LCG for seeded random positions ──────────────────────────────────────────
 function lcg(s) { return (Math.imul(s | 0, 1664525) + 1013904223) >>> 0; }
@@ -117,26 +119,25 @@ function stepEnv(env, action) {
   return { env: newEnv, reward, done };
 }
 
-function currentVisualState() {
-  if (!_env) return null;
+function buildVisualState(s) {
+  if (!s.env) return null;
   return {
     grid: GRID, nBoxes: N_BOXES,
-    robot:   _env.robot,
-    boxes:   _env.boxes,
-    targets: _env.targets,
-    onTarget: _env.onTarget,
-    episode: _episode,
-    stepInEp: _env.step,
-    totalSteps: _totalSteps,
-    epReward: +_epReward.toFixed(2),
-    bestReward: _bestReward === -Infinity ? null : +_bestReward.toFixed(2),
-    epsilon: _agent ? +_agent.epsilon.toFixed(4) : 1.0,
-    rewardHistory: _rewardHistory.slice(-80),
+    robot:    s.env.robot,
+    boxes:    s.env.boxes,
+    targets:  s.env.targets,
+    onTarget: s.env.onTarget,
+    episode:  s.episode,
+    stepInEp: s.env.step,
+    totalSteps: s.totalSteps,
+    epReward: +s.epReward.toFixed(2),
+    bestReward: s.bestReward === -Infinity ? null : +s.bestReward.toFixed(2),
+    epsilon:  s.agent ? +s.agent.epsilon.toFixed(4) : 1.0,
+    rewardHistory: s.rewardHistory.slice(-80),
   };
 }
 
-// ── Box-Muller Gaussian noise ─────────────────────────────────────────────────
-
+// ── Gaussian noise ────────────────────────────────────────────────────────────
 function gaussRand() {
   const u = Math.random(), v = Math.random();
   return Math.sqrt(-2 * Math.log(u + 1e-9)) * Math.cos(2 * Math.PI * v);
@@ -147,7 +148,9 @@ module.exports = {
   mainHandlers: {
     'warehouse-robot:init': (_, opts = {}) => {
       if (!_DQNAgent) return { error: 'DQNAgent module unavailable — check app bundle.' };
-      _agent = new _DQNAgent({
+      const id = opts.instanceId || 'default';
+      const s  = getSession(id);
+      s.agent = new _DQNAgent({
         architecture: {
           kind: 'classifier',
           inputDim: STATE_DIM, outputDim: N_ACTIONS,
@@ -156,123 +159,145 @@ module.exports = {
         gamma: 0.95,
         lr: opts.lr || opts.learningRate || 1e-3,
         batchSize:      opts.batchSize || 64,
-        bufferCapacity: 10000,
+        bufferCapacity: 5000,   // smaller buffer = less NAPI data per sample call
         epsilonStart: 1.0, epsilonEnd: 0.05, epsilonDecay: 0.9995,
         targetUpdateFreq: 200,
         seed: opts.seed || 42,
         optimizer: 'adam',
       });
-      _env         = resetEnv(opts.seed);
-      _running     = true;
-      _episode     = 0;
-      _epReward    = 0;
-      _totalSteps  = 0;
-      _bestReward  = -Infinity;
-      _rewardHistory = [];
+      s.env          = resetEnv(opts.seed);
+      s.running      = true;
+      s.episode      = 0;
+      s.epReward     = 0;
+      s.totalSteps   = 0;
+      s.bestReward   = -Infinity;
+      s.rewardHistory = [];
       return { ok: true, grid: GRID, nBoxes: N_BOXES };
     },
 
-    'warehouse-robot:getState': () => currentVisualState(),
+    'warehouse-robot:getState': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      return buildVisualState(getSession(id));
+    },
 
-    'warehouse-robot:step': (_, n = 4) => {
-      if (!_agent || !_env || !_running) return currentVisualState();
-      n = Math.max(1, Math.min(n | 0, 40));
+    // KEY FIX: collect n steps, then train ONCE — avoids blocking the main
+    // process with N full backprop passes per IPC call.
+    'warehouse-robot:step': (_, opts = {}) => {
+      const id = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+      const s  = getSession(id);
+      if (!s.agent || !s.env || !s.running) return buildVisualState(s);
+      const n = Math.max(1, Math.min((opts.n || (typeof opts === 'number' ? opts : 4)) | 0, 20));
 
       for (let i = 0; i < n; i++) {
-        const s      = encodeState(_env);
-        const a      = _agent.selectAction(s);
-        const { env: next, reward, done } = stepEnv(_env, a);
+        const state  = encodeState(s.env);
+        const a      = s.agent.selectAction(state);
+        const { env: next, reward, done } = stepEnv(s.env, a);
         const ns     = encodeState(next);
-        _agent.observe(s, a, reward, ns, done);
-        _agent.trainStep();
-        _epReward   += reward;
-        _totalSteps += 1;
-        _env         = next;
+        s.agent.observe(state, a, reward, ns, done);
+        s.epReward   += reward;
+        s.totalSteps += 1;
+        s.env         = next;
 
         if (done) {
-          _rewardHistory.push(+_epReward.toFixed(2));
-          if (_rewardHistory.length > 200) _rewardHistory.shift();
-          if (_epReward > _bestReward) _bestReward = _epReward;
-          _episode++;
-          _epReward = 0;
-          _env = resetEnv();
+          s.rewardHistory.push(+s.epReward.toFixed(2));
+          if (s.rewardHistory.length > 200) s.rewardHistory.shift();
+          if (s.epReward > s.bestReward) s.bestReward = s.epReward;
+          s.episode++;
+          s.epReward = 0;
+          s.env = resetEnv();
         }
       }
 
-      return currentVisualState();
+      // Train once per IPC call rather than once per step.
+      // This prevents the replay buffer's NAPI array conversion from
+      // blocking the main process N times per frame.
+      if (s.agent.buffer.ready) s.agent.trainStep();
+
+      return buildVisualState(s);
     },
 
-    'warehouse-robot:start': () => { _running = true;  return { ok: true }; },
-    'warehouse-robot:stop':  () => { _running = false; return { ok: true }; },
+    'warehouse-robot:start': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      getSession(id).running = true;
+      return { ok: true };
+    },
+    'warehouse-robot:stop': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      getSession(id).running = false;
+      return { ok: true };
+    },
 
-    'warehouse-robot:reset': () => {
-      if (!_agent) return { error: 'Not initialized — call init first.' };
-      _env         = resetEnv();
-      _episode     = 0;
-      _epReward    = 0;
-      _totalSteps  = 0;
-      _bestReward  = -Infinity;
-      _rewardHistory = [];
-      _agent.epsilon = _agent.epsilonStart;
-      _running     = true;
+    'warehouse-robot:reset': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      const s  = getSession(id);
+      if (!s.agent) return { error: 'Not initialized — call init first.' };
+      s.env          = resetEnv();
+      s.episode      = 0;
+      s.epReward     = 0;
+      s.totalSteps   = 0;
+      s.bestReward   = -Infinity;
+      s.rewardHistory = [];
+      s.agent.epsilon = s.agent.epsilonStart;
+      s.running      = true;
       return { ok: true };
     },
 
     // ── Inference handlers ────────────────────────────────────────────────
 
-    'warehouse-robot:inferInit': () => {
-      if (!_agent) return { error: 'No trained agent — run training first.' };
-      _inferEnv      = resetEnv();
-      _inferEpReward = 0;
-      _inferLapsDone = 0;
+    'warehouse-robot:inferInit': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      const s  = getSession(id);
+      if (!s.agent) return { error: 'No trained agent — run training first.' };
+      s.inferEnv      = resetEnv();
+      s.inferEpReward = 0;
+      s.inferLapsDone = 0;
       return {
-        ok: true,
-        grid: GRID, nBoxes: N_BOXES,
-        epsilon: +_agent.epsilon.toFixed(4),
-        totalSteps: _totalSteps,
-        episode: _episode,
-        bestReward: _bestReward === -Infinity ? null : +_bestReward.toFixed(2),
+        ok: true, grid: GRID, nBoxes: N_BOXES,
+        epsilon:    +s.agent.epsilon.toFixed(4),
+        totalSteps: s.totalSteps,
+        episode:    s.episode,
+        bestReward: s.bestReward === -Infinity ? null : +s.bestReward.toFixed(2),
       };
     },
 
-    'warehouse-robot:inferStep': (_, noiseStd = 0) => {
-      if (!_agent || !_inferEnv) return null;
+    'warehouse-robot:inferStep': (_, opts = {}) => {
+      const id       = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+      const noiseStd = (typeof opts === 'object' ? opts.noiseStd : 0) || 0;
+      const s        = getSession(id);
+      if (!s.agent || !s.inferEnv) return null;
 
-      const rawState = encodeState(_inferEnv);
+      const rawState = encodeState(s.inferEnv);
       let state = rawState;
       if (noiseStd > 0) {
         state = new Float32Array(rawState.length);
-        for (let i = 0; i < rawState.length; i++) {
-          state[i] = rawState[i] + gaussRand() * noiseStd;
-        }
+        for (let i = 0; i < rawState.length; i++) state[i] = rawState[i] + gaussRand() * noiseStd;
       }
 
-      // Greedy action (epsilon = 0)
-      const savedEps   = _agent.epsilon;
-      _agent.epsilon   = 0;
-      const action     = _agent.selectAction(state);
-      _agent.epsilon   = savedEps;
+      const savedEps = s.agent.epsilon;
+      s.agent.epsilon = 0;
+      const action = s.agent.selectAction(state);
+      s.agent.epsilon = savedEps;
 
-      const { env: next, reward, done } = stepEnv(_inferEnv, action);
-      _inferEpReward += reward;
-      _inferEnv       = next;
+      const { env: next, reward, done } = stepEnv(s.inferEnv, action);
+      s.inferEpReward += reward;
+      s.inferEnv       = next;
 
       let justReset = false;
       if (done) {
-        _inferLapsDone++;
-        _inferEpReward = 0;
-        _inferEnv      = resetEnv();
-        justReset      = true;
+        s.inferLapsDone++;
+        s.inferEpReward = 0;
+        s.inferEnv      = resetEnv();
+        justReset       = true;
       }
 
       return {
         grid: GRID, nBoxes: N_BOXES,
-        robot:    _inferEnv.robot,
-        boxes:    _inferEnv.boxes,
-        targets:  _inferEnv.targets,
-        onTarget: _inferEnv.onTarget,
-        epReward: +_inferEpReward.toFixed(2),
-        episodesDone: _inferLapsDone,
+        robot:    s.inferEnv.robot,
+        boxes:    s.inferEnv.boxes,
+        targets:  s.inferEnv.targets,
+        onTarget: s.inferEnv.onTarget,
+        epReward: +s.inferEpReward.toFixed(2),
+        episodesDone: s.inferLapsDone,
         justReset,
       };
     },

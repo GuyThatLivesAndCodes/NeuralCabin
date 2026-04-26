@@ -169,6 +169,9 @@
     let _initialized = false;
     let _cachedTrack = null;
 
+    const instanceId = (network && network.id) || 'car-default';
+    const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
+
     const t          = (network && network.training) || {};
     const cfgSeed    = (t.seed    || 42) >>> 0;
     const cfgPopSize = (t.batchSize | 0) || 20;
@@ -290,7 +293,7 @@
       const ticks = parseInt(document.getElementById('car-speed').value) || 2;
       const live  = readLiveSettings();
       try {
-        const s = await nb.invoke('self-driving-car:step', { ticks, ...live });
+        const s = await inv('self-driving-car:step', { ticks, ...live });
         if (s) { drawState(s); updateStats(s); }
       } catch (_) {}
       _raf = requestAnimationFrame(tick);
@@ -298,13 +301,13 @@
 
     async function startSim() {
       if (!_initialized) {
-        const r = await nb.invoke('self-driving-car:init', {
+        const r = await inv('self-driving-car:init', {
           seed: cfgSeed, popSize: cfgPopSize, mutStd: cfgMutStd, generations: cfgGens,
         });
         if (r && r.error) { console.error('[self-driving-car]', r.error); return; }
         _initialized = true;
       } else {
-        await nb.invoke('self-driving-car:start');
+        await inv('self-driving-car:start');
       }
       if (_running) return;
       _running = true;
@@ -313,13 +316,13 @@
 
     function pauseSim() {
       _running = false;
-      nb.invoke('self-driving-car:stop');
+      inv('self-driving-car:stop');
       if (_raf) { cancelAnimationFrame(_raf); _raf = null; }
     }
 
     async function resetSim() {
       pauseSim();
-      await nb.invoke('self-driving-car:reset');
+      await inv('self-driving-car:reset');
       _initialized = true;
       _cachedTrack = null;
       ctx.clearRect(0, 0, CW, CH);
@@ -337,14 +340,14 @@
     async function newTrack() {
       const wasPaused = !_running;
       pauseSim();
-      await nb.invoke('self-driving-car:newTrack', null);
+      await inv('self-driving-car:newTrack');
       if (!_initialized) _initialized = true;
       if (!wasPaused) {
-        await nb.invoke('self-driving-car:start');
+        await inv('self-driving-car:start');
         _running = true;
         _raf = requestAnimationFrame(tick);
       } else {
-        const s = await nb.invoke('self-driving-car:getState');
+        const s = await inv('self-driving-car:getState');
         if (s) { drawState(s); updateStats(s); }
       }
     }
@@ -359,7 +362,7 @@
       document.getElementById('car-speed-val').textContent = slider.value;
     });
 
-    nb.invoke('self-driving-car:getState').then(s => {
+    inv('self-driving-car:getState').then(s => {
       if (s) { _initialized = true; drawState(s); updateStats(s); }
       else {
         ctx.fillStyle = COL.bg;
@@ -378,6 +381,9 @@
     let _ready       = false;
     let _cachedTrack = null;
     let _noiseStd    = 0;
+
+    const instanceId = (network && network.id) || 'car-default';
+    const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
 
     root.innerHTML = `
       <div class="panel" style="max-width:960px;">
@@ -475,7 +481,7 @@
     async function tick() {
       if (!_running || !canvas.isConnected) return;
       try {
-        const s = await nb.invoke('self-driving-car:inferStep', _noiseStd);
+        const s = await inv('self-driving-car:inferStep', { noiseStd: _noiseStd });
         if (s) { drawInferState(s); updateInferStats(s); }
       } catch (_) {}
       _raf = requestAnimationFrame(tick);
@@ -483,7 +489,7 @@
 
     async function startInfer() {
       if (!_ready) {
-        const r = await nb.invoke('self-driving-car:inferInit');
+        const r = await inv('self-driving-car:inferInit');
         if (!r || r.error) {
           showPlaceholder(r ? r.error : 'No trained model — run the Train tab first.');
           return;
@@ -509,7 +515,7 @@
       _ready = false;
       document.getElementById('car-i-laps').textContent = '0';
       document.getElementById('car-i-spd').textContent  = '0';
-      const r = await nb.invoke('self-driving-car:inferInit');
+      const r = await inv('self-driving-car:inferInit');
       if (!r || r.error) {
         showPlaceholder(r ? r.error : 'No trained model — run the Train tab first.');
         return;

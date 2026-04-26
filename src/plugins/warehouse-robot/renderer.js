@@ -117,7 +117,7 @@
     trainingData: {},
   });
 
-  // ── Train settings — relabel standard training fields ─────────────────────
+  // ── Train settings ────────────────────────────────────────────────────────
   api.registerTrainSettings('warehouse-robot', {
     lr:        { label: 'Learning rate',   hint: 'DQN optimizer learning rate (default 0.001)' },
     bs:        { label: 'Replay batch',    hint: 'Experiences sampled per training step (default 64)' },
@@ -128,7 +128,7 @@
     sectionHint: 'DQN agent settings — applied when the simulation starts.',
   });
 
-  // ── Train editor (training data section) ──────────────────────────────────
+  // ── Train editor ──────────────────────────────────────────────────────────
   api.registerTrainEditor('warehouse-robot', function (root) {
     root.innerHTML = `
       <div style="display:grid;gap:10px;">
@@ -137,7 +137,7 @@
           <div style="font-size:12px;color:#aaa;line-height:1.6;">
             A Deep Q-Network generates its own experience by interacting with the 8×8 grid.
             The agent starts exploring randomly (ε = 1.0) and shifts to a learned policy as
-            epsilon decays to 0.05 over ~13 000 steps.
+            epsilon decays to 0.05.
             Configure learning rate and replay batch in the <strong style="color:#ccc;">Training settings</strong> above.
           </div>
         </div>
@@ -152,11 +152,15 @@
     `;
   });
 
-  // ── Train renderer — full DQN training simulation ─────────────────────────
+  // ── Train renderer ────────────────────────────────────────────────────────
   api.registerTrainRenderer('warehouse-robot', function (root, network, nb) {
     let _raf         = null;
     let _running     = false;
     let _initialized = false;
+
+    // Each network instance gets its own isolated session in main.js
+    const instanceId = (network && network.id) || 'wh-default';
+    const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
 
     const t       = (network && network.training) || {};
     const cfgLR   = t.learningRate || 0.001;
@@ -168,7 +172,7 @@
         <h2>Warehouse Robot — Q-Learning</h2>
         <p style="font-size:12px;color:#777;margin:-4px 0 16px;">
           DQN agent explores an 8×8 grid and learns to push all 3 boxes onto target rings.
-          LR: ${cfgLR} · Batch: ${cfgBS} · Epsilon decays 1.0 → 0.05 over ~13 000 steps.
+          LR: ${cfgLR} · Batch: ${cfgBS} · Epsilon decays 1.0 → 0.05.
         </p>
 
         <div style="display:grid;grid-template-columns:${CW}px 1fr;gap:20px;align-items:start;">
@@ -183,8 +187,8 @@
             </div>
             <div style="margin-top:8px;display:flex;align-items:center;gap:8px;font-size:12px;color:#666;">
               Steps / frame:
-              <input id="wh-speed" type="range" min="1" max="50" value="10" style="width:80px;">
-              <span id="wh-speed-val">10</span>
+              <input id="wh-speed" type="range" min="1" max="20" value="5" style="width:80px;">
+              <span id="wh-speed-val">5</span>
             </div>
           </div>
 
@@ -227,19 +231,19 @@
     const ctx    = canvas.getContext('2d');
 
     function updateStats(s) {
-      document.getElementById('wh-ep').textContent   = s.episode;
-      document.getElementById('wh-eps').textContent  = s.epsilon.toFixed(4);
-      document.getElementById('wh-rew').textContent  = s.epReward.toFixed(2);
-      document.getElementById('wh-best').textContent = s.bestReward == null ? '—' : s.bestReward.toFixed(2);
+      document.getElementById('wh-ep').textContent    = s.episode;
+      document.getElementById('wh-eps').textContent   = s.epsilon.toFixed(4);
+      document.getElementById('wh-rew').textContent   = s.epReward.toFixed(2);
+      document.getElementById('wh-best').textContent  = s.bestReward == null ? '—' : s.bestReward.toFixed(2);
       document.getElementById('wh-ontgt').textContent = `${s.onTarget} / 3`;
       drawRewardChart(document.getElementById('wh-chart'), s.rewardHistory);
     }
 
     async function tick() {
       if (!_running || !canvas.isConnected) return;
-      const n = parseInt(document.getElementById('wh-speed').value) || 10;
+      const n = parseInt(document.getElementById('wh-speed').value) || 5;
       try {
-        const s = await nb.invoke('warehouse-robot:step', n);
+        const s = await inv('warehouse-robot:step', { n });
         if (s) { drawGridState(ctx, s, COL.robot, COL.robotHi); updateStats(s); }
       } catch (_) {}
       _raf = requestAnimationFrame(tick);
@@ -247,11 +251,11 @@
 
     async function startSim() {
       if (!_initialized) {
-        const r = await nb.invoke('warehouse-robot:init', { lr: cfgLR, batchSize: cfgBS, seed: cfgSeed });
+        const r = await inv('warehouse-robot:init', { lr: cfgLR, batchSize: cfgBS, seed: cfgSeed });
         if (r && r.error) { console.error('[warehouse-robot]', r.error); return; }
         _initialized = true;
       } else {
-        await nb.invoke('warehouse-robot:start');
+        await inv('warehouse-robot:start');
       }
       if (_running) return;
       _running = true;
@@ -260,13 +264,13 @@
 
     function pauseSim() {
       _running = false;
-      nb.invoke('warehouse-robot:stop');
+      inv('warehouse-robot:stop');
       if (_raf) { cancelAnimationFrame(_raf); _raf = null; }
     }
 
     async function resetSim() {
       pauseSim();
-      await nb.invoke('warehouse-robot:reset');
+      await inv('warehouse-robot:reset');
       _initialized = true;
       drawGridState(ctx, null, COL.robot, COL.robotHi);
       ['wh-ep', 'wh-eps', 'wh-rew', 'wh-best'].forEach(id => {
@@ -291,18 +295,21 @@
       document.getElementById('wh-speed-val').textContent = slider.value;
     });
 
-    nb.invoke('warehouse-robot:getState').then(s => {
+    inv('warehouse-robot:getState').then(s => {
       if (s) { _initialized = true; drawGridState(ctx, s, COL.robot, COL.robotHi); updateStats(s); }
       else    { drawGridState(ctx, null, COL.robot, COL.robotHi); }
     }).catch(() => drawGridState(ctx, null, COL.robot, COL.robotHi));
   });
 
-  // ── Inference renderer — greedy policy + noise slider ────────────────────
+  // ── Inference renderer ────────────────────────────────────────────────────
   api.registerInferenceRenderer('warehouse-robot', function (root, network, nb) {
     let _raf      = null;
     let _running  = false;
     let _ready    = false;
     let _noiseStd = 0;
+
+    const instanceId = (network && network.id) || 'wh-default';
+    const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
 
     root.innerHTML = `
       <div class="panel" style="max-width:860px;">
@@ -346,7 +353,7 @@
                 <span id="wh-i-noise-val" style="min-width:36px;text-align:right;color:#4caf50;">0.00</span>
               </div>
               <div style="font-size:11px;color:#555;margin-top:4px;">
-                Gaussian noise std added to all 14 state dimensions. Drag right to stress-test.
+                Gaussian noise std added to all 14 state dimensions.
               </div>
             </div>
 
@@ -386,7 +393,7 @@
     async function tick() {
       if (!_running || !canvas.isConnected) return;
       try {
-        const s = await nb.invoke('warehouse-robot:inferStep', _noiseStd);
+        const s = await inv('warehouse-robot:inferStep', { noiseStd: _noiseStd });
         if (s) { drawGridState(ctx, s, COL.robotInfer, COL.robotInfHi); updateInferStats(s); }
       } catch (_) {}
       _raf = requestAnimationFrame(tick);
@@ -394,7 +401,7 @@
 
     async function startInfer() {
       if (!_ready) {
-        const r = await nb.invoke('warehouse-robot:inferInit');
+        const r = await inv('warehouse-robot:inferInit');
         if (!r || r.error) {
           showPlaceholder(r ? r.error : 'No trained agent — run the Train tab first.');
           return;
@@ -417,9 +424,9 @@
       const wasRunning = _running;
       pauseInfer();
       _ready = false;
-      document.getElementById('wh-i-rew').textContent  = '0.00';
+      document.getElementById('wh-i-rew').textContent   = '0.00';
       document.getElementById('wh-i-ontgt').textContent = '0 / 3';
-      const r = await nb.invoke('warehouse-robot:inferInit');
+      const r = await inv('warehouse-robot:inferInit');
       if (!r || r.error) {
         showPlaceholder(r ? r.error : 'No trained agent — run the Train tab first.');
         return;

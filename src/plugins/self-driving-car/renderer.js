@@ -275,11 +275,22 @@
       drawFitnessChart(document.getElementById('car-chart'), s.genHistory);
     }
 
+    function readLiveSettings() {
+      const lrEl = document.getElementById('t-lr');
+      const bsEl = document.getElementById('t-bs');
+      const epEl = document.getElementById('t-ep');
+      const mutStd  = lrEl ? Math.max(0,   parseFloat(lrEl.value) || cfgMutStd)  : cfgMutStd;
+      const popSize = bsEl ? Math.max(4,   parseInt(bsEl.value)   || cfgPopSize) : cfgPopSize;
+      const maxGens = epEl ? Math.max(0,   parseInt(epEl.value)   || 0)          : cfgGens;
+      return { mutStd, popSize, maxGens };
+    }
+
     async function tick() {
       if (!_running || !canvas.isConnected) return;
       const ticks = parseInt(document.getElementById('car-speed').value) || 2;
+      const live  = readLiveSettings();
       try {
-        const s = await nb.invoke('self-driving-car:step', ticks);
+        const s = await nb.invoke('self-driving-car:step', { ticks, ...live });
         if (s) { drawState(s); updateStats(s); }
       } catch (_) {}
       _raf = requestAnimationFrame(tick);

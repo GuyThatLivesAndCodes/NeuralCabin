@@ -4,10 +4,11 @@ const path = require('path');
 const { app } = require('electron');
 
 // Load neuroevolution + tensor from the app bundle.
-let Population, T;
+let Population, T, buildFromSpec;
 try {
   ({ Population } = require(path.join(app.getAppPath(), 'src', 'engine', 'neuroevolution')));
   T = require(path.join(app.getAppPath(), 'src', 'engine', 'tensor'));
+  ({ buildFromSpec } = require(path.join(app.getAppPath(), 'src', 'engine', 'model')));
 } catch (e) {
   console.error('[self-driving-car] Failed to load engines:', e.message);
 }
@@ -217,9 +218,11 @@ function gaussRand() {
 
 // ── Population step ───────────────────────────────────────────────────────────
 
-function stepGeneration(ticks) {
+// opts: { ticks, mutStd, popSize, maxGens } — live settings applied at generation boundary
+function stepGeneration(opts) {
   if (!_pop || !_track || !_running) return null;
-  ticks = Math.max(1, Math.min(ticks | 0, 6));
+  const ticks = Math.max(1, Math.min((typeof opts === 'number' ? opts : (opts.ticks || 2)) | 0, 6));
+  const liveSettings = typeof opts === 'object' ? opts : {};
 
   for (let t = 0; t < ticks; t++) {
     let allDead = true;
@@ -244,6 +247,10 @@ function stepGeneration(ticks) {
     }
 
     if (allDead) {
+      // Apply live settings before evolve so mutStd takes effect this generation
+      if (liveSettings.mutStd  != null) _pop.mutationStd = Math.max(0, liveSettings.mutStd);
+      if (liveSettings.maxGens != null) _maxGens = Math.max(0, liveSettings.maxGens | 0);
+
       _pop.evaluate((_, idx) => _carFit[idx]);
       const stats = _pop.evolve();
       _generation++;
@@ -253,6 +260,24 @@ function stepGeneration(ticks) {
       _genBestFit = stats.max;
 
       if (_maxGens > 0 && _generation >= _maxGens) _running = false;
+
+      // Apply population size change after evolve
+      const newSize = liveSettings.popSize ? Math.max(4, Math.min(100, liveSettings.popSize | 0)) : _popSize;
+      if (newSize !== _popSize) {
+        _popSize        = newSize;
+        _pop.size       = newSize;
+        _pop.eliteCount = Math.max(1, Math.floor(newSize * 0.2));
+        _pop.fitnesses  = new Float32Array(newSize);
+        // Trim excess individuals (post-evolve, elites are first so trim from tail)
+        while (_pop.individuals.length > newSize) _pop.individuals.pop();
+        // Pad with new random explorers if growing
+        if (buildFromSpec) {
+          while (_pop.individuals.length < newSize) {
+            const rng = T.rngFromSeed((Math.random() * 0xFFFFFF) | 0);
+            _pop.individuals.push(buildFromSpec(_pop.arch, rng));
+          }
+        }
+      }
 
       _cars   = Array.from({ length: _popSize }, () => spawnCar(_track));
       _carFit = new Array(_popSize).fill(0);
@@ -319,7 +344,7 @@ module.exports = {
 
     'self-driving-car:getState': () => buildVisualState(),
 
-    'self-driving-car:step': (_, ticks = 2) => stepGeneration(ticks),
+    'self-driving-car:step': (_, opts = 2) => stepGeneration(opts),
 
     'self-driving-car:start': () => { _running = true;  return { ok: true }; },
     'self-driving-car:stop':  () => { _running = false; return { ok: true }; },

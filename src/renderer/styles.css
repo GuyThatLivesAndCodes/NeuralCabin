@@ -400,3 +400,57 @@ button { cursor: pointer; }
 .backup-label { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .backup-meta { font-size: 11px; color: var(--fg-muted); margin-top: 2px; }
 .backup-btns { display: flex; gap: 6px; flex-shrink: 0; }
+
+/* ── GPT Training Modality Selector ──────────────────────────────────────── */
+.modality-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;
+}
+.modality-card {
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; transition: border-color 100ms, background 100ms;
+  background: var(--bg-2);
+}
+.modality-card:hover { border-color: var(--border-strong); }
+.modality-card.active { border-color: var(--fg); background: var(--bg); }
+.mc-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.mc-title { font-weight: 600; font-size: 13px; }
+.mc-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  background: var(--fg-muted); color: var(--bg); opacity: 0.7;
+}
+.modality-card.active .mc-badge { opacity: 1; background: var(--fg); }
+.mc-desc { font-size: 11px; color: var(--fg-muted); line-height: 1.4; }
+
+/* ── SFT Pair Editor ─────────────────────────────────────────────────────── */
+.pair-row {
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  margin-bottom: 8px; background: var(--bg-2);
+}
+.pair-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pair-label {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--fg-muted); margin-bottom: 4px;
+}
+.pair-row textarea {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 56px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.4;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 8px;
+}
+.pair-row textarea:focus { outline: none; border-color: var(--border-strong); }
+.pair-remove { font-size: 11px; color: var(--fg-muted); cursor: pointer; margin-top: 6px; }
+.pair-remove:hover { color: var(--fg); }
+
+/* ── Engine Selector (Train tab) ─────────────────────────────────────────── */
+.engine-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+}
+.engine-card {
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; transition: border-color 100ms, background 100ms;
+  background: var(--bg-2);
+}
+.engine-card:hover { border-color: var(--border-strong); }
+.engine-card.active { border-color: var(--fg); background: var(--bg); }
+.ec-title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.ec-desc { font-size: 11px; color: var(--fg-muted); line-height: 1.4; }

@@ -134,27 +134,13 @@ async function trainNetworkParallel(network, hooks = {}) {
 
   if (arch.kind === 'charLM' || arch.kind === 'gpt') {
     let corpusInput = data;
-    if (arch.kind === 'gpt' && Array.isArray(data.documents)) {
-      const docText = data.documents.map(d => d.content || '').filter(Boolean).join('\n\n---\n\n');
-      const validStems = Array.isArray(data.samples) ? data.samples.filter(s => s.user && s.output) : [];
-      let combined;
-      if (validStems.length > 0) {
-        const chunkSize = Math.max(300, (arch.contextLen || 96) * 3);
-        const chunks = [];
-        for (let i = 0; i < docText.length; i += chunkSize) {
-          const chunk = docText.slice(i, i + chunkSize).trim();
-          if (chunk) chunks.push(chunk);
-        }
-        if (!chunks.length) chunks.push(docText);
-        combined = chunks.map((chunk, i) => {
-          const stem = validStems[i % validStems.length];
-          return `<|user|>${stem.user}<|end|><|assistant|>${stem.output} ${chunk}<|end|>`;
-        }).join('\n');
-        arch.isChat = true;
-      } else {
-        combined = docText;
+    if (arch.kind === 'gpt') {
+      if (data.modality === 'sft' && Array.isArray(data.samples) && data.samples.length > 0) {
+        corpusInput = { samples: data.samples };
+      } else if (Array.isArray(data.documents)) {
+        const docText = data.documents.map(d => d.content || '').filter(Boolean).join('\n\n---\n\n');
+        corpusInput = { text: docText };
       }
-      corpusInput = { text: combined };
     }
     const corpus = ChatFormat.buildCorpus(corpusInput);
     const text = corpus.text;

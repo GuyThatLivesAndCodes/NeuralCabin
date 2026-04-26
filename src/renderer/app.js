@@ -12,7 +12,8 @@ const state = {
   apiLogs: [],
   currentDocId: 'welcome',
   chatSessions: new Map(), // id -> { history, system, busy, editingIndex }
-  gptEditor: { docs: [], stems: [], editingDocIdx: null }
+  gptEditor: { docs: [], modality: 'corpus', pairs: [], editingDocIdx: null },
+  enginePreset: 'js'      // 'js' | 'wasm' | 'webgpu'
 };
 
 function getChatSession(id) {
@@ -206,6 +207,23 @@ function renderNetworksTab(root) {
   }
   const n = state.current;
   const a = n.architecture;
+  // Init GPT editor state BEFORE the template runs so gptEditorHtml() reads
+  // the correct modality/docs/pairs from the saved network.
+  if (a.kind === 'gpt' && !a.pluginKind) {
+    const td = n.trainingData || {};
+    const hasSamples = Array.isArray(td.samples) && td.samples.length > 0;
+    const inferredModality = td.modality
+      || (hasSamples && !Array.isArray(td.documents) ? 'sft' : 'corpus');
+    state.gptEditor = {
+      docs: Array.isArray(td.documents) ? td.documents.map(d => ({ ...d })) : [],
+      modality: inferredModality,
+      pairs: hasSamples
+        ? td.samples.map(s => ({ user: s.user || '', assistant: s.assistant || s.output || '' }))
+        : [],
+      editingDocIdx: null
+    };
+  }
+
   root.innerHTML = `
     <div class="panel">
       <h2>Editor — ${escapeHtml(n.name)}</h2>
@@ -296,13 +314,6 @@ function renderNetworksTab(root) {
     const nb = { invoke: (ch, ...args) => window.nb.plugins.invoke(pluginId, ch, ...args) };
     fn(document.getElementById('plugin-train-editor'), n, nb);
   } else if (a.kind === 'gpt') {
-    // init gpt editor state from saved trainingData
-    const td = n.trainingData || {};
-    state.gptEditor = {
-      docs: Array.isArray(td.documents) ? td.documents.map(d => ({ ...d })) : [],
-      stems: Array.isArray(td.samples) ? td.samples.map(s => ({ ...s })) : [],
-      editingDocIdx: null
-    };
     bindGptEditor();
   } else {
     // populate training data textarea
@@ -380,9 +391,13 @@ function updateDataStats() {
   if (!tag) return;
   if (state.current?.architecture?.kind === 'gpt') {
     const ed = state.gptEditor;
-    const chars = ed.docs.reduce((s, d) => s + (d.content?.length || 0), 0);
-    const stems = ed.stems.filter(s => s.user && s.output).length;
-    tag.textContent = `${ed.docs.length} doc${ed.docs.length !== 1 ? 's' : ''} · ${chars.toLocaleString()} chars · ${stems} stem${stems !== 1 ? 's' : ''}`;
+    if (ed.modality === 'sft') {
+      const complete = ed.pairs.filter(p => p.user && p.assistant).length;
+      tag.textContent = `${ed.pairs.length} pair${ed.pairs.length !== 1 ? 's' : ''} · ${complete} complete`;
+    } else {
+      const chars = ed.docs.reduce((s, d) => s + (d.content?.length || 0), 0);
+      tag.textContent = `${ed.docs.length} doc${ed.docs.length !== 1 ? 's' : ''} · ${chars.toLocaleString()} chars`;
+    }
     return;
   }
   const area = $('#data-json');
@@ -505,15 +520,26 @@ function formatBytes(n) {
 }
 
 function gptEditorHtml() {
+  const ed = state.gptEditor;
+  const isCorpus = ed.modality !== 'sft';
   return `
-    <p class="hint">Upload documents (md, txt, etc.) as knowledge for this model. Content is stored internally — only names are shown.</p>
-    <div id="gpt-doc-list" style="margin-bottom:8px;"></div>
-    <button class="btn sm" id="btn-add-docs">+ Add documents</button>
-    <h4 style="margin:16px 0 6px;font-size:13px;color:#ccc;">Training stems</h4>
-    <p class="hint">Stems guide how the model begins its responses. Each stem's output is a response prefix — the model starts with it and continues using its document knowledge.</p>
-    <div id="gpt-stem-list" style="margin-bottom:8px;"></div>
-    <div class="row" style="margin-top:4px;">
-      <button class="btn sm" id="btn-add-stem">+ Add stem</button>
+    <div class="modality-grid" id="gpt-modality-grid">
+      <div class="modality-card${isCorpus ? ' active' : ''}" data-mode="corpus">
+        <div class="mc-header">
+          <span class="mc-title">Corpus Training</span>
+        </div>
+        <div class="mc-desc">Upload documents and train directly on the raw text. Good for building general knowledge and writing style.</div>
+      </div>
+      <div class="modality-card${!isCorpus ? ' active' : ''}" data-mode="sft">
+        <div class="mc-header">
+          <span class="mc-title">Instruction Fine-Tuning</span>
+          <span class="badge">SFT</span>
+        </div>
+        <div class="mc-desc">Train on structured User → AI pairs. Teaches proper conversation boundaries and reliable stop-token generation.</div>
+      </div>
+    </div>
+    <div id="gpt-mode-content"></div>
+    <div class="row" style="margin-top:8px;">
       <div class="spacer"></div>
       <span class="inline-tag" id="data-stats"></span>
     </div>
@@ -577,52 +603,107 @@ function bindGptDocEvents() {
   }));
 }
 
-function renderGptStemList() {
-  const list = $('#gpt-stem-list');
+// Renders either the corpus doc list or the SFT pair editor into #gpt-mode-content.
+function renderGptModeContent() {
+  const root = $('#gpt-mode-content');
+  if (!root) return;
+  const ed = state.gptEditor;
+
+  if (ed.modality !== 'sft') {
+    root.innerHTML = `
+      <p class="hint" style="margin:10px 0 8px;">Upload documents (md, txt, etc.) as the training corpus. The model learns from the raw text of each file.</p>
+      <div id="gpt-doc-list" style="margin-bottom:8px;"></div>
+      <button class="btn sm" id="btn-add-docs">+ Add documents</button>
+    `;
+    renderGptDocList();
+    $('#btn-add-docs').addEventListener('click', async () => {
+      const docs = await window.nb.gpt.pickDocuments();
+      if (!docs.length) return;
+      for (const d of docs) {
+        const idx = ed.docs.findIndex(x => x.name === d.name);
+        if (idx >= 0) ed.docs[idx] = d; else ed.docs.push(d);
+      }
+      renderGptDocList(); updateDataStats();
+    });
+  } else {
+    root.innerHTML = `
+      <p class="hint" style="margin:10px 0 8px;">Add User → AI pairs. Each pair is wrapped in role tags during training so the model learns to respond and generate proper stop tokens.</p>
+      <div id="gpt-pair-list" style="margin-bottom:8px;"></div>
+      <div class="row">
+        <button class="btn sm" id="btn-add-pair">+ Add pair</button>
+        <button class="btn sm ghost" id="btn-import-pairs">Import JSONL</button>
+      </div>
+    `;
+    renderGptPairList();
+    $('#btn-add-pair').addEventListener('click', () => {
+      ed.pairs.push({ user: '', assistant: '' });
+      renderGptPairList(); updateDataStats();
+    });
+    $('#btn-import-pairs').addEventListener('click', async () => {
+      const res = await window.nb.dialog.readTextFile({
+        filters: [{ name: 'JSONL / JSON', extensions: ['jsonl', 'json'] }]
+      });
+      if (!res) return;
+      try {
+        const lines = res.content.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const valid = lines.filter(l => typeof l.user === 'string' || typeof l.input === 'string');
+        if (!valid.length) throw new Error('No valid pairs found. Expected { "user": "...", "assistant": "..." } per line.');
+        for (const l of valid) {
+          ed.pairs.push({ user: l.user || l.input || '', assistant: l.assistant || l.output || '' });
+        }
+        renderGptPairList(); updateDataStats();
+        toast(`Imported ${valid.length} pair${valid.length !== 1 ? 's' : ''}.`);
+      } catch (e) { toast('Import failed: ' + e.message); }
+    });
+  }
+}
+
+function renderGptPairList() {
+  const list = $('#gpt-pair-list');
   if (!list) return;
   const ed = state.gptEditor;
-  if (!ed.stems.length) {
-    list.innerHTML = '<div class="hint" style="padding:4px 0;">No stems yet. Add user → output pairs to teach response behavior.</div>';
+  if (!ed.pairs.length) {
+    list.innerHTML = '<div class="hint" style="padding:4px 0;">No pairs yet. Click "+ Add pair" or import a JSONL file.</div>';
     return;
   }
-  list.innerHTML = ed.stems.map((s, i) => `
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-      <input class="gpt-stem-user" data-idx="${i}" type="text" placeholder="User…" value="${escapeHtml(s.user || '')}" style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:5px 8px;color:#e0e0e0;font-size:13px;">
-      <span style="color:#555;">→</span>
-      <input class="gpt-stem-output" data-idx="${i}" type="text" placeholder="Response prefix…" value="${escapeHtml(s.output || '')}" style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:5px 8px;color:#e0e0e0;font-size:13px;">
-      <button class="btn sm danger gpt-stem-remove" data-idx="${i}">✕</button>
+  list.innerHTML = ed.pairs.map((p, i) => `
+    <div class="pair-row" data-idx="${i}">
+      <div class="pair-col">
+        <div class="pair-label">User</div>
+        <textarea class="gpt-pair-user" data-idx="${i}" rows="3" placeholder="User message…">${escapeHtml(p.user || '')}</textarea>
+      </div>
+      <div class="pair-col">
+        <div class="pair-label">Assistant</div>
+        <textarea class="gpt-pair-assistant" data-idx="${i}" rows="3" placeholder="AI response…">${escapeHtml(p.assistant || '')}</textarea>
+      </div>
+      <button class="btn sm danger gpt-pair-remove" data-idx="${i}" style="align-self:flex-start;margin-top:18px;">✕</button>
     </div>
   `).join('');
-  list.querySelectorAll('.gpt-stem-user').forEach(inp => inp.addEventListener('input', () => {
-    state.gptEditor.stems[parseInt(inp.dataset.idx)].user = inp.value; updateDataStats();
+  list.querySelectorAll('.gpt-pair-user').forEach(t => t.addEventListener('input', () => {
+    ed.pairs[parseInt(t.dataset.idx)].user = t.value; updateDataStats();
   }));
-  list.querySelectorAll('.gpt-stem-output').forEach(inp => inp.addEventListener('input', () => {
-    state.gptEditor.stems[parseInt(inp.dataset.idx)].output = inp.value; updateDataStats();
+  list.querySelectorAll('.gpt-pair-assistant').forEach(t => t.addEventListener('input', () => {
+    ed.pairs[parseInt(t.dataset.idx)].assistant = t.value; updateDataStats();
   }));
-  list.querySelectorAll('.gpt-stem-remove').forEach(b => b.addEventListener('click', () => {
-    state.gptEditor.stems.splice(parseInt(b.dataset.idx), 1);
-    renderGptStemList(); updateDataStats();
+  list.querySelectorAll('.gpt-pair-remove').forEach(b => b.addEventListener('click', () => {
+    ed.pairs.splice(parseInt(b.dataset.idx), 1);
+    renderGptPairList(); updateDataStats();
   }));
 }
 
 function bindGptEditor() {
-  renderGptDocList();
-  renderGptStemList();
+  // Bind modality card clicks — switch between Corpus and SFT modes.
+  $('#gpt-modality-grid')?.querySelectorAll('.modality-card').forEach(card => {
+    card.addEventListener('click', () => {
+      state.gptEditor.modality = card.dataset.mode;
+      $('#gpt-modality-grid').querySelectorAll('.modality-card')
+        .forEach(c => c.classList.toggle('active', c === card));
+      renderGptModeContent();
+      updateDataStats();
+    });
+  });
+  renderGptModeContent();
   updateDataStats();
-  $('#btn-add-docs').addEventListener('click', async () => {
-    const docs = await window.nb.gpt.pickDocuments();
-    if (!docs.length) return;
-    for (const d of docs) {
-      const idx = state.gptEditor.docs.findIndex(x => x.name === d.name);
-      if (idx >= 0) state.gptEditor.docs[idx] = d;
-      else state.gptEditor.docs.push(d);
-    }
-    renderGptDocList(); updateDataStats();
-  });
-  $('#btn-add-stem').addEventListener('click', () => {
-    state.gptEditor.stems.push({ user: '', output: '' });
-    renderGptStemList(); updateDataStats();
-  });
 }
 
 function dataFormatHint(arch) {
@@ -712,7 +793,10 @@ async function saveEditor() {
   if (a.pluginKind && pluginRegistry.trainEditors[a.pluginKind]) {
     // Plugin manages its own trainingData — don't overwrite on save
   } else if (a.kind === 'gpt') {
-    patch.trainingData = { documents: state.gptEditor.docs, samples: state.gptEditor.stems };
+    const ed = state.gptEditor;
+    patch.trainingData = ed.modality === 'sft'
+      ? { modality: 'sft', samples: ed.pairs }
+      : { modality: 'corpus', documents: ed.docs };
   } else {
     let data;
     try { data = JSON.parse($('#data-json').value); }
@@ -783,6 +867,25 @@ function renderTrainTab(root) {
         <h3>Log</h3>
         <div class="log" id="log"></div>
       </div>
+
+      <div class="section">
+        <h3>Engine</h3>
+        <p class="hint" style="margin-bottom:10px;">Select the compute backend for this training run. JS is always available; WASM and WebGPU require native module support.</p>
+        <div class="engine-grid" id="engine-grid">
+          <div class="engine-card${state.enginePreset === 'js' ? ' active' : ''}" data-engine="js">
+            <div class="ec-title">JS</div>
+            <div class="ec-desc">Pure JavaScript. Runs everywhere, no setup required.</div>
+          </div>
+          <div class="engine-card${state.enginePreset === 'wasm' ? ' active' : ''}" data-engine="wasm">
+            <div class="ec-title">WASM</div>
+            <div class="ec-desc">WebAssembly / Rust native module. Faster matrix ops on supported platforms.</div>
+          </div>
+          <div class="engine-card${state.enginePreset === 'webgpu' ? ' active' : ''}" data-engine="webgpu">
+            <div class="ec-title">WebGPU</div>
+            <div class="ec-desc">GPU-accelerated compute. Requires a WebGPU-capable renderer process.</div>
+          </div>
+        </div>
+      </div>
     </div>
   `;
 
@@ -811,6 +914,13 @@ function renderTrainTab(root) {
   $('#btn-stop').addEventListener('click', async () => {
     await window.nb.training.stop(n.id);
   });
+  $('#engine-grid')?.querySelectorAll('.engine-card').forEach(card => {
+    card.addEventListener('click', () => {
+      state.enginePreset = card.dataset.engine;
+      $('#engine-grid').querySelectorAll('.engine-card')
+        .forEach(c => c.classList.toggle('active', c === card));
+    });
+  });
   updateTrainLive();
 }
 
@@ -823,7 +933,7 @@ async function startTraining(opts) {
   state.training.startedAt = Date.now();
   updateTrainLive();
   try {
-    await window.nb.training.start(state.current.id, { fromScratch: !!opts.fromScratch });
+    await window.nb.training.start(state.current.id, { fromScratch: !!opts.fromScratch, engine: state.enginePreset });
     const trainBtn = $('#btn-train'); if (trainBtn) trainBtn.disabled = true;
     const scratchBtn = $('#btn-train-scratch'); if (scratchBtn) scratchBtn.disabled = true;
     const stopBtn = $('#btn-stop'); if (stopBtn) stopBtn.disabled = false;

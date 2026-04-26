@@ -26,7 +26,7 @@
     arch: {
       kind: 'classifier', pluginKind: 'self-driving-car',
       inputDim: 7, outputDim: 2,
-      hidden: [16, 12], activation: 'tanh', dropout: 0,
+      hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
     },
     training: { optimizer: 'adam', learningRate: 0.001, batchSize: 32, epochs: 0, seed: 42, workers: 0 },
     trainingData: {},
@@ -45,7 +45,7 @@
           </div>
         </div>
         <div style="font-size:12px;color:#666;background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px 12px;line-height:1.6;">
-          Architecture: <strong style="color:#aaa;">7 → [16, 12] → 2</strong><br>
+          Architecture: <strong style="color:#aaa;">7 → [64, 32, 16] → 2</strong><br>
           Inputs: 5 sensor raycasts + normalised speed + orientation<br>
           Outputs: steer (tanh) · throttle (sigmoid)<br><br>
           Open the <strong style="color:#ccc;">Infer</strong> tab to launch the live simulation.

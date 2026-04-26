@@ -36,7 +36,9 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const pluginRegistry = {
   templates: [],
   inferenceRenderers: {}, // pluginKind → { fn(root, net, nb), pluginId }
-  trainEditors: {}        // pluginKind → { fn(root, net, nb), pluginId }
+  trainRenderers:     {}, // pluginKind → { fn(root, net, nb), pluginId }  — takes over the Train tab
+  trainEditors:       {}, // pluginKind → { fn(root, net, nb), pluginId }  — Edit tab data section
+  trainSettings:      {}, // pluginKind → field-label/visibility overrides for the training defaults section
 };
 
 async function initPlugins() {
@@ -46,10 +48,14 @@ async function initPlugins() {
   for (const p of plugins) {
     if (!p.rendererCode) continue;
     const api = {
-      registerTemplate:         t    => pluginRegistry.templates.push(t),
-      registerInferenceRenderer:(kind, fn) => { pluginRegistry.inferenceRenderers[kind] = { fn, pluginId: p.id }; },
-      registerTrainEditor:      (kind, fn) => { pluginRegistry.trainEditors[kind]       = { fn, pluginId: p.id }; },
-      invoke:                   (ch, ...a) => window.nb.plugins.invoke(p.id, ch, ...a)
+      registerTemplate:         t       => pluginRegistry.templates.push(t),
+      registerInferenceRenderer:(kind, fn)  => { pluginRegistry.inferenceRenderers[kind] = { fn, pluginId: p.id }; },
+      registerTrainRenderer:    (kind, fn)  => { pluginRegistry.trainRenderers[kind]     = { fn, pluginId: p.id }; },
+      registerTrainEditor:      (kind, fn)  => { pluginRegistry.trainEditors[kind]       = { fn, pluginId: p.id }; },
+      // cfg: { lr, bs, epochs, seed, workers, optimizer } each { label?, hint?, hidden? }
+      // plus optional cfg.sectionHint to replace the bottom Workers hint text
+      registerTrainSettings:    (kind, cfg) => { pluginRegistry.trainSettings[kind] = cfg; },
+      invoke:                   (ch, ...a)  => window.nb.plugins.invoke(p.id, ch, ...a)
     };
     try {
       // eslint-disable-next-line no-new-func
@@ -199,6 +205,35 @@ function renderActiveTab() {
   }
 }
 
+// Apply plugin-defined label/visibility overrides to the Training defaults fields.
+// cfg keys: lr | bs | epochs | seed | workers | optimizer — each { label?, hint?, hidden? }
+// cfg.sectionHint replaces the bottom Workers hint paragraph.
+function applyPluginTrainSettings(cfg) {
+  const fieldMap = { optimizer: 't-optimizer', lr: 't-lr', bs: 't-bs', epochs: 't-ep', seed: 't-seed', workers: 't-workers' };
+  for (const [key, settings] of Object.entries(cfg)) {
+    if (key === 'sectionHint') continue;
+    const inputId = fieldMap[key];
+    if (!inputId) continue;
+    const inputEl = document.getElementById(inputId);
+    if (!inputEl) continue;
+    const fieldEl = inputEl.closest('.field');
+    if (!fieldEl) continue;
+    if (settings.hidden) {
+      fieldEl.style.display = 'none';
+    } else {
+      if (settings.label) {
+        const spanEl = fieldEl.querySelector('span');
+        if (spanEl) spanEl.textContent = settings.label;
+      }
+      if (settings.hint) inputEl.title = settings.hint;
+    }
+  }
+  if (cfg.sectionHint !== undefined) {
+    const hintEl = document.getElementById('t-training-hint');
+    if (hintEl) hintEl.textContent = cfg.sectionHint;
+  }
+}
+
 // Networks / editor tab
 function renderNetworksTab(root) {
   if (!state.current) {
@@ -268,7 +303,7 @@ function renderNetworksTab(root) {
           <label class="field"><span>Seed</span><input id="t-seed" type="number" value="${n.training.seed ?? 42}"></label>
           <label class="field"><span>Workers (parallelism)</span><input id="t-workers" type="number" min="1" value="${n.training.workers ?? 0}"></label>
         </div>
-        <div class="hint" style="margin-top:6px;">
+        <div id="t-training-hint" class="hint" style="margin-top:6px;">
           <b>Workers</b> = number of CPU cores to use in parallel. <code>0</code> or <code>1</code> = single-threaded (legacy). Set to your core count for ${(n.architecture.kind === 'charLM' || n.architecture.kind === 'gpt') ? 'large models' : 'larger models'} — effective batch becomes <code>workers × batch size</code>, gradients are averaged across workers per step.
         </div>
       </div>
@@ -308,6 +343,11 @@ function renderNetworksTab(root) {
       </div>
     </div>
   `;
+
+  // Apply plugin-specific labels/visibility to the training defaults fields.
+  if (a.pluginKind && pluginRegistry.trainSettings[a.pluginKind]) {
+    applyPluginTrainSettings(pluginRegistry.trainSettings[a.pluginKind]);
+  }
 
   if (a.pluginKind && pluginRegistry.trainEditors[a.pluginKind]) {
     const { fn, pluginId } = pluginRegistry.trainEditors[a.pluginKind];
@@ -832,20 +872,12 @@ function renderTrainTab(root) {
     return;
   }
   const n = state.current;
-  // Plugin-managed networks handle training inside their own simulation (Infer tab).
-  if (n.architecture?.pluginKind && pluginRegistry.inferenceRenderers[n.architecture.pluginKind]) {
-    root.innerHTML = `
-      <div class="panel">
-        <h2>Plugin network — ${escapeHtml(n.name)}</h2>
-        <div style="background:#1a1a0d;border:1px solid #3a3a1a;border-radius:6px;padding:14px 18px;max-width:520px;">
-          <div style="font-weight:600;margin-bottom:6px;color:#ffd600;">Training runs inside the simulation</div>
-          <div style="font-size:12px;color:#aaa;line-height:1.6;">
-            This network is managed by the <strong style="color:#ccc;">${escapeHtml(n.architecture.pluginKind)}</strong> plugin,
-            which trains through environment interaction rather than labelled data.
-            Switch to the <strong style="color:#ccc;">Infer</strong> tab to start and watch the simulation.
-          </div>
-        </div>
-      </div>`;
+  // Plugin-managed training: hand the full Train tab to the plugin's registerTrainRenderer.
+  if (n.architecture?.pluginKind && pluginRegistry.trainRenderers[n.architecture.pluginKind]) {
+    const { fn, pluginId } = pluginRegistry.trainRenderers[n.architecture.pluginKind];
+    const nb = { invoke: (ch, ...args) => window.nb.plugins.invoke(pluginId, ch, ...args) };
+    root.innerHTML = '';
+    fn(root, n, nb);
     return;
   }
   const hasWeights = !!n.state || n.stateLocked;

@@ -14,21 +14,29 @@ try {
 
 // ── Simulation constants ──────────────────────────────────────────────────────
 const POP_SIZE    = 20;
-const INPUT_DIM   = 7;   // 5 sensor rays + normalised speed + steer_memory
-const OUTPUT_DIM  = 2;   // steer, throttle_raw
-const TRACK_PTS   = 16;
-const HALF_W      = 38;  // track half-width in pixels
-const MAX_FRAMES  = 600; // ~20 s at 30 fps before forced death
-const RAY_ANGLES  = [-1.2, -0.6, 0, 0.6, 1.2]; // 5 sensors in radians offset from heading
-const RAY_MAX     = 180; // max sensor range px
-const RAY_STEP    = 8;   // ray march step px
-const DT          = 1 / 30;
-const MAX_SPEED   = 130;
-const ACCEL       = 170;
-const FRICTION    = 25;
-const STEER_RATE  = 2.3;
+const INPUT_DIM   = 20;   // 18 sensor rays + current speed + steer_memory
+const OUTPUT_DIM  = 2;    // steer (-1 to 1), throttle/brake (-1 to 1)
+const TRACK_PTS   = 8;   // Base number of control points for track generation (before smoothing)
+const HALF_W      = 28;  // Track half-width for collision detection (note: track is visually slimmer than this for better challenge)
+const MAX_FRAMES  = (50 * 18);  // Increased to 25s to allow for realistic acceleration
+
+// ── Sensory Array (15 Rays) ──────────────────────────────────────────────────
+// Generates 15 rays spanning 160 degrees (-80 to +80) for better peripheral vision
+const RAY_ANGLES  = Array.from({length: 18}, (_, i) => -1.4 + (i * 2.8 / 14));
+const RAY_MAX     = 60;  // Longer range for high-speed reaction
+const RAY_STEP    = 20;    // Smaller step for higher precision detection
+
+// ── Realistic Physics & Movement ─────────────────────────────────────────────
+const DT          = 1 / 50; // 50fps suggested for smooth but realistic physics integration
+const MAX_SPEED   = 340;    
+const ACCEL       = 230;    
+const BRAKE_FORCE = 350;    // Braking is stronger than acceleration
+const FRICTION    = 0.93;   // Multiplicative drag for a natural coasting feel
+const STEER_RATE  = 2.4;    // How quickly the car can change direction (radians per second)
+const GRIP_LOSS   = 0.4;    // Factor representing speed lost during hard cornering
+
 const CANVAS_CX   = 350;
-const CANVAS_CY   = 265;
+const CANVAS_CY   = 285;
 
 // ── Module-level state ────────────────────────────────────────────────────────
 let _pop        = null;
@@ -44,42 +52,74 @@ let _genHistory = [];      // [{gen, best, mean}]
 // ── LCG seeded random ─────────────────────────────────────────────────────────
 function lcg(s) { return (Math.imul(s | 0, 1664525) + 1013904223) >>> 0; }
 function lcgFloat(s) { return [(lcg(s) >>> 0) / 4294967296, lcg(s)]; }
-
 // ── Track generation ──────────────────────────────────────────────────────────
 
 function generateTrack(seed) {
   let rng = (seed || 0xDEADBEEF) >>> 0;
-  const N = TRACK_PTS;
-
-  // Control points: random radii around a base circle
-  const base = 155, jitter = 0.45;
-  const angles = Array.from({ length: N }, (_, i) => (i / N) * 2 * Math.PI);
-  const radii  = angles.map(() => {
+  
+  // Helper to get next random float using your existing LCG pattern
+  function nextRand() {
     let f; [f, rng] = lcgFloat(rng);
-    return base * (1 - jitter / 2 + f * jitter);
+    return f;
+  }
+
+  // Double the initial control points for more complex macro-shapes
+  const initialN = TRACK_PTS * 2; 
+
+  // Track shape parameters
+  const baseRadius = 130;
+  const complexity = Math.floor(nextRand() * 4) + 2; // 2 to 5 "lobes" (turns/straights)
+  const phase = nextRand() * Math.PI * 2;            // Rotate the shape randomly
+  const lobeDepth = 40 + nextRand() * 60;            // How sharp/deep the curves are
+  const jitter = 0.15;                               // Local point variance
+
+  const angles = Array.from({ length: initialN }, (_, i) => (i / initialN) * 2 * Math.PI);
+  
+  const radii = angles.map((a) => {
+    // Base shape with lobes creates intentional hairpins and straights
+    let r = baseRadius + Math.sin(a * complexity + phase) * lobeDepth;
+    // Add random micro-jitter
+    r += (nextRand() - 0.5) * baseRadius * jitter;
+    // Clamp to ensure it doesn't cross the center or go off screen
+    return Math.max(50, Math.min(230, r)); 
   });
+
   let pts = angles.map((a, i) => [
     CANVAS_CX + Math.cos(a) * radii[i],
     CANVAS_CY + Math.sin(a) * radii[i],
   ]);
 
-  // Smooth 4 times — Chaikin-style averaging
+  // True Chaikin corner-cutting (smooths curves by splitting segments)
+  // Note: This increases point count, making collisions and rendering much smoother
   for (let iter = 0; iter < 4; iter++) {
-    pts = pts.map((p, i) => {
-      const prev = pts[(i - 1 + N) % N];
-      const next = pts[(i + 1) % N];
-      return [(prev[0] + p[0] * 2 + next[0]) / 4, (prev[1] + p[1] * 2 + next[1]) / 4];
-    });
+    let newPts = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p1 = pts[i];
+      const p2 = pts[(i + 1) % pts.length];
+      // Insert points at 25% and 75% along the line segment
+      newPts.push([p1[0] * 0.75 + p2[0] * 0.25, p1[1] * 0.75 + p2[1] * 0.25]);
+      newPts.push([p1[0] * 0.25 + p2[0] * 0.75, p1[1] * 0.25 + p2[1] * 0.75]);
+    }
+    pts = newPts;
   }
 
   // Arc lengths for progress calculation
   const segLens = pts.map((p, i) => {
-    const q = pts[(i + 1) % N];
+    const q = pts[(i + 1) % pts.length];
     return Math.hypot(q[0] - p[0], q[1] - p[1]);
   });
   const totalLen = segLens.reduce((a, b) => a + b, 0);
 
-  return { pts, segLens, totalLen, halfWidth: HALF_W, N };
+  // Return a custom halfWidth to make the track slimmer (ignoring the global HALF_W)
+  const slimHalfWidth = 22; 
+
+  return { 
+    pts, 
+    segLens, 
+    totalLen, 
+    halfWidth: slimHalfWidth, 
+    N: pts.length 
+  };
 }
 
 // ── Track geometry helpers ────────────────────────────────────────────────────
@@ -168,7 +208,7 @@ function updateCarProgress(car, track) {
 function carFitness(car) {
   // Primary: distance traveled. Tie-break: avg speed.
   const progress   = car.laps + car.totalDist / Math.max(1, car.frames) * (car.frames / _track.N);
-  const speedBonus = (car.frames > 0 ? car.speed / MAX_SPEED : 0) * 0.15;
+  const speedBonus = (car.frames > 0 ? car.speed / MAX_SPEED : 0) * 0.01;
   return progress + speedBonus;
 }
 
@@ -261,7 +301,7 @@ module.exports = {
         architecture: {
           kind: 'classifier',
           inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
-          hidden: [16, 12], activation: 'tanh', dropout: 0,
+          hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
         },
         size: POP_SIZE, eliteCount: 4,
         pMutate: 0.15, mutationStd: 0.05,
@@ -302,7 +342,7 @@ module.exports = {
         architecture: {
           kind: 'classifier',
           inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
-          hidden: [16, 12], activation: 'tanh', dropout: 0,
+          hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
         },
         size: POP_SIZE, eliteCount: 4,
         pMutate: 0.15, mutationStd: 0.05,

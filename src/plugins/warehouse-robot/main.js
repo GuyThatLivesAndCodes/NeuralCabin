@@ -3,7 +3,6 @@
 const path = require('path');
 const { app } = require('electron');
 
-// Load DQNAgent from the app bundle so this works from the userData plugin copy.
 let _DQNAgent;
 try {
   _DQNAgent = require(path.join(app.getAppPath(), 'src', 'engine', 'rl')).DQNAgent;
@@ -12,25 +11,29 @@ try {
 }
 
 // ── Environment constants ─────────────────────────────────────────────────────
-const GRID = 8;
-const N_BOXES = 3;
+const GRID      = 8;
+const N_BOXES   = 3;
 const MAX_STEPS = 200;
-// State: robot(r,c) + 3×box(r,c) + 3×target(r,c) = 14 floats, all / (GRID-1)
-const STATE_DIM = 2 + N_BOXES * 2 + N_BOXES * 2;
+const STATE_DIM = 2 + N_BOXES * 2 + N_BOXES * 2;  // 14 floats
 const N_ACTIONS = 4;
-const DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1]]; // UP DOWN LEFT RIGHT
+const DIRS      = [[-1, 0], [1, 0], [0, -1], [0, 1]];  // UP DOWN LEFT RIGHT
 
-// ── Module-level state (persists across IPC calls) ────────────────────────────
-let _agent   = null;
-let _env     = null;
-let _running = false;
-let _episode = 0;
-let _epReward   = 0;
-let _totalSteps = 0;
-let _bestReward = -Infinity;
+// ── Module-level state ────────────────────────────────────────────────────────
+let _agent       = null;
+let _env         = null;
+let _running     = false;
+let _episode     = 0;
+let _epReward    = 0;
+let _totalSteps  = 0;
+let _bestReward  = -Infinity;
 let _rewardHistory = [];
 
-// ── Tiny LCG for seeded random positions ─────────────────────────────────────
+// ── Inference state ───────────────────────────────────────────────────────────
+let _inferEnv    = null;
+let _inferEpReward = 0;
+let _inferLapsDone = 0;  // completed inference episodes
+
+// ── LCG for seeded random positions ──────────────────────────────────────────
 function lcg(s) { return (Math.imul(s | 0, 1664525) + 1013904223) >>> 0; }
 
 // ── Grid helpers ──────────────────────────────────────────────────────────────
@@ -83,17 +86,15 @@ function stepEnv(env, action) {
   const [r, c]   = env.robot;
   const nr = r + dr, nc = c + dc;
 
-  // Hit wall
   if (nr < 0 || nr >= GRID || nc < 0 || nc >= GRID) {
     return { env: { ...env, step: env.step + 1 }, reward: -0.5, done: env.step + 1 >= MAX_STEPS };
   }
 
   let boxes = env.boxes;
-  const bi = boxes.findIndex(b => b[0] === nr && b[1] === nc);
+  const bi  = boxes.findIndex(b => b[0] === nr && b[1] === nc);
 
   if (bi >= 0) {
     const bnr = nr + dr, bnc = nc + dc;
-    // Box push is blocked by wall or another box
     if (bnr < 0 || bnr >= GRID || bnc < 0 || bnc >= GRID ||
         boxes.some((b, i) => i !== bi && b[0] === bnr && b[1] === bnc)) {
       return { env: { ...env, step: env.step + 1 }, reward: -0.4, done: env.step + 1 >= MAX_STEPS };
@@ -106,12 +107,12 @@ function stepEnv(env, action) {
   const onPrev = env.onTarget;
   newEnv.onTarget = onNow;
 
-  let reward = -0.01; // small time penalty
-  if (onNow > onPrev) reward += 10 * (onNow - onPrev);  // box placed on target
-  if (onNow < onPrev) reward -= 3  * (onPrev - onNow);  // box knocked off target
+  let reward = -0.01;
+  if (onNow > onPrev) reward += 10 * (onNow - onPrev);
+  if (onNow < onPrev) reward -= 3  * (onPrev - onNow);
 
   const done = (onNow === N_BOXES) || (newEnv.step >= MAX_STEPS);
-  if (onNow === N_BOXES) reward += 50; // all boxes placed
+  if (onNow === N_BOXES) reward += 50;
 
   return { env: newEnv, reward, done };
 }
@@ -120,8 +121,8 @@ function currentVisualState() {
   if (!_env) return null;
   return {
     grid: GRID, nBoxes: N_BOXES,
-    robot: _env.robot,
-    boxes: _env.boxes,
+    robot:   _env.robot,
+    boxes:   _env.boxes,
     targets: _env.targets,
     onTarget: _env.onTarget,
     episode: _episode,
@@ -132,6 +133,13 @@ function currentVisualState() {
     epsilon: _agent ? +_agent.epsilon.toFixed(4) : 1.0,
     rewardHistory: _rewardHistory.slice(-80),
   };
+}
+
+// ── Box-Muller Gaussian noise ─────────────────────────────────────────────────
+
+function gaussRand() {
+  const u = Math.random(), v = Math.random();
+  return Math.sqrt(-2 * Math.log(u + 1e-9)) * Math.cos(2 * Math.PI * v);
 }
 
 // ── IPC handlers ──────────────────────────────────────────────────────────────
@@ -145,15 +153,22 @@ module.exports = {
           inputDim: STATE_DIM, outputDim: N_ACTIONS,
           hidden: [128, 64], activation: 'relu', dropout: 0,
         },
-        gamma: 0.95, lr: opts.lr || 1e-3,
-        batchSize: 64, bufferCapacity: 10000,
+        gamma: 0.95,
+        lr: opts.lr || opts.learningRate || 1e-3,
+        batchSize:      opts.batchSize || 64,
+        bufferCapacity: 10000,
         epsilonStart: 1.0, epsilonEnd: 0.05, epsilonDecay: 0.9995,
-        targetUpdateFreq: 200, seed: opts.seed || 42, optimizer: 'adam',
+        targetUpdateFreq: 200,
+        seed: opts.seed || 42,
+        optimizer: 'adam',
       });
-      _env       = resetEnv();
-      _running   = true;
-      _episode   = 0; _epReward = 0; _totalSteps = 0;
-      _bestReward = -Infinity; _rewardHistory = [];
+      _env         = resetEnv(opts.seed);
+      _running     = true;
+      _episode     = 0;
+      _epReward    = 0;
+      _totalSteps  = 0;
+      _bestReward  = -Infinity;
+      _rewardHistory = [];
       return { ok: true, grid: GRID, nBoxes: N_BOXES };
     },
 
@@ -176,6 +191,7 @@ module.exports = {
 
         if (done) {
           _rewardHistory.push(+_epReward.toFixed(2));
+          if (_rewardHistory.length > 200) _rewardHistory.shift();
           if (_epReward > _bestReward) _bestReward = _epReward;
           _episode++;
           _epReward = 0;
@@ -191,12 +207,74 @@ module.exports = {
 
     'warehouse-robot:reset': () => {
       if (!_agent) return { error: 'Not initialized — call init first.' };
-      _env = resetEnv();
-      _episode = 0; _epReward = 0; _totalSteps = 0;
-      _bestReward = -Infinity; _rewardHistory = [];
+      _env         = resetEnv();
+      _episode     = 0;
+      _epReward    = 0;
+      _totalSteps  = 0;
+      _bestReward  = -Infinity;
+      _rewardHistory = [];
       _agent.epsilon = _agent.epsilonStart;
-      _running = true;
+      _running     = true;
       return { ok: true };
+    },
+
+    // ── Inference handlers ────────────────────────────────────────────────
+
+    'warehouse-robot:inferInit': () => {
+      if (!_agent) return { error: 'No trained agent — run training first.' };
+      _inferEnv      = resetEnv();
+      _inferEpReward = 0;
+      _inferLapsDone = 0;
+      return {
+        ok: true,
+        grid: GRID, nBoxes: N_BOXES,
+        epsilon: +_agent.epsilon.toFixed(4),
+        totalSteps: _totalSteps,
+        episode: _episode,
+        bestReward: _bestReward === -Infinity ? null : +_bestReward.toFixed(2),
+      };
+    },
+
+    'warehouse-robot:inferStep': (_, noiseStd = 0) => {
+      if (!_agent || !_inferEnv) return null;
+
+      const rawState = encodeState(_inferEnv);
+      let state = rawState;
+      if (noiseStd > 0) {
+        state = new Float32Array(rawState.length);
+        for (let i = 0; i < rawState.length; i++) {
+          state[i] = rawState[i] + gaussRand() * noiseStd;
+        }
+      }
+
+      // Greedy action (epsilon = 0)
+      const savedEps   = _agent.epsilon;
+      _agent.epsilon   = 0;
+      const action     = _agent.selectAction(state);
+      _agent.epsilon   = savedEps;
+
+      const { env: next, reward, done } = stepEnv(_inferEnv, action);
+      _inferEpReward += reward;
+      _inferEnv       = next;
+
+      let justReset = false;
+      if (done) {
+        _inferLapsDone++;
+        _inferEpReward = 0;
+        _inferEnv      = resetEnv();
+        justReset      = true;
+      }
+
+      return {
+        grid: GRID, nBoxes: N_BOXES,
+        robot:    _inferEnv.robot,
+        boxes:    _inferEnv.boxes,
+        targets:  _inferEnv.targets,
+        onTarget: _inferEnv.onTarget,
+        epReward: +_inferEpReward.toFixed(2),
+        episodesDone: _inferLapsDone,
+        justReset,
+      };
     },
   },
 };

@@ -1,16 +1,21 @@
 'use strict';
 
-const { tokenize } = require('./lexer');
-const { parse } = require('./parser');
+const { compileNeuralScript } = require('./compiler');
 const T = require('../engine/tensor');
 const { buildFromSpec } = require('../engine/model');
-const { buildOptim } = require('../engine/optim');
 const { trainNetwork, trainNetworkSync, infer } = require('../engine/trainer');
 
-class ReturnException { constructor(value) { this.value = value; } }
+// 1. SIGNAL CLASS: Replacing exceptions for control flow.
+// Throwing/catching exceptions is incredibly slow because it builds stack traces.
+class ReturnSignal { 
+  constructor(value) { 
+    this.value = value; 
+  } 
+}
 
+// 2. FAST TRUTHINESS: Avoid unnecessary function calls for common falsy values.
 function truthy(v) {
-  if (v === null || v === undefined || v === false || v === 0 || v === '') return false;
+  if (!v) return false; // Instantly catches null, undefined, false, 0, ''
   if (Array.isArray(v) && v.length === 0) return false;
   return true;
 }
@@ -19,7 +24,12 @@ function evalNode(node, env, ctx) {
   switch (node.type) {
     case 'Program': {
       let result = null;
-      for (const s of node.body) result = evalNode(s, env, ctx);
+      // Using standard loops instead of for...of avoids iterator allocation overhead
+      const len = node.body.length;
+      for (let i = 0; i < len; i++) {
+        result = evalNode(node.body[i], env, ctx);
+        if (result instanceof ReturnSignal) return result;
+      }
       return result;
     }
     case 'Let': {
@@ -32,12 +42,13 @@ function evalNode(node, env, ctx) {
         env.assign(node.name, v);
       } else {
         let target = env.get(node.name);
-        for (let i = 0; i < node.chain.length - 1; i++) {
+        const chainLen = node.chain.length;
+        for (let i = 0; i < chainLen - 1; i++) {
           const step = node.chain[i];
           const key = step.kind === 'dot' ? step.key : evalNode(step.key, env, ctx);
           target = target[key];
         }
-        const last = node.chain[node.chain.length - 1];
+        const last = node.chain[chainLen - 1];
         const key = last.kind === 'dot' ? last.key : evalNode(last.key, env, ctx);
         target[key] = v;
       }
@@ -45,16 +56,28 @@ function evalNode(node, env, ctx) {
     }
     case 'If': {
       if (truthy(evalNode(node.cond, env, ctx))) {
-        for (const s of node.consequent) evalNode(s, env, ctx);
+        const len = node.consequent.length;
+        for (let i = 0; i < len; i++) {
+          const res = evalNode(node.consequent[i], env, ctx);
+          if (res instanceof ReturnSignal) return res; // Bubble up return signal
+        }
       } else if (node.alternate) {
-        for (const s of node.alternate) evalNode(s, env, ctx);
+        const len = node.alternate.length;
+        for (let i = 0; i < len; i++) {
+          const res = evalNode(node.alternate[i], env, ctx);
+          if (res instanceof ReturnSignal) return res;
+        }
       }
       return null;
     }
     case 'While': {
       let guard = 0;
       while (truthy(evalNode(node.cond, env, ctx))) {
-        for (const s of node.body) evalNode(s, env, ctx);
+        const len = node.body.length;
+        for (let i = 0; i < len; i++) {
+          const res = evalNode(node.body[i], env, ctx);
+          if (res instanceof ReturnSignal) return res;
+        }
         if (++guard > 10_000_000) throw new Error('while: iteration limit exceeded');
       }
       return null;
@@ -63,12 +86,26 @@ function evalNode(node, env, ctx) {
       let from = evalNode(node.from, env, ctx);
       const to = evalNode(node.to, env, ctx);
       const by = node.by ? evalNode(node.by, env, ctx) : 1;
+      
       const forEnv = new Env(env);
-      forEnv.define(node.name, from);
+      // Fast path: bypass .define() overhead and inject directly
+      forEnv.vars[node.name] = from; 
+      
       let guard = 0;
-      while ((by >= 0 ? forEnv.get(node.name) <= to : forEnv.get(node.name) >= to)) {
-        for (const s of node.body) evalNode(s, forEnv, ctx);
-        forEnv.assign(node.name, forEnv.get(node.name) + by);
+      const isUp = by >= 0;
+      const len = node.body.length;
+
+      while (true) {
+        // Fast path: direct dictionary access, avoiding prototype/scope traversal
+        const current = forEnv.vars[node.name]; 
+        if (isUp ? current > to : current < to) break;
+
+        for (let i = 0; i < len; i++) {
+          const res = evalNode(node.body[i], forEnv, ctx);
+          if (res instanceof ReturnSignal) return res;
+        }
+        
+        forEnv.vars[node.name] += by; // Fast path: Direct local scope mutation
         if (++guard > 10_000_000) throw new Error('for: iteration limit exceeded');
       }
       return null;
@@ -79,7 +116,8 @@ function evalNode(node, env, ctx) {
       return null;
     }
     case 'Return': {
-      throw new ReturnException(node.value ? evalNode(node.value, env, ctx) : null);
+      // Create lightweight signal object instead of throwing
+      return new ReturnSignal(node.value ? evalNode(node.value, env, ctx) : null);
     }
     case 'Print': {
       const v = evalNode(node.value, env, ctx);
@@ -91,10 +129,21 @@ function evalNode(node, env, ctx) {
     case 'Str': return node.value;
     case 'Literal': return node.value;
     case 'Ident': return env.get(node.name);
-    case 'List': return node.items.map(it => evalNode(it, env, ctx));
+    case 'List': {
+      const len = node.items.length;
+      const arr = new Array(len); // Pre-allocate array
+      for (let i = 0; i < len; i++) {
+        arr[i] = evalNode(node.items[i], env, ctx);
+      }
+      return arr;
+    }
     case 'Obj': {
       const o = {};
-      for (const e of node.entries) o[e.key] = evalNode(e.value, env, ctx);
+      const len = node.entries.length;
+      for (let i = 0; i < len; i++) {
+        const e = node.entries[i];
+        o[e.key] = evalNode(e.value, env, ctx);
+      }
       return o;
     }
     case 'Unary': {
@@ -129,7 +178,12 @@ function evalNode(node, env, ctx) {
     case 'Call': {
       const fn = evalNode(node.callee, env, ctx);
       if (typeof fn !== 'function') throw new Error(`cannot call: ${stringify(fn)}`);
-      const args = node.args.map(a => evalNode(a, env, ctx));
+      
+      const len = node.args.length;
+      const args = new Array(len); // Pre-allocate for speed
+      for (let i = 0; i < len; i++) {
+        args[i] = evalNode(node.args[i], env, ctx);
+      }
       return fn(...args);
     }
     case 'Index': {
@@ -150,35 +204,52 @@ function evalNode(node, env, ctx) {
 function makeFunction(params, body, closure) {
   return function (...args) {
     const env = new Env(closure);
-    for (let i = 0; i < params.length; i++) env.define(params[i], args[i]);
-    try {
-      for (const s of body) evalNode(s, env, env._ctx);
-      return null;
-    } catch (e) {
-      if (e instanceof ReturnException) return e.value;
-      throw e;
+    const paramsLen = params.length;
+    // Direct assignment bypasses .define() checks
+    for (let i = 0; i < paramsLen; i++) env.vars[params[i]] = args[i]; 
+    
+    const bodyLen = body.length;
+    for (let i = 0; i < bodyLen; i++) {
+      const res = evalNode(body[i], env, env._ctx);
+      if (res instanceof ReturnSignal) return res.value; // Unpack signal here
     }
+    return null;
   };
 }
 
 class Env {
   constructor(parent) {
     this.parent = parent || null;
-    this.vars = new Map();
+    // Object.create(null) avoids prototype chain traversals and is highly 
+    // optimized by V8 engines for fast dictionary/hash-map lookups
+    this.vars = Object.create(null);
     this._ctx = parent ? parent._ctx : null;
   }
-  define(name, value) { this.vars.set(name, value); }
+  
+  define(name, value) { 
+    this.vars[name] = value; 
+  }
+  
   get(name) {
-    if (this.vars.has(name)) return this.vars.get(name);
-    if (this.parent) return this.parent.get(name);
+    let current = this;
+    while (current !== null) {
+      if (name in current.vars) return current.vars[name];
+      current = current.parent;
+    }
     throw new Error(`undefined: ${name}`);
   }
+  
   assign(name, value) {
-    if (this.vars.has(name)) { this.vars.set(name, value); return; }
-    if (this.parent && this.parent._has(name)) { this.parent.assign(name, value); return; }
-    this.vars.set(name, value); // implicit define if nowhere
+    let current = this;
+    while (current !== null) {
+      if (name in current.vars) { 
+        current.vars[name] = value; 
+        return; 
+      }
+      current = current.parent;
+    }
+    this.vars[name] = value; // implicit define if nowhere
   }
-  _has(name) { return this.vars.has(name) || (this.parent && this.parent._has(name)); }
 }
 
 function stringify(v) {
@@ -235,20 +306,21 @@ function makeStandardLib(scriptCtx) {
 }
 
 async function runScript(code, ctx = {}) {
-  const tokens = tokenize(code);
-  const ast = parse(tokens);
   const scriptCtx = { output: [], network: ctx.network || null, saveTrainedState: ctx.saveTrainedState };
+  
   const globalEnv = new Env(null);
   globalEnv._ctx = scriptCtx;
+  
   const lib = makeStandardLib(scriptCtx);
   for (const [k, v] of Object.entries(lib)) globalEnv.define(k, v);
 
   try {
-    // Execute top-level. Some stdlib functions are async (train); since our
-    // interpreter is synchronous, async funcs return a Promise the script
-    // can handle via `let r = await(train(...))`. Implement `await(x)` helper.
-    globalEnv.define('await', (p) => p); // pass-through — train is sync in NeuralScript
-    evalNode(ast, globalEnv, scriptCtx);
+    const { ast } = compileNeuralScript(code);
+    globalEnv.define('await', (p) => p); 
+    
+    const result = evalNode(ast, globalEnv, scriptCtx);
+    // Note: If a top-level return is executed, result will be a ReturnSignal, which we can safely ignore
+    
     return { ok: true, output: scriptCtx.output.join('\n') };
   } catch (e) {
     return { ok: false, error: e.message, output: scriptCtx.output.join('\n') };

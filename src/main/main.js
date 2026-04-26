@@ -57,6 +57,11 @@ function createWindow() {
       mainWindow.webContents.send('training:error', payload);
     }
   });
+  trainer.on('log', (payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('training:log', payload);
+    }
+  });
 
   apiServer.on('log', (line) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -169,10 +174,14 @@ ipcMain.handle('plugins:install', async () => {
 });
 ipcMain.handle('plugins:uninstall', (_, id) => pluginLoader.uninstall(id));
 
-ipcMain.handle('api:start', (_, id, port) => apiServer.start(id, port));
+ipcMain.handle('api:start', (_, id, port, opts) => apiServer.start(id, port, opts || {}));
 ipcMain.handle('api:stop', (_, id) => apiServer.stop(id));
 ipcMain.handle('api:status', (_, id) => apiServer.status(id));
 ipcMain.handle('api:list', () => apiServer.listAll());
+ipcMain.handle('api:issue-token', (_, id, expiresIn) => apiServer.issueToken(id, expiresIn));
+ipcMain.handle('api:metrics', (_, id) => apiServer.getMetrics(id));
+
+ipcMain.handle('training:backend-info', () => trainer.backendInfo());
 
 ipcMain.handle('script:run', (_, id, code) => trainer.runScript(id, code));
 

@@ -4,8 +4,8 @@ window.NB_DOCS = [
     title: 'Welcome',
     body: `
 <h1>Welcome to NeuralCabin</h1>
-<p>NeuralCabin is a self-contained neural network platform built entirely in plain JavaScript — no NumPy, no TensorFlow, no PyTorch. Every tensor operation, every gradient computation, and every optimizer step runs on readable source code you can inspect, modify, and learn from. The full engine is available at <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">github.com/GuyThatLivesAndCodes/NeuralCabin</a>.</p>
-<p>The engine is approximately <strong>2,000 lines of plain JavaScript</strong> — small enough to read in an afternoon, powerful enough to train real classifiers, regressors, character language models, and multi-turn chat assistants. There is no compilation step, no virtual environment, and no external runtime dependency beyond Node.js and Electron.</p>
+<p>NeuralCabin is now a hybrid neural platform: a readable JavaScript application layer plus a staged Rust/WebGPU engine migration. The JavaScript backend remains available for transparency and fallback, while the native path introduces mixed precision, kernel fusion, and GPU execution hooks.</p>
+<p>The active runtime is selected by <code>src/engine/tensor.js</code>, which can load a native backend or fall back to <code>src/engine/tensor-js.js</code>. This keeps the existing UI/API stable while the Rust engine is integrated incrementally.</p>
 <p>Select a topic from the left sidebar to explore the engine internals, learn how to design and train networks, understand the training data formats, use the HTTP API, script experiments with NeuralScript, and more.</p>
 
 <h2>Quick start</h2>
@@ -67,7 +67,7 @@ window.NB_DOCS = [
   <li>Seed the loss tensor's own <code>grad</code> with 1 (since <code>∂loss/∂loss = 1</code>).</li>
   <li>Iterate in reverse order, calling each node's stored <code>_backward()</code> function. That function reads <code>out.grad</code> and accumulates into each parent's <code>grad</code> using <code>+=</code> (to handle shared nodes correctly).</li>
 </ol>
-<p>Each operator — <code>matmul</code>, <code>relu</code>, <code>gelu</code>, <code>softmax</code>, <code>embedding</code>, and others — implements its own local derivative. You can read every one of them in <code>src/engine/tensor.js</code>.</p>
+<p>Each operator — <code>matmul</code>, <code>relu</code>, <code>gelu</code>, <code>softmax</code>, <code>embedding</code>, and others — implements its own local derivative. For the JS path, you can read every one of them in <code>src/engine/tensor-js.js</code>; <code>src/engine/tensor.js</code> is now the backend selector.</p>
 
 <h2>4. Optimizer step</h2>
 <p>After backward, every parameter has a populated <code>.grad</code> array. The optimizer uses these gradients to update the parameters. NeuralCabin ships ten optimizers (see the <strong>Optimizers</strong> reference section for full details):</p>
@@ -104,7 +104,7 @@ window.NB_DOCS = [
     title: 'Tensor engine internals',
     body: `
 <h1>Tensor engine internals</h1>
-<p>All computation in NeuralCabin is built on the <code>Tensor</code> class defined in <code>src/engine/tensor.js</code>. Understanding this class is the key to understanding everything else.</p>
+<p>NeuralCabin currently supports two tensor backends: a JavaScript implementation (<code>src/engine/tensor-js.js</code>) and a staged native Rust/WebGPU path (<code>native/rust-engine/</code>). <code>src/engine/tensor.js</code> selects the backend at runtime.</p>
 
 <h2>The Tensor class</h2>
 <p>A <code>Tensor</code> holds three things:</p>
@@ -789,13 +789,13 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
 <h1>No frameworks. No abstraction tax.</h1>
 <p>Production ML frameworks — PyTorch, TensorFlow, JAX — are built for scale and generality. That means they sit behind tens of thousands of lines of kernel dispatch code, custom CUDA ops, and multi-level JIT compilation infrastructure. The depth is appropriate when you're training billion-parameter models on distributed GPU clusters. For understanding what a network is actually doing at the arithmetic level, or for small to medium models where none of that infrastructure provides any benefit, it's just noise standing between you and the computation.</p>
 
-<p>The NeuralCabin engine (see <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">the source</a>) is approximately <strong>2,000 lines of plain JavaScript</strong>. You can open <code>src/engine/tensor.js</code> and read the entire autograd system in one sitting. You can trace a gradient backward through a specific operation, verify the chain rule application by hand, and confirm it matches what the code computes. You can add a new activation function in ten lines. You can swap in a different optimizer and watch it change the loss curve. Nothing is hidden.</p>
+<p>The NeuralCabin engine (see <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">the source</a>) is a hybrid JavaScript + Rust/WebGPU implementation. You can open <code>src/engine/tensor-js.js</code> and read the full JS autograd system in one sitting, while <code>native/rust-engine/neuralcabin-core/src/</code> contains the native kernel path. You can trace a gradient backward through a specific operation, verify the chain rule application by hand, and confirm it matches what the code computes. You can add a new activation function in ten lines. You can swap in a different optimizer and watch it change the loss curve. Nothing is hidden.</p>
 
 <h2>What you trade away</h2>
 <ul>
-  <li><strong>No GPU acceleration.</strong> All computation runs on CPU in JavaScript. This is sufficient for networks up to a few million parameters — XOR to small char LMs. Larger models will be slow.</li>
-  <li><strong>No distributed training.</strong> Single machine, single process. Intentional.</li>
-  <li><strong>No automatic mixed precision, gradient checkpointing, or FSDP.</strong> Not needed at NeuralCabin's scale.</li>
+  <li><strong>GPU path is staged.</strong> The Rust core includes WebGPU runtime scaffolding and fused kernel templates; the JS backend remains the compatibility fallback.</li>
+  <li><strong>Distributed training contracts are present.</strong> AllReduce interfaces are now part of the native core, with transport wiring staged.</li>
+  <li><strong>Mixed precision is now part of the migration path.</strong> FP16/BF16 dtypes are available in the Rust core APIs.</li>
   <li><strong>No Transformer blocks out of the box.</strong> The primitives (matmul, embedding, softmax, gelu) are all present, and NeuralScript can compose them, but there is no pre-built attention layer.</li>
 </ul>
 
@@ -1230,13 +1230,18 @@ if (file) {
 
 <h2>Repository layout</h2>
 <pre><code>src/
-  engine/      tensor.js, layers.js, optim.js, model.js,
+  engine/      tensor.js (selector), tensor-js.js (JS backend),
+               tensor-native-loader.js, layers.js, optim.js, model.js,
                tokenizer.js, chat-format.js, trainer.js
-  dsl/         lexer.js, parser.js, interpreter.js
+  dsl/         lexer.js, parser.js, compiler.js, typecheck.js, interpreter.js
   main/        main.js, preload.js, storage.js,
                training-manager.js, api-server.js
   renderer/    index.html, styles.css, app.js,
                templates.js, docs.js
+native/
+  rust-engine/         neuralcabin-core + neuralcabin-node
+  cpp-inference-server/ C++ serving scaffold
+docs/          rust-migration.md
 tests/         run-tests.js
 assets/        icon.png, make-icon.js</code></pre>
 
@@ -1244,11 +1249,14 @@ assets/        icon.png, make-icon.js</code></pre>
 <pre><code>npm install
 npm start          # launches the Electron app
 npm test           # runs the engine test harness
-npm run build:win  # builds NeuralCabin-Setup-1.0.0.exe</code></pre>
+npm run build:win  # builds NeuralCabin-Setup-1.0.0.exe
+npm run engine:check:rust
+npm run engine:build:rust
+npm run server:build:cpp</code></pre>
 
 <h2>Adding a new tensor op</h2>
 <ol>
-  <li>Open <code>src/engine/tensor.js</code>.</li>
+  <li>Open <code>src/engine/tensor-js.js</code> for JS backend ops, or <code>native/rust-engine/neuralcabin-core/src/</code> for native kernels.</li>
   <li>Implement the forward pass into a new <code>Tensor</code> with <code>requiresGrad</code> set correctly.</li>
   <li>Assign <code>out._parents</code> and <code>out._backward</code>. Use <code>+=</code> in all gradient accumulations.</li>
   <li>Export from the bottom of the file.</li>
@@ -1272,11 +1280,13 @@ npm run build:win  # builds NeuralCabin-Setup-1.0.0.exe</code></pre>
 
 <h2>Code style</h2>
 <ul>
-  <li>Plain ES5/ES6 JavaScript. No TypeScript, no transpilation.</li>
-  <li>No external runtime dependencies in the engine (<code>src/engine/</code>).</li>
+  <li>Primary app code is plain ES5/ES6 JavaScript; native acceleration lives in Rust/C++ modules under <code>native/</code>.</li>
+  <li>Keep the JS fallback engine dependency-light; native dependencies belong under <code>native/</code>.</li>
   <li>Comments on performance-sensitive sections (loop order, caching decisions) are expected and valued.</li>
   <li>Keep the engine small. If a feature belongs in application code, put it in <code>src/main/</code> or <code>src/renderer/</code>, not in the engine.</li>
 </ul>
 `
   }
 ];
+
+

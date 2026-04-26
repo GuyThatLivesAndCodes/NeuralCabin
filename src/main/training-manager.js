@@ -4,19 +4,38 @@ const { EventEmitter } = require('events');
 const { trainNetwork, infer, inferStream, buildInferenceCache } = require('../engine/trainer');
 const { runScript } = require('../dsl/interpreter');
 
+// ── Structured log helper ─────────────────────────────────────────────────────
+
+function makeLog(emit, id) {
+  return (line, level = 'info') => {
+    emit('log', { id, line, level, ts: Date.now() });
+  };
+}
+
+// ── Backend telemetry ─────────────────────────────────────────────────────────
+
+let _backendMeta = null;
+function getBackendMeta() {
+  if (_backendMeta) return _backendMeta;
+  try {
+    const tensor = require('../engine/tensor');
+    _backendMeta = tensor.__backend || { mode: 'js', reason: 'not-checked' };
+  } catch (_) {
+    _backendMeta = { mode: 'unknown' };
+  }
+  return _backendMeta;
+}
+
+// ── TrainingManager ───────────────────────────────────────────────────────────
+
 class TrainingManager extends EventEmitter {
   constructor(storage) {
     super();
     this.storage = storage;
-    this.active = new Map();      // id -> { stop, startedAt, lastProgress }
-    // Model object cache: avoids rebuilding Float32Array weights + tokenizer on
-    // every inference call.  Entry shape: { updatedAt: number, cache: {model, tokenizer} }
-    // Invalidated when updatedAt changes (after training, restore, or update).
+    this.active = new Map();     // id -> { stop, startedAt, lastProgress }
     this._modelCache = new Map(); // id -> { updatedAt, cache }
   }
 
-  // Returns a { model, tokenizer } cache entry for the network, rebuilding only
-  // when the network's updatedAt timestamp has changed since the last build.
   _getOrBuildModel(net) {
     const stored = this._modelCache.get(net.id);
     if (stored && stored.updatedAt === net.updatedAt) return stored.cache;
@@ -29,6 +48,18 @@ class TrainingManager extends EventEmitter {
     const a = this.active.get(id);
     if (!a) return { running: false };
     return { running: true, startedAt: a.startedAt, lastProgress: a.lastProgress };
+  }
+
+  backendInfo() {
+    const meta = getBackendMeta();
+    let extraInfo = {};
+    if (meta.mode === 'rust') {
+      try {
+        const native = require('../../native/rust-engine/neuralcabin-node');
+        extraInfo = native.api.backendInfo();
+      } catch (_) {}
+    }
+    return { ...meta, ...extraInfo };
   }
 
   // opts: { fromScratch?: boolean, overrides?: object }
@@ -49,11 +80,16 @@ class TrainingManager extends EventEmitter {
     const record = {
       stop: () => { cancelRequested = true; },
       startedAt: Date.now(),
-      lastProgress: null
+      lastProgress: null,
     };
     this.active.set(id, record);
 
+    const log = makeLog(this.emit.bind(this), id);
+    const backend = getBackendMeta();
+    log(`training started (backend=${backend.mode}${backend.reason ? '/' + backend.reason : ''})`);
+
     (async () => {
+      const t0 = Date.now();
       try {
         const result = await trainNetwork(net, {
           fromScratch,
@@ -62,24 +98,23 @@ class TrainingManager extends EventEmitter {
             this.emit('progress', { id, ...p });
           },
           shouldStop: () => cancelRequested,
-          log: (line) => this.emit('progress', { id, log: line })
+          log: (line) => log(line),
         });
+
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+        log(`training finished in ${elapsed}s (${result.metrics?.length ?? 0} epochs)`);
+
         this.storage.saveTrainedState(id, {
           state: result.state,
           optimizerState: result.optimizerState,
           tokenizer: result.tokenizer,
-          // The trainer may have mutated arch (e.g. set vocabSize after
-          // building tokenizer from corpus, or flipped isChat). Persist that
-          // so the next continue-training run sees a consistent arch ↔ state
-          // ↔ tokenizer triple.
           architecture: result.architecture,
-          metrics: result.metrics
+          metrics: result.metrics,
         });
-        // Evict the stale model cache so the next inference call picks up the
-        // freshly-trained weights instead of the pre-training snapshot.
         this._modelCache.delete(id);
         this.emit('done', { id, stopped: !!result.stopped, metrics: result.metrics });
       } catch (e) {
+        log(`training error: ${e.message}`, 'error');
         this.emit('error', { id, message: e.message, stack: e.stack });
       } finally {
         this.active.delete(id);
@@ -93,6 +128,7 @@ class TrainingManager extends EventEmitter {
     const a = this.active.get(id);
     if (!a) return { running: false };
     a.stop();
+    makeLog(this.emit.bind(this), id)('stop requested');
     return { stopping: true };
   }
 
@@ -119,7 +155,7 @@ class TrainingManager extends EventEmitter {
     const ctx = {
       network: net,
       saveTrainedState: (state) => net && this.storage.saveTrainedState(net.id, state),
-      storage: this.storage
+      storage: this.storage,
     };
     return runScript(code, ctx);
   }

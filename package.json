@@ -13,7 +13,10 @@
     "build:win": "node scripts/bump-version.js && electron-builder --win",
     "build:nobump": "electron-builder",
     "pack": "electron-builder --dir",
-    "test": "node tests/run-tests.js"
+    "test": "node tests/run-tests.js",
+    "engine:build:rust": "cargo build --manifest-path native/rust-engine/Cargo.toml -p neuralcabin-node --release",
+    "engine:check:rust": "cargo check --manifest-path native/rust-engine/Cargo.toml -p neuralcabin-core",
+    "server:build:cpp": "cmake -S native/cpp-inference-server -B native/cpp-inference-server/build && cmake --build native/cpp-inference-server/build --config Release"
   },
   "devDependencies": {
     "electron": "^33.0.0",

@@ -122,6 +122,19 @@ async function testDSL() {
   check('DSL trains inline', r2.ok, r2.error);
 }
 
+async function testDSLTypecheck() {
+  console.log('\n== DSL typecheck ==');
+  const bad = await runScript(`
+    let spec = { kind: "classifier", inputDim: -2, outputDim: 2, hidden: [8] }
+    let data = { samples: [{ input: [0,0], label: 0 }] }
+    let opts = { optimizer: "adam", learningRate: 0.05, batchSize: 4, epochs: 50, seed: 42 }
+    let r = await(train(spec, data, opts))
+    print r
+  `);
+  check('DSL compile catches invalid architecture', !bad.ok && /type check failed/i.test(bad.error), bad.error);
+  check('DSL compile pinpoints field', /inputDim/.test(bad.error), bad.error);
+}
+
 async function testChatFormat() {
   console.log('\n== chat-format loader ==');
   const ChatFormat = require('../src/engine/chat-format');
@@ -626,6 +639,7 @@ async function testParallelTrainerProducesValidModel() {
     await testMLP();
     await testCharLM();
     await testDSL();
+    await testDSLTypecheck();
     await testChatFormat();
     await testChatTrainingEndToEnd();
     await testOptimizerStateRoundtrip();

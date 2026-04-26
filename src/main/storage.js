@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// JSON file store at <userData>/NeuralCity/networks/<id>.json
+// JSON file store at <userData>/NeuralCabin/networks/<id>.json
 // Optional per-network encryption using AES-256-GCM with a passphrase-derived key.
 
 function uuid() {

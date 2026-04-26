@@ -1,4 +1,4 @@
-# NeuralCity
+# NeuralCabin
 
 Build neural networks from the ground up. No NumPy, no TensorFlow, no PyTorch â€” every tensor op, every gradient, every optimizer step is plain JavaScript code you can read and modify.
 
@@ -18,12 +18,12 @@ Build neural networks from the ground up. No NumPy, no TensorFlow, no PyTorch â€
 npm install
 npm start          # launches the app
 npm test           # runs the engine test harness
-npm run build:win  # produces dist/NeuralCity-Setup-1.0.0.exe
+npm run build:win  # produces dist/NeuralCabin-Setup-1.0.0.exe
 ```
 
 ## Install on Windows
 
-After building, run `dist/NeuralCity-Setup-1.0.0.exe`. The NSIS installer lets you pick an install location, creates a Start Menu and desktop shortcut, and registers an uninstaller.
+After building, run `dist/NeuralCabin-Setup-1.0.0.exe`. The NSIS installer lets you pick an install location, creates a Start Menu and desktop shortcut, and registers an uninstaller.
 
 Releases are published on GitHub by the project maintainer.
 

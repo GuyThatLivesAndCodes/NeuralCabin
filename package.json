@@ -1,9 +1,9 @@
 {
-  "name": "neuralcity",
+  "name": "neuralcabin",
   "version": "1.1.0",
   "description": "Build neural networks from the ground up. No frameworks, no fluff.",
   "main": "src/main/main.js",
-  "author": "NeuralCity",
+  "author": "NeuralCabin",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
@@ -21,8 +21,8 @@
   },
   "dependencies": {},
   "build": {
-    "appId": "com.neuralcity.app",
-    "productName": "NeuralCity",
+    "appId": "com.neuralcabin.app",
+    "productName": "NeuralCabin",
     "directories": {
       "output": "dist"
     },
@@ -41,14 +41,14 @@
         }
       ],
       "icon": "assets/icon.png",
-      "artifactName": "NeuralCity-Setup-${version}.${ext}"
+      "artifactName": "NeuralCabin-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "NeuralCity"
+      "shortcutName": "NeuralCabin"
     }
   }
 }

@@ -72,16 +72,16 @@ class PluginLoader {
     }));
   }
 
-  // Install a .ncpl file (JSON) into the plugins directory.
+  // Install a .nbpl file (JSON) into the plugins directory.
   install(ncplPath) {
     const raw = fs.readFileSync(ncplPath, 'utf-8');
     let plugin;
     try { plugin = JSON.parse(raw); }
-    catch (e) { throw new Error('Invalid .ncpl file: not valid JSON'); }
+    catch (e) { throw new Error('Invalid .nbpl file: not valid JSON'); }
 
     const { id, name, version, description, author, mainCode, rendererCode } = plugin;
-    if (!id || typeof id !== 'string') throw new Error('.ncpl missing required "id" field');
-    if (!/^[a-z0-9_-]+$/i.test(id)) throw new Error(`.ncpl id "${id}" contains invalid characters`);
+    if (!id || typeof id !== 'string') throw new Error('.nbpl missing required "id" field');
+    if (!/^[a-z0-9_-]+$/i.test(id)) throw new Error(`.nbpl id "${id}" contains invalid characters`);
 
     const dir = path.join(this.pluginDir, id);
     fs.mkdirSync(dir, { recursive: true });

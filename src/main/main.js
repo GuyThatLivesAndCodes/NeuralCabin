@@ -8,7 +8,7 @@ const { TrainingManager } = require('./training-manager');
 const PluginLoader = require('./plugin-loader');
 
 const isDev = process.argv.includes('--dev');
-const userDataDir = path.join(app.getPath('userData'), 'NeuralCity');
+const userDataDir = path.join(app.getPath('userData'), 'NeuralCabin');
 if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
 const storage = new Storage(userDataDir);
@@ -28,7 +28,7 @@ function createWindow() {
     minWidth: 1000,
     minHeight: 650,
     backgroundColor: '#0a0a0a',
-    title: 'NeuralCity',
+    title: 'NeuralCabin',
     autoHideMenuBar: true,
     icon: path.join(__dirname, '..', '..', 'assets', 'icon.png'),
     webPreferences: {
@@ -98,8 +98,8 @@ ipcMain.handle('networks:export', async (_, id) => {
   if (!net) throw new Error('Network not found');
   const result = await dialog.showSaveDialog(mainWindow, {
     title: 'Export Network',
-    defaultPath: `${net.name.replace(/[^a-z0-9_\-]/gi, '_')}.ncnet.json`,
-    filters: [{ name: 'NeuralCity Network', extensions: ['json'] }]
+    defaultPath: `${net.name.replace(/[^a-z0-9_\-]/gi, '_')}.nbnet.json`,
+    filters: [{ name: 'NeuralCabin Network', extensions: ['json'] }]
   });
   if (result.canceled || !result.filePath) return null;
   fs.writeFileSync(result.filePath, JSON.stringify(net, null, 2));
@@ -109,7 +109,7 @@ ipcMain.handle('networks:export', async (_, id) => {
 ipcMain.handle('networks:import', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Import Network',
-    filters: [{ name: 'NeuralCity Network', extensions: ['json'] }],
+    filters: [{ name: 'NeuralCabin Network', extensions: ['json'] }],
     properties: ['openFile']
   });
   if (result.canceled || !result.filePaths[0]) return null;
@@ -128,8 +128,8 @@ ipcMain.handle('backups:download', async (_, netId, backupId) => {
   const safeName = (backup.label || 'backup').replace(/[^a-z0-9_\-]/gi, '_').slice(0, 48);
   const result = await dialog.showSaveDialog(mainWindow, {
     title: 'Save Backup',
-    defaultPath: `${safeName}.ncbackup.json`,
-    filters: [{ name: 'NeuralCity Backup', extensions: ['json'] }]
+    defaultPath: `${safeName}.nbbackup.json`,
+    filters: [{ name: 'NeuralCabin Backup', extensions: ['json'] }]
   });
   if (result.canceled || !result.filePath) return null;
   fs.copyFileSync(srcPath, result.filePath);
@@ -161,7 +161,7 @@ ipcMain.handle('plugins:list', () => pluginLoader.list());
 ipcMain.handle('plugins:install', async () => {
   const res = await dialog.showOpenDialog(mainWindow, {
     title: 'Install Plugin',
-    filters: [{ name: 'NeuralCity Plugin', extensions: ['ncpl'] }],
+    filters: [{ name: 'NeuralCabin Plugin', extensions: ['nbpl'] }],
     properties: ['openFile']
   });
   if (res.canceled || !res.filePaths[0]) return null;
@@ -212,7 +212,7 @@ ipcMain.handle('gpt:pickDocuments', async () => {
     const ext = path.extname(p).slice(1).toLowerCase();
     if (ext === 'zip') {
       const extractZip = require('extract-zip');
-      const extractDir = path.join(os.tmpdir(), `nc-zip-${Date.now()}`);
+      const extractDir = path.join(os.tmpdir(), `nb-zip-${Date.now()}`);
       fs.mkdirSync(extractDir, { recursive: true });
       try {
         await extractZip(p, { dir: extractDir });

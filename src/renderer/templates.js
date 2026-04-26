@@ -1,6 +1,6 @@
-// NeuralCity templates. Exposed on window.NC_TEMPLATES.
+// NeuralCabin templates. Exposed on window.NB_TEMPLATES.
 
-window.NC_TEMPLATES = [
+window.NB_TEMPLATES = [
   {
     id: 'xor',
     name: 'XOR Classifier',
@@ -141,7 +141,7 @@ function DEFAULT_CORPUS() {
     "data shapes the mind of the machine.",
     "the future is written one token at a time.",
     "learn the math, own the magic.",
-    "neuralcity builds models that you can actually hold in your head."
+    "neuralcabin builds models that you can actually hold in your head."
   ].join("\n").repeat(8);
 }
 
@@ -150,7 +150,7 @@ function DEFAULT_CHAT_PAIRS() {
   const seed = [
     { user: "Hello, I need help", assistant: "Of course, I'm here, what's up?" },
     { user: "Hi there", assistant: "Hey! How can I help today?" },
-    { user: "What's your name?", assistant: "I'm a small NeuralCity model." },
+    { user: "What's your name?", assistant: "I'm a small NeuralCabin model." },
     { user: "Thanks", assistant: "Happy to help!" },
     { user: "Can you help me?", assistant: "Yes — tell me what you need." },
     { user: "Tell me a fact", assistant: "Neural networks learn by adjusting weights." },

@@ -1,4 +1,4 @@
-// NeuralCity tensor + autograd engine. Pure JS, no dependencies.
+// NeuralCabin tensor + autograd engine. Pure JS, no dependencies.
 // Tensors store a flat Float32Array + shape. Autograd builds a dynamic graph
 // on forward, then walks it in reverse topological order on .backward().
 

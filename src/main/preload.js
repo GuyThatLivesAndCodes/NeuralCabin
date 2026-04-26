@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('nc', {
+contextBridge.exposeInMainWorld('nb', {
   networks: {
     list: () => ipcRenderer.invoke('networks:list'),
     get: (id) => ipcRenderer.invoke('networks:get', id),

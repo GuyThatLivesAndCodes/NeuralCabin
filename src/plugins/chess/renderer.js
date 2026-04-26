@@ -162,7 +162,7 @@
   }
 
   // ── Training data editor ──────────────────────────────────────────────────
-  api.registerTrainEditor('chess', function (root, network, nc) {
+  api.registerTrainEditor('chess', function (root, network, nb) {
     const count = Array.isArray(network.trainingData && network.trainingData.samples)
       ? network.trainingData.samples.length : 0;
 
@@ -190,12 +190,12 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
       const statusEl = document.getElementById('chess-upload-status');
       statusEl.textContent = 'Reading files…';
       try {
-        const file = await window.nc.dialog.readTextFile({ filters: [{ name: 'Text/PGN', extensions: ['txt', 'pgn', 'csv'] }] });
+        const file = await window.nb.dialog.readTextFile({ filters: [{ name: 'Text/PGN', extensions: ['txt', 'pgn', 'csv'] }] });
         if (!file) { statusEl.textContent = ''; return; }
         statusEl.textContent = 'Parsing games…';
-        const result = await nc.invoke('chess:parseGames', file.content);
+        const result = await nb.invoke('chess:parseGames', file.content);
         if (!result.samples.length) { statusEl.style.color = '#f44'; statusEl.textContent = 'No valid UCI games found in file.'; return; }
-        await window.nc.networks.update(network.id, { trainingData: { samples: result.samples } });
+        await window.nb.networks.update(network.id, { trainingData: { samples: result.samples } });
         document.getElementById('chess-pos-count').textContent = result.positionCount.toLocaleString();
         statusEl.style.color = '#8bc34a';
         statusEl.textContent = `Loaded ${result.positionCount.toLocaleString()} positions from ${result.gameCount} game(s).`;
@@ -206,14 +206,14 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
     });
 
     document.getElementById('btn-chess-clear').addEventListener('click', async () => {
-      await window.nc.networks.update(network.id, { trainingData: { samples: [] } });
+      await window.nb.networks.update(network.id, { trainingData: { samples: [] } });
       document.getElementById('chess-pos-count').textContent = '0';
       document.getElementById('chess-upload-status').textContent = 'Training data cleared.';
     });
   });
 
   // ── Inference UI ──────────────────────────────────────────────────────────
-  api.registerInferenceRenderer('chess', function (root, network, nc) {
+  api.registerInferenceRenderer('chess', function (root, network, nb) {
     const isTrained = !!(network.state || network.stateLocked);
 
     // ── State ──
@@ -352,7 +352,7 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
     // Returns true if the game has reached a terminal state (caller should stop).
     async function handleGameStatus() {
       try {
-        const status = await nc.invoke('chess:gameStatus', fen);
+        const status = await nb.invoke('chess:gameStatus', fen);
         if (status === 'checkmate') {
           const matedColor = fen.split(' ')[1] === 'w' ? 'White' : 'Black';
           const winner     = matedColor === 'White' ? 'Black' : 'White';
@@ -387,12 +387,12 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
       let moved = false;
       try {
         updateModeStatus();
-        const encoded = await nc.invoke('chess:encodePosition', fen);
-        const result = await window.nc.inference.run(network.id, { input: encoded });
+        const encoded = await nb.invoke('chess:encodePosition', fen);
+        const result = await window.nb.inference.run(network.id, { input: encoded });
         if (!result || result.kind !== 'classification') {
           stopMode(); return false;
         }
-        const top = await nc.invoke('chess:topLegalMoves', fen, result.probs);
+        const top = await nb.invoke('chess:topLegalMoves', fen, result.probs);
 
         if (!top.length) {
           // No legal moves — handled by handleGameStatus after the previous move,
@@ -413,7 +413,7 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
         ).join('');
 
         highlights = { [nameToSq(best.from)]: 'from', [nameToSq(best.to)]: 'to' };
-        fen = await nc.invoke('chess:applyMove', fen, best.uci);
+        fen = await nb.invoke('chess:applyMove', fen, best.uci);
         el('ci-fen').value = fen;
         selectedSq = null; pseudoLegal = [];
         refreshBoard();
@@ -461,12 +461,12 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
       predEl.textContent = 'Thinking…';
       topEl.textContent  = '';
       try {
-        const encoded = await nc.invoke('chess:encodePosition', fen);
-        const result  = await window.nc.inference.run(network.id, { input: encoded });
+        const encoded = await nb.invoke('chess:encodePosition', fen);
+        const result  = await window.nb.inference.run(network.id, { input: encoded });
         if (!result || result.kind !== 'classification') {
           predEl.textContent = 'Unexpected result from model.'; return;
         }
-        const top = await nc.invoke('chess:topLegalMoves', fen, result.probs);
+        const top = await nb.invoke('chess:topLegalMoves', fen, result.probs);
         lastPrediction = top[0] || null;
 
         if (lastPrediction) {
@@ -502,7 +502,7 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
 
     async function applyUCI(uci) {
       try {
-        fen = await nc.invoke('chess:applyMove', fen, uci);
+        fen = await nb.invoke('chess:applyMove', fen, uci);
         el('ci-fen').value = fen;
         selectedSq = null; highlights = {}; lastPrediction = null; pseudoLegal = [];
         refreshBoard();
@@ -535,7 +535,7 @@ d2d4 d7d5 c2c4 e7e6 b1c3 g8f6</code>
         selectedSq = sqIdx;
         highlights = { [sqIdx]: 'sel' };
         try {
-          const legalUci = await nc.invoke('chess:legalMoves', fen);
+          const legalUci = await nb.invoke('chess:legalMoves', fen);
           const fromName = sqName(sqIdx);
           pseudoLegal = legalUci.filter(m => m.startsWith(fromName));
           for (const m of pseudoLegal) {

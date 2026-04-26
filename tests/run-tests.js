@@ -620,7 +620,7 @@ async function testParallelTrainerProducesValidModel() {
 }
 
 (async () => {
-  console.log('NeuralCity engine tests');
+  console.log('NeuralCabin engine tests');
   try {
     await testTensor();
     await testMLP();

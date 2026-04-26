@@ -12,9 +12,9 @@ const pluginTemplate = {
   description: "Train a neural network to predict chess moves. Upload UCI game files, then play against the AI for both sides.",
   mainCode: mainCode,
   rendererCode: rendererCode,
-  author: "NeuralCity"
+  author: "NeuralCabin"
 };
 
 // Convert to a properly escaped JSON string and save it
-fs.writeFileSync('chess.ncpl', JSON.stringify(pluginTemplate, null, 2));
-console.log('Successfully created chess.ncpl!');
+fs.writeFileSync('chess.nbpl', JSON.stringify(pluginTemplate, null, 2));
+console.log('Successfully created chess.nbpl!');

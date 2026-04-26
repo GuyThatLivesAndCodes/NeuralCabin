@@ -1,10 +1,10 @@
-window.NC_DOCS = [
+window.NB_DOCS = [
   {
     id: 'welcome',
     title: 'Welcome',
     body: `
-<h1>Welcome to NeuralCity</h1>
-<p>NeuralCity is a self-contained neural network platform built entirely in plain JavaScript — no NumPy, no TensorFlow, no PyTorch. Every tensor operation, every gradient computation, and every optimizer step runs on readable source code you can inspect, modify, and learn from. The full engine is available at <a href="https://github.com/GuyThatLivesAndCodes/NeuralCity" target="_blank">github.com/GuyThatLivesAndCodes/NeuralCity</a>.</p>
+<h1>Welcome to NeuralCabin</h1>
+<p>NeuralCabin is a self-contained neural network platform built entirely in plain JavaScript — no NumPy, no TensorFlow, no PyTorch. Every tensor operation, every gradient computation, and every optimizer step runs on readable source code you can inspect, modify, and learn from. The full engine is available at <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">github.com/GuyThatLivesAndCodes/NeuralCabin</a>.</p>
 <p>The engine is approximately <strong>2,000 lines of plain JavaScript</strong> — small enough to read in an afternoon, powerful enough to train real classifiers, regressors, character language models, and multi-turn chat assistants. There is no compilation step, no virtual environment, and no external runtime dependency beyond Node.js and Electron.</p>
 <p>Select a topic from the left sidebar to explore the engine internals, learn how to design and train networks, understand the training data formats, use the HTTP API, script experiments with NeuralScript, and more.</p>
 
@@ -30,7 +30,7 @@ window.NC_DOCS = [
 </table>
 
 <h2>Templates</h2>
-<p>NeuralCity ships with five built-in templates to get you started immediately:</p>
+<p>NeuralCabin ships with five built-in templates to get you started immediately:</p>
 <table>
 <tr><th>Template</th><th>Type</th><th>Description</th></tr>
 <tr><td>XOR Classifier</td><td>Classifier</td><td>Learns the XOR function. Trains in &lt;1 second. Use as a smoke test for any engine change.</td></tr>
@@ -50,7 +50,7 @@ window.NC_DOCS = [
 
 <h2>1. Forward pass</h2>
 <p>An input vector <code>x</code> flows through each layer in sequence. A <strong>Linear</strong> layer computes <code>y = x·W + b</code> — a matrix multiply followed by a bias add. An <strong>Activation</strong> function such as <code>ReLU</code> then applies a non-linearity (for ReLU, clamping every negative value to zero). Stacking enough Linear + Activation pairs gives the network the capacity to approximate arbitrary continuous functions — this is the universal approximation property.</p>
-<p>In NeuralCity, every operation during the forward pass records its input tensors on the output tensor's <code>_parents</code> list and stores a <code>_backward</code> function that knows how to propagate gradients backward through that specific operation. This builds the <strong>computation graph</strong> dynamically — there is no separate graph-compilation step.</p>
+<p>In NeuralCabin, every operation during the forward pass records its input tensors on the output tensor's <code>_parents</code> list and stores a <code>_backward</code> function that knows how to propagate gradients backward through that specific operation. This builds the <strong>computation graph</strong> dynamically — there is no separate graph-compilation step.</p>
 
 <h2>2. Loss computation</h2>
 <p>After the forward pass, the network's output is compared to the ground-truth target to produce a single scalar number called the <strong>loss</strong>. A lower loss means better predictions. Two loss functions are implemented:</p>
@@ -60,7 +60,7 @@ window.NC_DOCS = [
 </ul>
 
 <h2>3. Backward pass (autograd)</h2>
-<p>NeuralCity implements <strong>reverse-mode automatic differentiation</strong> (backpropagation). Calling <code>loss.backward()</code> traverses the computation graph in reverse topological order and applies the chain rule at each node to accumulate <code>∂loss/∂W</code> and <code>∂loss/∂b</code> for every trainable parameter.</p>
+<p>NeuralCabin implements <strong>reverse-mode automatic differentiation</strong> (backpropagation). Calling <code>loss.backward()</code> traverses the computation graph in reverse topological order and applies the chain rule at each node to accumulate <code>∂loss/∂W</code> and <code>∂loss/∂b</code> for every trainable parameter.</p>
 <p>The traversal is implemented in <code>Tensor.backward()</code>:</p>
 <ol>
   <li>Build the topological order by recursively walking <code>_parents</code> (DFS, deduplication by <code>id</code>).</li>
@@ -70,7 +70,7 @@ window.NC_DOCS = [
 <p>Each operator — <code>matmul</code>, <code>relu</code>, <code>gelu</code>, <code>softmax</code>, <code>embedding</code>, and others — implements its own local derivative. You can read every one of them in <code>src/engine/tensor.js</code>.</p>
 
 <h2>4. Optimizer step</h2>
-<p>After backward, every parameter has a populated <code>.grad</code> array. The optimizer uses these gradients to update the parameters. NeuralCity ships ten optimizers (see the <strong>Optimizers</strong> reference section for full details):</p>
+<p>After backward, every parameter has a populated <code>.grad</code> array. The optimizer uses these gradients to update the parameters. NeuralCabin ships ten optimizers (see the <strong>Optimizers</strong> reference section for full details):</p>
 <ul>
   <li><strong>SGD</strong> — momentum-based gradient descent; simple and predictable baseline.</li>
   <li><strong>Adam</strong> — adaptive per-parameter learning rates via first and second gradient moments; the standard default for most tasks.</li>
@@ -86,14 +86,14 @@ window.NC_DOCS = [
 <p>All optimizer state (moments, slow weights, step counters) is saved alongside the network weights and restored automatically when training resumes. After the optimizer updates the weights, gradients are zeroed via <code>zeroGrad()</code> before the next batch begins.</p>
 
 <h2>5. The training loop</h2>
-<p>NeuralCity's trainer repeats the following for each epoch:</p>
+<p>NeuralCabin's trainer repeats the following for each epoch:</p>
 <ol>
   <li>Shuffle the dataset (using the seeded RNG if a seed is set).</li>
   <li>Slice into mini-batches of the configured <code>batchSize</code>.</li>
   <li>For each batch: zero gradients → forward pass → loss → backward → optimizer step.</li>
   <li>Record the mean epoch loss and emit it to the live chart.</li>
 </ol>
-<p>This is the complete training loop. Nothing more is needed to train the models NeuralCity supports.</p>
+<p>This is the complete training loop. Nothing more is needed to train the models NeuralCabin supports.</p>
 
 <h2>Reproducibility and seeding</h2>
 <p>Setting a <strong>seed</strong> in the Editor tab makes every stochastic step deterministic: weight initialization (Kaiming / scaled Gaussian via Box-Muller), dataset shuffle order, dropout masks, and character-LM temperature sampling all use the same Mulberry32 seeded RNG. Two runs with the same seed, architecture, data, and hyperparameters produce byte-identical results. Omit the seed for non-deterministic runs.</p>
@@ -104,7 +104,7 @@ window.NC_DOCS = [
     title: 'Tensor engine internals',
     body: `
 <h1>Tensor engine internals</h1>
-<p>All computation in NeuralCity is built on the <code>Tensor</code> class defined in <code>src/engine/tensor.js</code>. Understanding this class is the key to understanding everything else.</p>
+<p>All computation in NeuralCabin is built on the <code>Tensor</code> class defined in <code>src/engine/tensor.js</code>. Understanding this class is the key to understanding everything else.</p>
 
 <h2>The Tensor class</h2>
 <p>A <code>Tensor</code> holds three things:</p>
@@ -211,7 +211,7 @@ window.NC_DOCS = [
     title: 'Optimizers',
     body: `
 <h1>Optimizers</h1>
-<p>The optimizer updates the network's weights after each backward pass using the accumulated gradients. NeuralCity provides ten optimizers. All optimizer state (momentum buffers, variance estimates, slow weights) is saved alongside the model weights so training can resume without a warmup bump.</p>
+<p>The optimizer updates the network's weights after each backward pass using the accumulated gradients. NeuralCabin provides ten optimizers. All optimizer state (momentum buffers, variance estimates, slow weights) is saved alongside the model weights so training can resume without a warmup bump.</p>
 
 <h2>SGD — Stochastic Gradient Descent</h2>
 <p>The simplest baseline. Subtracts a scaled gradient from each weight, with optional momentum:</p>
@@ -491,7 +491,7 @@ W ← W − v</code></pre>
     title: 'Tokenizer',
     body: `
 <h1>Tokenizer</h1>
-<p>NeuralCity uses a <strong>character-level tokenizer</strong>. Every unique character in the training corpus becomes a token — there is no subword splitting or BPE. This keeps the implementation simple and the vocabulary fully interpretable, at the cost of longer sequence lengths compared to word-piece tokenizers.</p>
+<p>NeuralCabin uses a <strong>character-level tokenizer</strong>. Every unique character in the training corpus becomes a token — there is no subword splitting or BPE. This keeps the implementation simple and the vocabulary fully interpretable, at the cost of longer sequence lengths compared to word-piece tokenizers.</p>
 
 <h2>Vocabulary construction</h2>
 <p>When a character LM or chat model is trained, the tokenizer scans the full training corpus and builds a sorted list of unique characters. Four special tokens are added automatically:</p>
@@ -524,7 +524,7 @@ W ← W − v</code></pre>
     title: 'NeuralScript language',
     body: `
 <h1>NeuralScript</h1>
-<p>NeuralScript is a lightweight scripting language built into NeuralCity for running experiments programmatically. It uses <code>do</code>/<code>end</code> blocks for all compound statements, requires no semicolons, and supports first-class neural operations (<code>build</code>, <code>train</code>, <code>predict</code>) as standard library functions.</p>
+<p>NeuralScript is a lightweight scripting language built into NeuralCabin for running experiments programmatically. It uses <code>do</code>/<code>end</code> blocks for all compound statements, requires no semicolons, and supports first-class neural operations (<code>build</code>, <code>train</code>, <code>predict</code>) as standard library functions.</p>
 <p>NeuralScript programs run in the <strong>Script</strong> tab. Output from <code>print</code> appears in the console panel below the editor. Async operations (training) must be awaited with <code>await()</code>.</p>
 
 <h2>Variables</h2>
@@ -755,7 +755,7 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
     title: 'Encryption',
     body: `
 <h1>Encrypting a network</h1>
-<p>NeuralCity supports optional AES-256-GCM encryption at rest for any saved network. The weights, optimizer state, and tokenizer are serialized into a single bundle, then encrypted using a key derived from your passphrase via <strong>scrypt</strong>. The passphrase is never stored — only the encrypted ciphertext and the scrypt salt and nonce are written to disk.</p>
+<p>NeuralCabin supports optional AES-256-GCM encryption at rest for any saved network. The weights, optimizer state, and tokenizer are serialized into a single bundle, then encrypted using a key derived from your passphrase via <strong>scrypt</strong>. The passphrase is never stored — only the encrypted ciphertext and the scrypt salt and nonce are written to disk.</p>
 
 <h2>Enabling encryption</h2>
 <ol>
@@ -776,7 +776,7 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
 </table>
 
 <h2>Key loss is total loss</h2>
-<p>NeuralCity never stores or escrows the passphrase. If it is lost, the weights are unrecoverable by design. Back up the passphrase separately from the network file.</p>
+<p>NeuralCabin never stores or escrows the passphrase. If it is lost, the weights are unrecoverable by design. Back up the passphrase separately from the network file.</p>
 
 <h2>When to use encryption</h2>
 <p>Encryption at rest is worth enabling whenever a model has been trained on sensitive data — personal chat logs, confidential business content, or any corpus you would not want disclosed if the machine were lost or compromised. The overhead at load time (the scrypt derivation) is a one-time cost of roughly 100–500ms on modern hardware.</p>
@@ -789,13 +789,13 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
 <h1>No frameworks. No abstraction tax.</h1>
 <p>Production ML frameworks — PyTorch, TensorFlow, JAX — are built for scale and generality. That means they sit behind tens of thousands of lines of kernel dispatch code, custom CUDA ops, and multi-level JIT compilation infrastructure. The depth is appropriate when you're training billion-parameter models on distributed GPU clusters. For understanding what a network is actually doing at the arithmetic level, or for small to medium models where none of that infrastructure provides any benefit, it's just noise standing between you and the computation.</p>
 
-<p>The NeuralCity engine (see <a href="https://github.com/GuyThatLivesAndCodes/NeuralCity" target="_blank">the source</a>) is approximately <strong>2,000 lines of plain JavaScript</strong>. You can open <code>src/engine/tensor.js</code> and read the entire autograd system in one sitting. You can trace a gradient backward through a specific operation, verify the chain rule application by hand, and confirm it matches what the code computes. You can add a new activation function in ten lines. You can swap in a different optimizer and watch it change the loss curve. Nothing is hidden.</p>
+<p>The NeuralCabin engine (see <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">the source</a>) is approximately <strong>2,000 lines of plain JavaScript</strong>. You can open <code>src/engine/tensor.js</code> and read the entire autograd system in one sitting. You can trace a gradient backward through a specific operation, verify the chain rule application by hand, and confirm it matches what the code computes. You can add a new activation function in ten lines. You can swap in a different optimizer and watch it change the loss curve. Nothing is hidden.</p>
 
 <h2>What you trade away</h2>
 <ul>
   <li><strong>No GPU acceleration.</strong> All computation runs on CPU in JavaScript. This is sufficient for networks up to a few million parameters — XOR to small char LMs. Larger models will be slow.</li>
   <li><strong>No distributed training.</strong> Single machine, single process. Intentional.</li>
-  <li><strong>No automatic mixed precision, gradient checkpointing, or FSDP.</strong> Not needed at NeuralCity's scale.</li>
+  <li><strong>No automatic mixed precision, gradient checkpointing, or FSDP.</strong> Not needed at NeuralCabin's scale.</li>
   <li><strong>No Transformer blocks out of the box.</strong> The primitives (matmul, embedding, softmax, gelu) are all present, and NeuralScript can compose them, but there is no pre-built attention layer.</li>
 </ul>
 
@@ -809,7 +809,7 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
 </ul>
 
 <h2>Who this is for</h2>
-<p>NeuralCity is well suited for: learning how neural networks work at the implementation level; rapid prototyping of small models without framework setup overhead; training personal conversational models on local data with no cloud involvement; embedding a neural inference engine in an Electron application; and anyone who finds that black-box tools obscure more than they reveal.</p>
+<p>NeuralCabin is well suited for: learning how neural networks work at the implementation level; rapid prototyping of small models without framework setup overhead; training personal conversational models on local data with no cloud involvement; embedding a neural inference engine in an Electron application; and anyone who finds that black-box tools obscure more than they reveal.</p>
 <p>It is not suited for: training large language models, computer vision at scale, production deployment requiring GPU throughput, or any task where PyTorch or JAX would provide meaningful performance or capability advantages. Use the right tool for the job.</p>
 `
   },
@@ -818,17 +818,17 @@ const second = await chat(first.sessionId, 'Tell me more.');</code></pre>
     title: 'Architecture design tips',
     body: `
 <h1>Architecture design tips</h1>
-<p>Choosing a network architecture is partly science and partly empirical. These guidelines apply to the model sizes NeuralCity is designed for.</p>
+<p>Choosing a network architecture is partly science and partly empirical. These guidelines apply to the model sizes NeuralCabin is designed for.</p>
 
 <h2>Start small, then scale up</h2>
 <p>Resist the temptation to build a large network immediately. A 2-hidden-layer network with 32 units per layer will train fast, converge reliably, and tell you quickly whether the task is learnable. If training loss stalls at an unacceptably high value after full convergence, then add capacity. If training loss is good but the model behaves poorly at inference, the problem is usually data quality or quantity, not capacity.</p>
 
 <h2>Depth vs. width</h2>
-<p>For most tasks NeuralCity handles, 2–3 hidden layers is sufficient. Adding more layers adds representational depth but also adds vanishing gradient risk and slower convergence. For classification of moderately non-linear data (2D spiral), go deeper (3 layers) before going wider. For regression over smooth functions, width matters more than depth.</p>
+<p>For most tasks NeuralCabin handles, 2–3 hidden layers is sufficient. Adding more layers adds representational depth but also adds vanishing gradient risk and slower convergence. For classification of moderately non-linear data (2D spiral), go deeper (3 layers) before going wider. For regression over smooth functions, width matters more than depth.</p>
 
 <h2>Activation choice</h2>
 <ul>
-  <li>Use <strong>ReLU</strong> as the default for classifiers and most regressors. It trains fast and rarely causes problems at NeuralCity's scale.</li>
+  <li>Use <strong>ReLU</strong> as the default for classifiers and most regressors. It trains fast and rarely causes problems at NeuralCabin's scale.</li>
   <li>Use <strong>GELU</strong> for language models and chat assistants — it provides smoother gradients and is standard in LM architectures.</li>
   <li>Use <strong>tanh</strong> for small regressors where bounded output in the hidden layers is desirable.</li>
   <li>Never use <strong>softmax</strong> in a hidden layer. It is only appropriate as a final output activation for classification heads.</li>
@@ -862,7 +862,7 @@ dropout:    0.1</code></pre>
     title: 'Storage and persistence',
     body: `
 <h1>Storage and persistence</h1>
-<p>NeuralCity saves all network state to the local filesystem. No data is sent to any remote server at any point.</p>
+<p>NeuralCabin saves all network state to the local filesystem. No data is sent to any remote server at any point.</p>
 
 <h2>What is saved</h2>
 <p>When a network is saved (either manually or after training), the following are serialized to a single JSON file:</p>
@@ -875,27 +875,27 @@ dropout:    0.1</code></pre>
 </ul>
 
 <h2>File location</h2>
-<p>Network files are stored in the application data directory, managed by Electron's <code>userData</code> path. On Windows this is typically <code>%APPDATA%\NeuralCity\networks\</code>. You can open a network file in any text editor to inspect the raw JSON (or ciphertext, if encrypted).</p>
+<p>Network files are stored in the application data directory, managed by Electron's <code>userData</code> path. On Windows this is typically <code>%APPDATA%\NeuralCabin\networks\</code>. You can open a network file in any text editor to inspect the raw JSON (or ciphertext, if encrypted).</p>
 
 <h2>Encryption at rest</h2>
 <p>See the <strong>Encryption</strong> topic for full details. Summary: when encryption is enabled, the serialized JSON is encrypted with AES-256-GCM before writing to disk. The passphrase is never stored.</p>
 
 <h2>Exporting and importing</h2>
-<p>Network files are portable — copy them to another machine running NeuralCity and load them via the Networks sidebar. Architecture, weights, tokenizer, and optimizer state all transfer together.</p>
+<p>Network files are portable — copy them to another machine running NeuralCabin and load them via the Networks sidebar. Architecture, weights, tokenizer, and optimizer state all transfer together.</p>
 
 <h2>Resuming training</h2>
 <p>Because Adam's optimizer state is persisted, you can stop training at epoch 500, close the application, reopen it, and continue from epoch 501 with the same optimizer momentum. The loss curve continues from where it left off. SGD has no persisted state (no momentum), so resuming with SGD is equivalent to a fresh optimizer start on the existing weights.</p>
 `
   },
   {
-    id: 'ncpl-intro',
-    title: 'Plugin system (.ncpl)',
+    id: 'nbpl-intro',
+    title: 'Plugin system (.nbpl)',
     body: `
-<h1>The NeuralCity Plugin System</h1>
-<p>NeuralCity's plugin system lets you extend the application with new model templates, custom training-data editors, and custom inference UIs — all delivered as a single portable file with the <code>.ncpl</code> extension. Plugins can run logic in the main (Node.js) process and render custom UI in the renderer process, communicating over Electron's IPC bridge.</p>
+<h1>The NeuralCabin Plugin System</h1>
+<p>NeuralCabin's plugin system lets you extend the application with new model templates, custom training-data editors, and custom inference UIs — all delivered as a single portable file with the <code>.nbpl</code> extension. Plugins can run logic in the main (Node.js) process and render custom UI in the renderer process, communicating over Electron's IPC bridge.</p>
 
-<h2>The .ncpl file format</h2>
-<p>A <code>.ncpl</code> file is plain JSON. It requires no compression or binary packaging — open any <code>.ncpl</code> in a text editor to inspect or modify it.</p>
+<h2>The .nbpl file format</h2>
+<p>A <code>.nbpl</code> file is plain JSON. It requires no compression or binary packaging — open any <code>.nbpl</code> in a text editor to inspect or modify it.</p>
 <pre><code>{
   "id":          "my-plugin",
   "name":        "My Plugin",
@@ -919,38 +919,38 @@ dropout:    0.1</code></pre>
 </table>
 
 <h2>How plugins are stored</h2>
-<p>When you install a <code>.ncpl</code> file, the installer extracts the JSON fields and writes them to the user's application data directory:</p>
-<pre><code>%APPDATA%/NeuralCity/
+<p>When you install a <code>.nbpl</code> file, the installer extracts the JSON fields and writes them to the user's application data directory:</p>
+<pre><code>%APPDATA%/NeuralCabin/
 └── plugins/
     └── my-plugin/
         ├── manifest.json    ← id, name, version, description, author
         ├── main.js          ← extracted mainCode
         └── renderer.js      ← extracted rendererCode</code></pre>
-<p>The plugin directory layout mirrors the built-in <code>src/plugins/</code> directory in the NeuralCity source tree. Bundled example plugins (such as the Chess plugin) are seeded into this directory on every app launch, ensuring the latest version is always present.</p>
+<p>The plugin directory layout mirrors the built-in <code>src/plugins/</code> directory in the NeuralCabin source tree. Bundled example plugins (such as the Chess plugin) are seeded into this directory on every app launch, ensuring the latest version is always present.</p>
 
 <h2>Plugin loading lifecycle</h2>
 <ol>
   <li><strong>Startup</strong> — <code>PluginLoader.load(ipcMain)</code> scans every subdirectory of the plugins folder, reads <code>manifest.json</code> and <code>renderer.js</code>, and <code>require()</code>s <code>main.js</code>. Any IPC handlers exported from <code>mainHandlers</code> are registered at this point.</li>
-  <li><strong>Renderer init</strong> — <code>initPlugins()</code> in the renderer calls <code>window.nc.plugins.list()</code>, iterates each plugin's <code>rendererCode</code>, and evaluates it via <code>new Function('api', code)(api)</code>. Templates, inference renderers, and train editors registered here become immediately usable.</li>
+  <li><strong>Renderer init</strong> — <code>initPlugins()</code> in the renderer calls <code>window.nb.plugins.list()</code>, iterates each plugin's <code>rendererCode</code>, and evaluates it via <code>new Function('api', code)(api)</code>. Templates, inference renderers, and train editors registered here become immediately usable.</li>
   <li><strong>Install / uninstall</strong> — Installs write files to disk; uninstalls remove them. Neither operation hot-reloads plugins. A manual restart is required to apply the changes.</li>
 </ol>
 
 <h2>IPC namespacing</h2>
 <p>Each plugin's main-process handlers are registered under a namespaced channel: <code>plugin:&lt;id&gt;:&lt;channel&gt;</code>. For example, if the chess plugin exports <code>mainHandlers['chess:encodePosition']</code>, it is registered as <code>plugin:chess:chess:encodePosition</code>. From the renderer, call it via:</p>
-<pre><code>nc.invoke('chess:encodePosition', fen)
-// equivalent to: window.nc.plugins.invoke('chess', 'chess:encodePosition', fen)</code></pre>
-<p>The <code>nc</code> object is the namespaced invoke helper provided to your renderer code by the plugin registry — it automatically prepends your plugin's ID.</p>
+<pre><code>nb.invoke('chess:encodePosition', fen)
+// equivalent to: window.nb.plugins.invoke('chess', 'chess:encodePosition', fen)</code></pre>
+<p>The <code>nb</code> object is the namespaced invoke helper provided to your renderer code by the plugin registry — it automatically prepends your plugin's ID.</p>
 
 <h2>Security model</h2>
-<p>Plugin <code>mainCode</code> runs with full Node.js access in the Electron main process — treat it like any application code you install. Plugin <code>rendererCode</code> is evaluated in the renderer with <code>unsafe-eval</code> allowed in the CSP; it has access to the renderer's <code>window</code> object but not to Node.js APIs directly. All main-process calls must go through the <code>nc.invoke()</code> bridge.</p>
+<p>Plugin <code>mainCode</code> runs with full Node.js access in the Electron main process — treat it like any application code you install. Plugin <code>rendererCode</code> is evaluated in the renderer with <code>unsafe-eval</code> allowed in the CSP; it has access to the renderer's <code>window</code> object but not to Node.js APIs directly. All main-process calls must go through the <code>nb.invoke()</code> bridge.</p>
 `
   },
   {
-    id: 'ncpl-dev-guide',
+    id: 'nbpl-dev-guide',
     title: 'Building a plugin',
     body: `
-<h1>Building a NeuralCity Plugin</h1>
-<p>This guide walks through creating a complete plugin from scratch — defining main-process logic, writing a renderer UI, packaging it as a <code>.ncpl</code> file, and testing it in the app.</p>
+<h1>Building a NeuralCabin Plugin</h1>
+<p>This guide walks through creating a complete plugin from scratch — defining main-process logic, writing a renderer UI, packaging it as a <code>.nbpl</code> file, and testing it in the app.</p>
 
 <h2>1. Plan your plugin</h2>
 <p>Every plugin can contribute up to three things:</p>
@@ -974,7 +974,7 @@ function doSomethingExpensive(data) {
 module.exports = {
   mainHandlers: {
     // Channel name is a free-form string; namespaced automatically by the loader.
-    // Called from renderer via: nc.invoke('my-plugin:process', data)
+    // Called from renderer via: nb.invoke('my-plugin:process', data)
     'my-plugin:process': (_, data) => doSomethingExpensive(data),
 
     // Handlers are plain async functions — return a Promise to resolve it.
@@ -1017,27 +1017,27 @@ module.exports = {
 
   // ── 2. Register a custom training editor ───────────────────────────────
   // 'my-plugin' matches arch.pluginKind above
-  api.registerTrainEditor('my-plugin', function (root, network, nc) {
+  api.registerTrainEditor('my-plugin', function (root, network, nb) {
     root.innerHTML = '&lt;button id="my-upload-btn"&gt;Upload data&lt;/button&gt;';
 
     document.getElementById('my-upload-btn').addEventListener('click', async () => {
-      const file = await window.nc.dialog.readTextFile({
+      const file = await window.nb.dialog.readTextFile({
         filters: [{ name: 'Text', extensions: ['txt'] }]
       });
       if (!file) return;
 
       // Call a main-process handler to parse the file
-      const parsed = await nc.invoke('my-plugin:process', file.content);
+      const parsed = await nb.invoke('my-plugin:process', file.content);
 
       // Save samples back to the network
-      await window.nc.networks.update(network.id, {
+      await window.nb.networks.update(network.id, {
         trainingData: { samples: parsed.samples }
       });
     });
   });
 
   // ── 3. Register a custom inference renderer ────────────────────────────
-  api.registerInferenceRenderer('my-plugin', function (root, network, nc) {
+  api.registerInferenceRenderer('my-plugin', function (root, network, nb) {
     const isTrained = !!(network.state || network.stateLocked);
 
     root.innerHTML = \`
@@ -1052,24 +1052,24 @@ module.exports = {
     document.getElementById('my-predict').addEventListener('click', async () => {
       const rawInput = document.getElementById('my-input').value;
       // Encode via main-process handler
-      const encoded = await nc.invoke('my-plugin:process', rawInput);
+      const encoded = await nb.invoke('my-plugin:process', rawInput);
       // Run inference through the engine
-      const result = await window.nc.inference.run(network.id, { input: encoded.vector });
+      const result = await window.nb.inference.run(network.id, { input: encoded.vector });
       document.getElementById('my-result').textContent = JSON.stringify(result);
     });
   });
 
 })(api); // api is injected by the plugin registry</code></pre>
 
-<h2>4. Package as a .ncpl file</h2>
+<h2>4. Package as a .nbpl file</h2>
 <p>Read <code>main.js</code> and <code>renderer.js</code>, embed them as JSON strings, and write the combined manifest:</p>
-<pre><code>// build-ncpl.js — run with: node build-ncpl.js
+<pre><code>// build-nbpl.js — run with: node build-nbpl.js
 const fs = require('fs');
 
 const mainCode     = fs.readFileSync('main.js', 'utf-8');
 const rendererCode = fs.readFileSync('renderer.js', 'utf-8');
 
-const ncpl = {
+const nbpl = {
   id:          'my-plugin',
   name:        'My Custom Model',
   version:     '1.0.0',
@@ -1079,19 +1079,19 @@ const ncpl = {
   rendererCode
 };
 
-fs.writeFileSync('my-plugin.ncpl', JSON.stringify(ncpl, null, 2));
-console.log('Wrote my-plugin.ncpl');</code></pre>
+fs.writeFileSync('my-plugin.nbpl', JSON.stringify(nbpl, null, 2));
+console.log('Wrote my-plugin.nbpl');</code></pre>
 <p>Alternatively, build the JSON manually in any text editor — it is just a JSON object with two large string fields.</p>
 
 <h2>5. Testing during development</h2>
 <p>The fastest workflow avoids packaging entirely:</p>
 <ol>
-  <li>Create a directory <code>src/plugins/my-plugin/</code> in the NeuralCity source tree.</li>
+  <li>Create a directory <code>src/plugins/my-plugin/</code> in the NeuralCabin source tree.</li>
   <li>Add <code>manifest.json</code>, <code>main.js</code>, and <code>renderer.js</code> as separate files.</li>
   <li>The <code>seedBuiltins</code> method copies everything from <code>src/plugins/</code> to the user's plugin directory on every launch, so your changes are picked up automatically on restart.</li>
   <li>Launch with <code>npm start</code>. Your plugin is live after the renderer initializes.</li>
 </ol>
-<p>For production, package as a <code>.ncpl</code> and install via the Plugins tab → Install Plugin.</p>
+<p>For production, package as a <code>.nbpl</code> and install via the Plugins tab → Install Plugin.</p>
 
 <h2>Common pitfalls</h2>
 <table>
@@ -1099,20 +1099,20 @@ console.log('Wrote my-plugin.ncpl');</code></pre>
 <tr><td>Plugin not visible after install</td><td>Needs restart</td><td>Restart the app — plugin system loads at startup only</td></tr>
 <tr><td>Inference renderer never called</td><td><code>pluginKind</code> mismatch</td><td>Ensure <code>arch.pluginKind</code> in the template matches the key passed to <code>registerInferenceRenderer()</code></td></tr>
 <tr><td>Train editor not shown</td><td>Same mismatch</td><td>Same fix — <code>registerTrainEditor('my-plugin', ...)</code> key must equal <code>arch.pluginKind</code></td></tr>
-<tr><td>Main handler returns undefined</td><td>Channel name wrong</td><td>Channel passed to <code>nc.invoke()</code> must exactly match a key in <code>mainHandlers</code></td></tr>
+<tr><td>Main handler returns undefined</td><td>Channel name wrong</td><td>Channel passed to <code>nb.invoke()</code> must exactly match a key in <code>mainHandlers</code></td></tr>
 <tr><td>Error: "Plugin renderer failed"</td><td>JavaScript error in rendererCode</td><td>Open DevTools (launch with <code>--dev</code> flag) and check the console for the stack trace</td></tr>
 </table>
 `
   },
   {
-    id: 'ncpl-api-ref',
+    id: 'nbpl-api-ref',
     title: 'Plugin API reference',
     body: `
 <h1>Plugin API Reference</h1>
-<p>This page documents every API available to plugin code: the <code>api</code> object available in <code>rendererCode</code>, the <code>nc</code> invoke helper, the <code>window.nc</code> APIs accessible from renderer plugins, and the <code>mainHandlers</code> export format for <code>mainCode</code>.</p>
+<p>This page documents every API available to plugin code: the <code>api</code> object available in <code>rendererCode</code>, the <code>nb</code> invoke helper, the <code>window.nb</code> APIs accessible from renderer plugins, and the <code>mainHandlers</code> export format for <code>mainCode</code>.</p>
 
 <h2>api object (rendererCode)</h2>
-<p>The <code>api</code> object is the sole argument passed to your renderer code. It is the only sanctioned way to hook into the NeuralCity UI from a plugin.</p>
+<p>The <code>api</code> object is the sole argument passed to your renderer code. It is the only sanctioned way to hook into the NeuralCabin UI from a plugin.</p>
 
 <h3>api.registerTemplate(template)</h3>
 <p>Adds a network template to the global template list. Templates appear in the "New Network" modal under the "Plugin Models" category.</p>
@@ -1130,25 +1130,25 @@ console.log('Wrote my-plugin.ncpl');</code></pre>
 
 <h3>api.registerTrainEditor(pluginKind, fn)</h3>
 <p>Registers a custom training data editor for networks whose <code>arch.pluginKind</code> matches <code>pluginKind</code>. The editor replaces the default JSON textarea on the Train tab.</p>
-<pre><code>api.registerTrainEditor('my-plugin', function (root, network, nc) {
+<pre><code>api.registerTrainEditor('my-plugin', function (root, network, nb) {
   // root   — HTMLElement container to render into (empty on entry)
   // network — the full network object (id, name, architecture, trainingData, …)
-  // nc     — the namespaced invoke helper for this plugin
+  // nb     — the namespaced invoke helper for this plugin
 });</code></pre>
-<p>The <code>root</code> element is a <code>div</code> with id <code>plugin-train-editor</code>. Set <code>root.innerHTML</code> to render your UI. Use <code>window.nc.networks.update(network.id, patch)</code> to persist changes.</p>
+<p>The <code>root</code> element is a <code>div</code> with id <code>plugin-train-editor</code>. Set <code>root.innerHTML</code> to render your UI. Use <code>window.nb.networks.update(network.id, patch)</code> to persist changes.</p>
 
 <h3>api.registerInferenceRenderer(pluginKind, fn)</h3>
 <p>Registers a custom inference UI for networks whose <code>arch.pluginKind</code> matches <code>pluginKind</code>. Replaces the entire Inference tab content for those networks.</p>
-<pre><code>api.registerInferenceRenderer('my-plugin', function (root, network, nc) {
+<pre><code>api.registerInferenceRenderer('my-plugin', function (root, network, nb) {
   // root   — HTMLElement to render into (cleared on entry)
   // network — full network object; check network.state to determine if trained
-  // nc     — namespaced invoke helper
+  // nb     — namespaced invoke helper
 });</code></pre>
 <p><strong>Note:</strong> The inference renderer is shown even for untrained networks. Check <code>!!(network.state || network.stateLocked)</code> to determine whether to enable AI-dependent buttons.</p>
 
 <h3>api.invoke(channel, ...args)</h3>
-<p>Calls a main-process handler registered under the plugin's own <code>mainHandlers</code>. This is a convenience alias for <code>window.nc.plugins.invoke(pluginId, channel, ...args)</code>.</p>
-<pre><code>const result = await nc.invoke('my-plugin:doWork', payload);</code></pre>
+<p>Calls a main-process handler registered under the plugin's own <code>mainHandlers</code>. This is a convenience alias for <code>window.nb.plugins.invoke(pluginId, channel, ...args)</code>.</p>
+<pre><code>const result = await nb.invoke('my-plugin:doWork', payload);</code></pre>
 <p>The channel string must exactly match a key in <code>mainHandlers</code>. Returns a Promise resolving to the handler's return value.</p>
 
 <hr>
@@ -1158,7 +1158,7 @@ console.log('Wrote my-plugin.ncpl');</code></pre>
 <pre><code>module.exports = {
   mainHandlers: {
     // First arg is always the Electron IpcMainInvokeEvent (usually unused).
-    // Remaining args are what the renderer passed to nc.invoke().
+    // Remaining args are what the renderer passed to nb.invoke().
     'my-plugin:doWork': (event, payload) => {
       return processPayload(payload); // return value goes back to renderer
     },
@@ -1172,10 +1172,10 @@ console.log('Wrote my-plugin.ncpl');</code></pre>
 
 <hr>
 
-<h2>window.nc APIs available to renderer plugins</h2>
-<p>Plugin renderer code runs in the Electron renderer context and has access to the full <code>window.nc</code> bridge.</p>
+<h2>window.nb APIs available to renderer plugins</h2>
+<p>Plugin renderer code runs in the Electron renderer context and has access to the full <code>window.nb</code> bridge.</p>
 
-<h3>window.nc.inference.run(networkId, input)</h3>
+<h3>window.nb.inference.run(networkId, input)</h3>
 <p>Runs a forward pass through a trained network. Returns a Promise.</p>
 <table>
 <tr><th>input field</th><th>Used for</th><th>Type</th></tr>
@@ -1185,23 +1185,23 @@ console.log('Wrote my-plugin.ncpl');</code></pre>
 </table>
 <p>Return value for classifiers: <code>{ kind: 'classification', label, labelIndex, confidence, probs: number[] }</code>. The <code>probs</code> array has one entry per output class.</p>
 
-<h3>window.nc.networks.update(networkId, patch)</h3>
+<h3>window.nb.networks.update(networkId, patch)</h3>
 <p>Merges <code>patch</code> into the saved network object. Use this to persist training data after parsing:</p>
-<pre><code>await window.nc.networks.update(network.id, {
+<pre><code>await window.nb.networks.update(network.id, {
   trainingData: { samples: parsedSamples }
 });</code></pre>
 
-<h3>window.nc.dialog.readTextFile(options)</h3>
+<h3>window.nb.dialog.readTextFile(options)</h3>
 <p>Shows a native open-file dialog and returns the selected file's content as a string.</p>
-<pre><code>const file = await window.nc.dialog.readTextFile({
+<pre><code>const file = await window.nb.dialog.readTextFile({
   filters: [{ name: 'Text', extensions: ['txt', 'csv'] }]
 });
 if (file) {
   const { path, content } = file; // content is a UTF-8 string
 }</code></pre>
 
-<h3>window.nc.plugins.invoke(pluginId, channel, ...args)</h3>
-<p>Low-level invoke. The <code>nc.invoke()</code> helper in your renderer code calls this automatically with your plugin's ID filled in. You can also call other plugins' handlers directly if needed.</p>
+<h3>window.nb.plugins.invoke(pluginId, channel, ...args)</h3>
+<p>Low-level invoke. The <code>nb.invoke()</code> helper in your renderer code calls this automatically with your plugin's ID filled in. You can also call other plugins' handlers directly if needed.</p>
 
 <hr>
 
@@ -1218,7 +1218,7 @@ if (file) {
 </table>
 
 <h2>Built-in example plugin — Chess</h2>
-<p>The Chess Move Predictor plugin bundled with NeuralCity (<code>src/plugins/chess/</code>) demonstrates all three hooks: a template registering a 73-input → 4096-output classifier, a training editor for parsing UCI game files, and an inference renderer with a full interactive chessboard. Browse <code>src/plugins/chess/main.js</code> and <code>renderer.js</code> for a complete real-world reference implementation.</p>
+<p>The Chess Move Predictor plugin bundled with NeuralCabin (<code>src/plugins/chess/</code>) demonstrates all three hooks: a template registering a 73-input → 4096-output classifier, a training editor for parsing UCI game files, and an inference renderer with a full interactive chessboard. Browse <code>src/plugins/chess/main.js</code> and <code>renderer.js</code> for a complete real-world reference implementation.</p>
 `
   },
   {
@@ -1226,7 +1226,7 @@ if (file) {
     title: 'Contributing',
     body: `
 <h1>Contributing</h1>
-<p>NeuralCity is open-source and hosted at <a href="https://github.com/GuyThatLivesAndCodes/NeuralCity" target="_blank">github.com/GuyThatLivesAndCodes/NeuralCity</a>. Issues and pull requests are welcome.</p>
+<p>NeuralCabin is open-source and hosted at <a href="https://github.com/GuyThatLivesAndCodes/NeuralCabin" target="_blank">github.com/GuyThatLivesAndCodes/NeuralCabin</a>. Issues and pull requests are welcome.</p>
 
 <h2>Repository layout</h2>
 <pre><code>src/
@@ -1244,7 +1244,7 @@ assets/        icon.png, make-icon.js</code></pre>
 <pre><code>npm install
 npm start          # launches the Electron app
 npm test           # runs the engine test harness
-npm run build:win  # builds NeuralCity-Setup-1.0.0.exe</code></pre>
+npm run build:win  # builds NeuralCabin-Setup-1.0.0.exe</code></pre>
 
 <h2>Adding a new tensor op</h2>
 <ol>

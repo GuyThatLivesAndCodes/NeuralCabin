@@ -1,6 +1,6 @@
 'use strict';
 
-// NeuralCity renderer. Single-file UI controller that reads from window.nc.
+// NeuralCabin renderer. Single-file UI controller that reads from window.nb.
 
 const state = {
   networks: [],
@@ -34,13 +34,13 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 const pluginRegistry = {
   templates: [],
-  inferenceRenderers: {}, // pluginKind → { fn(root, net, nc), pluginId }
-  trainEditors: {}        // pluginKind → { fn(root, net, nc), pluginId }
+  inferenceRenderers: {}, // pluginKind → { fn(root, net, nb), pluginId }
+  trainEditors: {}        // pluginKind → { fn(root, net, nb), pluginId }
 };
 
 async function initPlugins() {
   let plugins;
-  try { plugins = await window.nc.plugins.list(); }
+  try { plugins = await window.nb.plugins.list(); }
   catch (e) { console.warn('Plugin system unavailable:', e.message); return; }
   for (const p of plugins) {
     if (!p.rendererCode) continue;
@@ -48,7 +48,7 @@ async function initPlugins() {
       registerTemplate:         t    => pluginRegistry.templates.push(t),
       registerInferenceRenderer:(kind, fn) => { pluginRegistry.inferenceRenderers[kind] = { fn, pluginId: p.id }; },
       registerTrainEditor:      (kind, fn) => { pluginRegistry.trainEditors[kind]       = { fn, pluginId: p.id }; },
-      invoke:                   (ch, ...a) => window.nc.plugins.invoke(p.id, ch, ...a)
+      invoke:                   (ch, ...a) => window.nb.plugins.invoke(p.id, ch, ...a)
     };
     try {
       // eslint-disable-next-line no-new-func
@@ -56,7 +56,7 @@ async function initPlugins() {
     } catch (e) { console.error(`Plugin "${p.id}" renderer failed:`, e); }
   }
   for (const t of pluginRegistry.templates) {
-    if (!window.NC_TEMPLATES.find(x => x.id === t.id)) window.NC_TEMPLATES.push(t);
+    if (!window.NB_TEMPLATES.find(x => x.id === t.id)) window.NB_TEMPLATES.push(t);
   }
 }
 
@@ -82,14 +82,14 @@ function bindChrome() {
   $('#btn-new').addEventListener('click', openNewNetworkModal);
   $('#btn-import').addEventListener('click', async () => {
     try {
-      const net = await window.nc.networks.importNet();
+      const net = await window.nb.networks.importNet();
       if (net) { await refreshNetworks(); selectNetwork(net.id); toast('Imported.'); }
     } catch (e) { toast('Import failed: ' + e.message); }
   });
   $('#btn-export').addEventListener('click', async () => {
     if (!state.selectedId) return toast('Select a network first.');
     try {
-      const p = await window.nc.networks.exportNet(state.selectedId);
+      const p = await window.nb.networks.exportNet(state.selectedId);
       if (p) toast('Saved to ' + p);
     } catch (e) { toast('Export failed: ' + e.message); }
   });
@@ -106,7 +106,7 @@ function bindModals() {
 }
 
 function bindTrainingStreams() {
-  window.nc.training.onProgress(p => {
+  window.nb.training.onProgress(p => {
     if (p.id !== state.selectedId) return;
     if (p.log) {
       state.training.logs.push(p.log);
@@ -119,13 +119,13 @@ function bindTrainingStreams() {
     }
     if (state.activeTab === 'train') updateTrainLive();
   });
-  window.nc.training.onDone(async (p) => {
+  window.nb.training.onDone(async (p) => {
     state.training.running = false;
     state.training.logs.push(p.stopped ? '-- stopped --' : '-- done --');
     await refreshNetworks();
     if (p.id === state.selectedId) { await loadCurrent(state.selectedId); renderActiveTab(); }
   });
-  window.nc.training.onError(e => {
+  window.nb.training.onError(e => {
     state.training.running = false;
     state.training.logs.push('ERROR: ' + e.message);
     if (state.activeTab === 'train') updateTrainLive();
@@ -133,7 +133,7 @@ function bindTrainingStreams() {
 }
 
 function bindApiStreams() {
-  window.nc.api.onLog(line => {
+  window.nb.api.onLog(line => {
     state.apiLogs.push(`[${new Date().toLocaleTimeString()}] ${line.id?.slice?.(0, 6) || ''} ${line.line}`);
     if (state.apiLogs.length > 500) state.apiLogs.shift();
     if (state.activeTab === 'api') renderApiPanel();
@@ -143,7 +143,7 @@ function bindApiStreams() {
 // ---------- networks list ----------
 
 async function refreshNetworks() {
-  state.networks = await window.nc.networks.list();
+  state.networks = await window.nb.networks.list();
   renderNetworkList();
 }
 
@@ -177,7 +177,7 @@ async function selectNetwork(id) {
 }
 
 async function loadCurrent(id) {
-  try { state.current = await window.nc.networks.get(id); }
+  try { state.current = await window.nb.networks.get(id); }
   catch (e) { state.current = null; toast('Failed to load: ' + e.message); }
   state.training.history = [];
   state.training.logs = [];
@@ -293,8 +293,8 @@ function renderNetworksTab(root) {
 
   if (a.pluginKind && pluginRegistry.trainEditors[a.pluginKind]) {
     const { fn, pluginId } = pluginRegistry.trainEditors[a.pluginKind];
-    const nc = { invoke: (ch, ...args) => window.nc.plugins.invoke(pluginId, ch, ...args) };
-    fn(document.getElementById('plugin-train-editor'), n, nc);
+    const nb = { invoke: (ch, ...args) => window.nb.plugins.invoke(pluginId, ch, ...args) };
+    fn(document.getElementById('plugin-train-editor'), n, nb);
   } else if (a.kind === 'gpt') {
     // init gpt editor state from saved trainingData
     const td = n.trainingData || {};
@@ -313,7 +313,7 @@ function renderNetworksTab(root) {
     dataArea.addEventListener('input', () => { updateDataStats(); refreshHints(); });
 
     $('#btn-import-data').addEventListener('click', async () => {
-      const res = await window.nc.dialog.readTextFile({
+      const res = await window.nb.dialog.readTextFile({
         properties: ['openFile'],
         filters: [{ name: 'Text / JSON', extensions: ['json', 'txt', 'jsonl', 'md', 'docs'] }]
       });
@@ -337,14 +337,14 @@ function renderNetworksTab(root) {
 
   $('#btn-save').addEventListener('click', saveEditor);
   $('#btn-dup').addEventListener('click', async () => {
-    const dup = await window.nc.networks.duplicate(n.id);
+    const dup = await window.nb.networks.duplicate(n.id);
     await refreshNetworks(); selectNetwork(dup.id);
   });
   $('#btn-backup').addEventListener('click', () => openBackupModal(n.id));
 
   $('#btn-delete').addEventListener('click', () => {
     confirmModal('Delete network?', `This will permanently remove "${n.name}" and its weights.`, async () => {
-      await window.nc.networks.delete(n.id);
+      await window.nb.networks.delete(n.id);
       state.selectedId = null; state.current = null;
       await refreshNetworks(); state.activeTab = 'networks'; renderActiveTab();
     });
@@ -354,7 +354,7 @@ function renderNetworksTab(root) {
   if (encBtn) encBtn.addEventListener('click', () => {
     passphraseModal('Set passphrase', 'Create a passphrase to encrypt this network', async (pass) => {
       if (!pass) return;
-      await window.nc.networks.update(n.id, { encryptionIntent: 'enable', passphrase: pass });
+      await window.nb.networks.update(n.id, { encryptionIntent: 'enable', passphrase: pass });
       await loadCurrent(n.id); renderActiveTab(); toast('Network encrypted.');
     });
   });
@@ -363,7 +363,7 @@ function renderNetworksTab(root) {
     passphraseModal('Decrypt network', 'Enter the passphrase to disable encryption', async (pass) => {
       if (!pass) return;
       try {
-        await window.nc.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
+        await window.nb.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
         await loadCurrent(n.id); renderActiveTab(); toast('Network decrypted.');
       } catch (e) { toast('Decrypt failed: ' + e.message); }
     });
@@ -610,7 +610,7 @@ function bindGptEditor() {
   renderGptStemList();
   updateDataStats();
   $('#btn-add-docs').addEventListener('click', async () => {
-    const docs = await window.nc.gpt.pickDocuments();
+    const docs = await window.nb.gpt.pickDocuments();
     if (!docs.length) return;
     for (const d of docs) {
       const idx = state.gptEditor.docs.findIndex(x => x.name === d.name);
@@ -735,7 +735,7 @@ async function saveEditor() {
     patch.tokenizer = null;
   }
   try {
-    await window.nc.networks.update(n.id, patch);
+    await window.nb.networks.update(n.id, patch);
     await refreshNetworks();
     await loadCurrent(n.id);
     renderActiveTab();
@@ -790,7 +790,7 @@ function renderTrainTab(root) {
     if (n.stateLocked) {
       passphraseModal('Decrypt to train', 'Passphrase required to train an encrypted network', async (pass) => {
         if (!pass) return;
-        await window.nc.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
+        await window.nb.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
         await loadCurrent(n.id);
         startTraining({ fromScratch });
       });
@@ -809,7 +809,7 @@ function renderTrainTab(root) {
     });
   }
   $('#btn-stop').addEventListener('click', async () => {
-    await window.nc.training.stop(n.id);
+    await window.nb.training.stop(n.id);
   });
   updateTrainLive();
 }
@@ -823,7 +823,7 @@ async function startTraining(opts) {
   state.training.startedAt = Date.now();
   updateTrainLive();
   try {
-    await window.nc.training.start(state.current.id, { fromScratch: !!opts.fromScratch });
+    await window.nb.training.start(state.current.id, { fromScratch: !!opts.fromScratch });
     const trainBtn = $('#btn-train'); if (trainBtn) trainBtn.disabled = true;
     const scratchBtn = $('#btn-train-scratch'); if (scratchBtn) scratchBtn.disabled = true;
     const stopBtn = $('#btn-stop'); if (stopBtn) stopBtn.disabled = false;
@@ -895,9 +895,9 @@ function renderInferenceTab(root) {
   const hookKind = a.pluginKind || null;
   if (hookKind && pluginRegistry.inferenceRenderers[hookKind]) {
     const { fn, pluginId } = pluginRegistry.inferenceRenderers[hookKind];
-    const nc = { invoke: (ch, ...args) => window.nc.plugins.invoke(pluginId, ch, ...args) };
+    const nb = { invoke: (ch, ...args) => window.nb.plugins.invoke(pluginId, ch, ...args) };
     root.innerHTML = '';
-    fn(root, n, nc);
+    fn(root, n, nb);
     return;
   }
   if (!n.state && !n.stateLocked) {
@@ -929,7 +929,7 @@ function renderInferenceTab(root) {
     </div>
   `;
   $('#btn-run').addEventListener('click', runInference);
-  $('#btn-stop-gen').addEventListener('click', () => window.nc.inference.cancel());
+  $('#btn-stop-gen').addEventListener('click', () => window.nb.inference.cancel());
 }
 
 function renderChatTab(root, n) {
@@ -1083,7 +1083,7 @@ async function regenerateAssistantTurn(id, idx) {
   turn.content = '…';
   redrawChatLog(id);
   try {
-    const result = await window.nc.inference.run(id, {
+    const result = await window.nb.inference.run(id, {
       history: historyBefore,
       prompt: userPrompt,
       system: s.system || '',
@@ -1135,7 +1135,7 @@ async function commitEditUserTurn(id, idx) {
   s.busy = true;
   redrawChatLog(id);
   try {
-    const result = await window.nc.inference.run(id, {
+    const result = await window.nb.inference.run(id, {
       history: historyBefore,
       prompt: newText,
       system: s.system || '',
@@ -1157,7 +1157,7 @@ async function sendChatMessage(id) {
   if (n.stateLocked) {
     passphraseModal('Decrypt to chat', 'Passphrase required to chat with an encrypted network', async (pass) => {
       if (!pass) return;
-      await window.nc.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
+      await window.nb.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
       await loadCurrent(n.id); sendChatMessage(id);
     });
     return;
@@ -1181,7 +1181,7 @@ async function sendChatMessage(id) {
       temperature: parseFloat($('#chat-temp').value) || 0.8,
       topK: parseInt($('#chat-topk').value) || 0
     };
-    const result = await window.nc.inference.run(id, payload);
+    const result = await window.nb.inference.run(id, payload);
     const reply = (result && typeof result.text === 'string') ? result.text : '';
     s.history.push({ role: 'assistant', content: reply });
   } catch (e) {
@@ -1223,7 +1223,7 @@ async function runInference() {
   if (n.stateLocked) {
     passphraseModal('Decrypt to run', 'Passphrase required to run this network', async (pass) => {
       if (!pass) return;
-      await window.nc.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
+      await window.nb.networks.update(n.id, { encryptionIntent: 'disable', passphrase: pass });
       await loadCurrent(n.id); runInference();
     });
     return;
@@ -1250,7 +1250,7 @@ async function runInference() {
       stopBtn.style.display = '';
       let streamed = '';
       try {
-        const result = await window.nc.inference.streamStart(n.id, payload, (chunk) => {
+        const result = await window.nb.inference.streamStart(n.id, payload, (chunk) => {
           streamed += chunk;
           out.textContent = streamed;
         });
@@ -1268,7 +1268,7 @@ async function runInference() {
       const vec = $('#inp-vec').value.split(',').map(v => parseFloat(v.trim()));
       if (vec.some(isNaN)) throw new Error('Vector has non-numeric value');
       payload = { input: vec };
-      const result = await window.nc.inference.run(n.id, payload);
+      const result = await window.nb.inference.run(n.id, payload);
       renderInferenceResult(result);
     }
   } catch (e) { $('#infer-output').textContent = 'ERROR: ' + e.message; }
@@ -1296,14 +1296,14 @@ function renderInferenceResult(r) {
 // API tab
 async function renderApiPanel() {
   const root = $('#content');
-  const allActive = await window.nc.api.list();
+  const allActive = await window.nb.api.list();
   state.apiServers = new Map(allActive.map(s => [s.id, s]));
   if (!state.current) {
     root.innerHTML = `<div class="empty"><div class="big">No network selected</div></div>`;
     return;
   }
   const n = state.current;
-  const info = await window.nc.system.info();
+  const info = await window.nb.system.info();
   const running = state.apiServers.get(n.id);
   root.innerHTML = `
     <div class="panel">
@@ -1345,14 +1345,14 @@ async function renderApiPanel() {
     if (n.stateLocked) { toast('Decrypt the network first.'); return; }
     const port = parseInt($('#api-port').value) || 0;
     try {
-      const r = await window.nc.api.start(n.id, port);
+      const r = await window.nb.api.start(n.id, port);
       toast('API running at ' + r.url);
       renderApiPanel();
     } catch (e) { toast('Failed: ' + e.message); }
   });
   const stopBtn = $('#btn-stop-api');
   if (stopBtn) stopBtn.addEventListener('click', async () => {
-    await window.nc.api.stop(n.id);
+    await window.nb.api.stop(n.id);
     renderApiPanel();
   });
   const logEl = $('#api-log');
@@ -1400,13 +1400,13 @@ print result.metrics[len(result.metrics) - 1].loss
     const out = $('#script-out');
     out.textContent = 'running...';
     try {
-      const r = await window.nc.script.run(state.current?.id || null, $('#script-area').value);
+      const r = await window.nb.script.run(state.current?.id || null, $('#script-area').value);
       out.textContent = (r.output || '') + (r.ok ? '' : '\n[error] ' + r.error);
     } catch (e) { out.textContent = 'ERROR: ' + e.message; }
   });
   $('#btn-save-script').addEventListener('click', async () => {
     if (!state.current) { toast('No network selected.'); return; }
-    await window.nc.networks.update(state.current.id, { script: $('#script-area').value });
+    await window.nb.networks.update(state.current.id, { script: $('#script-area').value });
     await loadCurrent(state.current.id);
     toast('Saved.');
   });
@@ -1602,12 +1602,12 @@ function triggerDownload(data, filename, mimeType) {
 
 // Docs tab
 function renderDocsTab(root) {
-  const doc = window.NC_DOCS.find(d => d.id === state.currentDocId) || window.NC_DOCS[0];
+  const doc = window.NB_DOCS.find(d => d.id === state.currentDocId) || window.NB_DOCS[0];
   root.innerHTML = `
     <div class="panel">
       <div class="docs-layout">
         <div class="docs-nav">
-          ${window.NC_DOCS.map(d => `<button data-id="${d.id}" class="${d.id === doc.id ? 'active' : ''}">${d.title}</button>`).join('')}
+          ${window.NB_DOCS.map(d => `<button data-id="${d.id}" class="${d.id === doc.id ? 'active' : ''}">${d.title}</button>`).join('')}
           <div style="border-top:1px solid #2a2a2a;margin-top:8px;padding-top:8px;">
             <button class="btn sm" id="btn-docs-zip" style="width:100%;font-size:11px;text-align:left;padding:5px 8px;">⬇ Download all for LLM (.zip)</button>
           </div>
@@ -1632,27 +1632,27 @@ function renderDocsTab(root) {
   root.querySelector('#btn-docs-llm').addEventListener('click', () => {
     const md       = docPageToMarkdown(doc.title, doc.body);
     const safeName = doc.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    triggerDownload(md, `neuralcity-doc-${safeName}.md`, 'text/markdown');
+    triggerDownload(md, `neuralcabin-doc-${safeName}.md`, 'text/markdown');
   });
 
   // Download all pages as a ZIP of Markdown files for LLM ingestion
   root.querySelector('#btn-docs-zip').addEventListener('click', () => {
-    const files = window.NC_DOCS.map(d => {
+    const files = window.NB_DOCS.map(d => {
       const safeName = d.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       return {
-        name:    `neuralcity-docs/${safeName}.md`,
+        name:    `neuralcabin-docs/${safeName}.md`,
         content: docPageToMarkdown(d.title, d.body)
       };
     });
     const zipBytes = buildZip(files);
-    triggerDownload(zipBytes, 'neuralcity-docs.zip', 'application/zip');
+    triggerDownload(zipBytes, 'neuralcabin-docs.zip', 'application/zip');
   });
 }
 
 // ---------- plugins tab ----------
 
 async function renderPluginsTab(root) {
-  const installed = await window.nc.plugins.list();
+  const installed = await window.nb.plugins.list();
 
   // Restart-required banner (shown after any install/uninstall this session)
   const restartBanner = pluginNeedsRestart ? `
@@ -1668,16 +1668,16 @@ async function renderPluginsTab(root) {
   root.innerHTML = `
     <div class="panel">
       <h2>Plugins</h2>
-      <p class="hint">Plugins add new model types, training data editors, and inference UIs. Each plugin is a <code>.ncpl</code> file — see Docs → Plugin system for the format reference.</p>
+      <p class="hint">Plugins add new model types, training data editors, and inference UIs. Each plugin is a <code>.nbpl</code> file — see Docs → Plugin system for the format reference.</p>
       <div class="section">
         ${restartBanner}
         <div class="row" style="margin-bottom:14px;gap:8px;">
-          <button class="btn primary" id="btn-install-plugin">Install Plugin (.ncpl)</button>
+          <button class="btn primary" id="btn-install-plugin">Install Plugin (.nbpl)</button>
         </div>
 
         <div id="plugin-list">
           ${installed.length === 0
-            ? `<div class="empty" style="padding:24px 0;"><div>No plugins installed.</div><div style="font-size:12px;color:#666;margin-top:6px;">Click "Install Plugin" to add a .ncpl file.</div></div>`
+            ? `<div class="empty" style="padding:24px 0;"><div>No plugins installed.</div><div style="font-size:12px;color:#666;margin-top:6px;">Click "Install Plugin" to add a .nbpl file.</div></div>`
             : installed.map(p => {
                 const active = isPluginActive(p.id);
                 const badge  = active
@@ -1715,14 +1715,14 @@ async function renderPluginsTab(root) {
     restartBtn.addEventListener('click', async () => {
       restartBtn.disabled = true;
       restartBtn.textContent = 'Restarting…';
-      try { await window.nc.app.restart(); } catch (e) { toast('Restart failed: ' + e.message); restartBtn.disabled = false; restartBtn.textContent = 'Restart now'; }
+      try { await window.nb.app.restart(); } catch (e) { toast('Restart failed: ' + e.message); restartBtn.disabled = false; restartBtn.textContent = 'Restart now'; }
     });
   }
 
   // Install plugin
   root.querySelector('#btn-install-plugin').addEventListener('click', async () => {
     let result;
-    try { result = await window.nc.plugins.install(); }
+    try { result = await window.nb.plugins.install(); }
     catch (e) { toast('Install failed: ' + e.message); return; }
 
     if (!result) return; // user cancelled dialog
@@ -1739,7 +1739,7 @@ async function renderPluginsTab(root) {
       const name = btn.closest('.section')?.querySelector('[style*="font-weight:600"]')?.textContent?.trim() || id;
       confirmModal('Uninstall plugin?', `Remove "${escapeHtml(name)}"? Changes take effect after restart.`, async () => {
         try {
-          await window.nc.plugins.uninstall(id);
+          await window.nb.plugins.uninstall(id);
           pluginNeedsRestart = true;
           toast(`✓ "${name}" removed. Restart to apply.`);
           renderPluginsTab(root);
@@ -1763,7 +1763,7 @@ async function renderBackupList(netId) {
   if (!body) return;
   body.innerHTML = '<div style="padding:16px;color:#8a8a8a;">Loading…</div>';
   let backups;
-  try { backups = await window.nc.backups.list(netId); }
+  try { backups = await window.nb.backups.list(netId); }
   catch (e) { body.innerHTML = `<div style="padding:16px;color:#ff7b7b;">Failed to load backups: ${escapeHtml(e.message)}</div>`; return; }
 
   if (backups.length === 0) {
@@ -1774,7 +1774,7 @@ async function renderBackupList(netId) {
         <button class="btn primary" id="btn-backup-first">Create your first backup</button>
       </div>`;
     $('#btn-backup-first').addEventListener('click', async () => {
-      try { await window.nc.backups.create(netId, ''); await renderBackupList(netId); toast('Backup created.'); }
+      try { await window.nb.backups.create(netId, ''); await renderBackupList(netId); toast('Backup created.'); }
       catch (e) { toast('Backup failed: ' + e.message); }
     });
     return;
@@ -1800,7 +1800,7 @@ async function renderBackupList(netId) {
     </div>`;
 
   $('#btn-backup-new').addEventListener('click', async () => {
-    try { await window.nc.backups.create(netId, ''); await renderBackupList(netId); toast('Backup created.'); }
+    try { await window.nb.backups.create(netId, ''); await renderBackupList(netId); toast('Backup created.'); }
     catch (e) { toast('Backup failed: ' + e.message); }
   });
 
@@ -1811,19 +1811,19 @@ async function renderBackupList(netId) {
         confirmModal('Restore backup?',
           'This overwrites the current network state. The current state will be lost unless you have another backup.',
           async () => {
-            await window.nc.backups.restore(netId, backupId);
+            await window.nb.backups.restore(netId, backupId);
             await refreshNetworks(); await loadCurrent(netId);
             $('#modal-backup').hidden = true;
             renderActiveTab(); toast('Network restored from backup.');
           });
       } else if (act === 'download') {
         try {
-          const p = await window.nc.backups.download(netId, backupId);
+          const p = await window.nb.backups.download(netId, backupId);
           if (p) toast('Saved to ' + p);
         } catch (e) { toast('Download failed: ' + e.message); }
       } else if (act === 'delete') {
         confirmModal('Delete backup?', 'This permanently removes this backup snapshot.', async () => {
-          await window.nc.backups.delete(netId, backupId);
+          await window.nb.backups.delete(netId, backupId);
           await renderBackupList(netId); toast('Backup deleted.');
         });
       }
@@ -1846,7 +1846,7 @@ function populateTemplates() {
   const kind = $('#new-kind').value;
   const matches = kind === 'plugin'
     ? pluginRegistry.templates
-    : window.NC_TEMPLATES.filter(t => {
+    : window.NB_TEMPLATES.filter(t => {
         if (kind === 'chat') return t.kind === 'charLM' && t.arch && t.arch.isChat;
         if (kind === 'charLM') return t.kind === 'charLM' && !(t.arch && t.arch.isChat);
         return t.kind === kind;
@@ -1875,7 +1875,7 @@ async function createNetworkFromModal() {
   const kind = $('#new-kind').value;
   let payload;
   if (selectedTemplate && selectedTemplate !== '__blank__') {
-    const t = window.NC_TEMPLATES.find(x => x.id === selectedTemplate);
+    const t = window.NB_TEMPLATES.find(x => x.id === selectedTemplate);
     payload = {
       name, description: t.desc,
       architecture: JSON.parse(JSON.stringify(t.arch)),
@@ -1892,7 +1892,7 @@ async function createNetworkFromModal() {
         : ((kind === 'charLM' || kind === 'gpt') ? { text: '' } : { samples: [] })
     };
   }
-  const net = await window.nc.networks.create(payload);
+  const net = await window.nb.networks.create(payload);
   $('#modal-new').hidden = true;
   await refreshNetworks();
   selectNetwork(net.id);
@@ -1938,7 +1938,7 @@ function passphraseModal(title, prompt, onSubmit) {
 
 async function fillSystemInfo() {
   try {
-    const info = await window.nc.system.info();
+    const info = await window.nb.system.info();
     $('#sys-info').innerHTML = `
       <div>v${info.version} · ${info.platform} ${info.arch}</div>
       <div>${info.cpus} CPUs · ${Math.round(info.mem / 1024 / 1024 / 1024)} GB RAM</div>

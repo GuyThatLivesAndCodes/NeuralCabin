@@ -62,6 +62,67 @@ The UI requires standard Linux desktop libs (X11 or Wayland + OpenGL); on
 macOS and Windows it builds out of the box. If you’re on a headless server,
 use `--xor-demo` to verify the engine without launching a window.
 
+## Pre-built binaries
+
+Every push to `master` and to a `claude/**` branch triggers
+`.github/workflows/autobuild-test.yml`, which builds, tests, and packages
+release binaries for **Linux x86_64**, **Windows x86_64**, and
+**macOS aarch64** (Apple Silicon).
+
+### Download from a workflow run
+
+1. Go to the repository → **Actions** tab → pick the latest successful
+   *Build & Test* run on the branch you want.
+2. Scroll to the **Artifacts** section and download:
+   - `neuralcabin-windows-x86_64` (zip, contains `neuralcabin.exe`)
+   - `neuralcabin-linux-x86_64` (tar.gz)
+   - `neuralcabin-macos-aarch64` (tar.gz)
+3. Each archive also ships a `.sha256` file you can verify against.
+
+Artifacts are retained for 30 days.
+
+### Cutting a versioned release
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The same workflow then attaches the three archives to a GitHub Release
+named `v0.1.0` with auto-generated release notes — those downloads do not
+expire.
+
+### Running the Windows executable
+
+1. Download `neuralcabin-windows-x86_64.zip` from Actions or Releases.
+2. Right-click → **Extract All…** anywhere you like (e.g.
+   `C:\Tools\NeuralCabin`).
+3. Double-click `neuralcabin.exe` to launch the workbench.
+   - The release build uses the `windows` subsystem, so no extra console
+     window appears.
+   - From `cmd` or PowerShell you can also run
+     `neuralcabin.exe --xor-demo` for the headless training smoke test, or
+     `neuralcabin.exe --help`. In those modes the binary re-attaches to
+     the parent console so output appears as expected.
+4. SmartScreen may prompt the first time because the binary isn’t
+   code-signed. Click **More info → Run anyway**.
+
+### Running on Linux / macOS
+
+```bash
+tar -xzf neuralcabin-linux-x86_64.tar.gz
+cd neuralcabin-linux-x86_64
+./neuralcabin                # launches the workbench
+./neuralcabin --xor-demo     # headless smoke test
+```
+
+On macOS Apple Silicon use the `aarch64` archive. Gatekeeper may flag the
+unsigned binary — clear the quarantine attribute with:
+
+```bash
+xattr -d com.apple.quarantine ./neuralcabin
+```
+
 ## Tests
 
 ```bash

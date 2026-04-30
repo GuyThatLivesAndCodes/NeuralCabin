@@ -4,10 +4,34 @@
 //! for a headless training-and-inference smoke test that exercises the engine
 //! without opening a window — useful for CI environments without a display.
 
+// On Windows release builds, suppress the auxiliary console window. We still
+// re-attach to a parent console below when the user runs us with `--xor-demo`
+// or `--help`, so command-line output keeps working from `cmd` / PowerShell.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::process::ExitCode;
+
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn attach_parent_console() {
+    // SAFETY: AttachConsole is documented as a no-op (returning 0) when no
+    // parent console is available; the call has no other side effects. We
+    // intentionally ignore the return value.
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
+}
+
+#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+fn attach_parent_console() {}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    let needs_console = args.iter().any(|a| {
+        matches!(a.as_str(), "--xor-demo" | "--demo" | "--help" | "-h")
+    });
+    if needs_console { attach_parent_console(); }
     if args.iter().any(|a| a == "--xor-demo" || a == "--demo") {
         match xor_demo() {
             Ok(()) => ExitCode::SUCCESS,

@@ -3,6 +3,7 @@ name: Build & Test
 on:
   push:
     branches: [master, "claude/**"]
+    tags: ["v*"]
   pull_request:
     branches: [master]
 
@@ -12,7 +13,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: neuralcabin
+            asset_name: neuralcabin-linux-x86_64
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: neuralcabin.exe
+            asset_name: neuralcabin-windows-x86_64
+            archive_ext: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: neuralcabin
+            asset_name: neuralcabin-macos-aarch64
+            archive_ext: tar.gz
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -34,7 +50,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Build (release)
         run: cargo build --workspace --release
 
       - name: Test
@@ -45,3 +61,44 @@ jobs:
 
       - name: Headless XOR demo
         run: cargo run --release -- --xor-demo
+
+      - name: Stage release artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p staging/${{ matrix.asset_name }}
+          cp target/release/${{ matrix.artifact_name }} staging/${{ matrix.asset_name }}/
+          cp README.md LICENSE.md staging/${{ matrix.asset_name }}/
+          tar -czf ${{ matrix.asset_name }}.tar.gz -C staging ${{ matrix.asset_name }}
+          shasum -a 256 ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
+
+      - name: Stage release artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging\${{ matrix.asset_name }} | Out-Null
+          Copy-Item target\release\${{ matrix.artifact_name }} staging\${{ matrix.asset_name }}\
+          Copy-Item README.md, LICENSE.md staging\${{ matrix.asset_name }}\
+          Compress-Archive -Path staging\${{ matrix.asset_name }}\* -DestinationPath ${{ matrix.asset_name }}.zip -Force
+          (Get-FileHash ${{ matrix.asset_name }}.zip -Algorithm SHA256).Hash | Out-File -Encoding ASCII ${{ matrix.asset_name }}.zip.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

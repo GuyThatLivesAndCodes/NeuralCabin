@@ -1408,6 +1408,8 @@ dependencies = [
  "eframe",
  "egui",
  "neuralcabin-engine",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -4,8 +4,14 @@
 //! internal implementation detail.
 
 mod app;
-mod trainer;
+mod corpus;
+mod docs;
+mod networks;
 mod plot;
+mod plugins;
+mod theme;
+mod trainer;
+mod vocab;
 
 pub use app::NeuralCabinApp;
 
@@ -14,8 +20,8 @@ pub fn run() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NeuralCabin")
-            .with_inner_size([1200.0, 780.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([960.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native(

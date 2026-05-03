@@ -6,6 +6,7 @@
 mod app;
 mod corpus;
 mod docs;
+mod generator;
 mod networks;
 mod paths;
 mod plot;

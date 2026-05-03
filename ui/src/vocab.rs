@@ -144,6 +144,11 @@ impl Vocab {
                         }
                     }
                 }
+                // Whitespace chars must be real tokens so the greedy encoder
+                // never maps them to <unk>.
+                for c in corpus_text.chars() {
+                    if c.is_whitespace() { set.insert(c.to_string()); }
+                }
             }
             VocabMode::Bulk => {
                 for c in corpus_text.chars() { set.insert(c.to_string()); }

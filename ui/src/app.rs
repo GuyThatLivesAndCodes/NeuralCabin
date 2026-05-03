@@ -936,8 +936,15 @@ impl NeuralCabinApp {
             for (i, tok) in net.vocab.tokens.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{i:>5}  ")).color(theme::TEXT_FAINT).monospace());
-                    let display = if tok.is_empty() { "<empty>".into() } else { tok.replace('\n', "\\n") };
-                    ui.label(RichText::new(display).monospace().color(theme::TEXT));
+                    let display = if i == 0 {
+                        "<unk> (EOS)".into()
+                    } else if tok.is_empty() {
+                        "<empty>".into()
+                    } else {
+                        tok.replace('\n', "\\n").replace(' ', "·")
+                    };
+                    let color = if i == 0 { theme::TEXT_WEAK } else { theme::TEXT };
+                    ui.label(RichText::new(display).monospace().color(color));
                     if i > 0 && ui.small_button("✕").clicked() { to_remove = Some(i); }
                 });
             }
@@ -1331,10 +1338,13 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
         vec![1.0; v]
     };
     let mut history = net.vocab.encode(&net.prompt);
-    if history.is_empty() { history.push(0); }
+    // If the prompt encoded to nothing, seed with token 1 (the first real token)
+    // rather than 0 (<unk>/EOS) which would stop generation immediately.
+    if history.is_empty() { history.push(1.min(v - 1)); }
     let mut rng = SplitMix64::new(seed.wrapping_add(history.len() as u64).wrapping_add(0xBEEF));
     let mut out_tokens = Vec::new();
     let temp = net.temperature.max(1e-3);
+    let word_mode = net.vocab.mode == crate::vocab::VocabMode::Word;
     for _ in 0..net.max_tokens {
         let input_vec = build_input_vec(&history, ctx, v, edim, emb, emb_table.as_deref(), &idf);
         let logits = model.predict(&Tensor::new(vec![1, expected_in], input_vec));
@@ -1350,13 +1360,21 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
             acc += *p;
             if u <= acc { chosen = i; break; }
         }
+        // Token 0 (<unk>) is the end-of-sequence sentinel — stop here.
+        if chosen == 0 { break; }
         out_tokens.push(chosen);
         history.push(chosen);
     }
     let mut out = net.prompt.clone();
     out.push('|');
-    for id in out_tokens {
-        if id < net.vocab.tokens.len() { out.push_str(&net.vocab.tokens[id]); }
+    for (i, id) in out_tokens.iter().enumerate() {
+        if *id >= net.vocab.tokens.len() { continue; }
+        // In word mode tokens are whole words; insert a space before each so
+        // the output reads as normal text rather than concatenated words.
+        if word_mode && (i > 0 || !net.prompt.is_empty()) {
+            out.push(' ');
+        }
+        out.push_str(&net.vocab.tokens[*id]);
     }
     Ok(out)
 }

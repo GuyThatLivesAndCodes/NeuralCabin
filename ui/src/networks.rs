@@ -188,6 +188,10 @@ pub struct NetworkInstance {
     pub generated: String,
     pub temperature: f32,
     pub max_tokens: usize,
+    /// Background streaming generator; `None` when idle.
+    pub generator: Option<crate::generator::GeneratorHandle>,
+    /// Re-run generation automatically whenever the prompt changes.
+    pub realtime_text: bool,
 
     // Persistence.
     pub persistence_message: Option<String>,
@@ -282,6 +286,8 @@ impl NetworkInstance {
             generated: String::new(),
             temperature: 0.8,
             max_tokens: 64,
+            generator: None,
+            realtime_text: false,
             persistence_message: None,
         }
     }

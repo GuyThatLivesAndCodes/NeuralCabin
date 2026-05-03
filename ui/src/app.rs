@@ -1271,152 +1271,170 @@ fn run_simplex_predict(net: &mut NetworkInstance) {
 }
 
 fn text_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
+    // ── Poll the background generator and append any new tokens ──────────────
+    let pieces: Vec<String> = net.generator.as_ref()
+        .map(|g| g.drain())
+        .unwrap_or_default();
+    for piece in pieces { net.generated.push_str(&piece); }
+
+    let still_generating = net.generator.as_ref()
+        .map(|g| !g.is_finished())
+        .unwrap_or(false);
+    if !still_generating && net.generator.is_some() {
+        net.generator = None;
+    }
+    if still_generating {
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    // ── Controls row ──────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.label("Temperature:");
         ui.add(egui::DragValue::new(&mut net.temperature).speed(0.01).range(0.05..=4.0));
+        ui.add_space(6.0);
         ui.label("Max tokens:");
         let mut m = net.max_tokens as i32;
         if ui.add(egui::DragValue::new(&mut m).range(1..=4096)).changed() {
             net.max_tokens = m.max(1) as usize;
         }
+        ui.add_space(12.0);
+        ui.checkbox(&mut net.realtime_text, "Real-time prediction");
+        ui.add_space(12.0);
         ui.label(RichText::new(format!("vocab={}", net.vocab.len())).color(theme::TEXT_WEAK));
         ui.label(RichText::new(format!("emb={}", net.embedding_kind.name()))
             .color(theme::TEXT_FAINT).size(11.0));
     });
+
+    // ── Action buttons ────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
-        if ui.button("Clear Input").clicked()  { net.prompt.clear(); }
-        if ui.button("Clear Output").clicked() { net.generated.clear(); }
+        if ui.button("Clear Input").clicked() {
+            net.prompt.clear();
+            net.generator = None; // drop → stop signal sent via Drop impl
+            net.generated.clear();
+        }
+        if ui.button("Clear Output").clicked() {
+            net.generated.clear();
+        }
     });
+
+    // ── Prompt text area ──────────────────────────────────────────────────────
     ui.label(RichText::new("Prompt").color(theme::TEXT_WEAK).size(11.5));
-    egui::ScrollArea::vertical().id_salt("prompt_scroll").max_height(140.0).show(ui, |ui| {
-        ui.add(egui::TextEdit::multiline(&mut net.prompt)
-            .desired_width(f32::INFINITY).desired_rows(4));
-    });
-    ui.add_space(4.0);
-    if ui.add_sized([ui.available_width(), 28.0],
-        egui::Button::new(RichText::new("Generate").strong())).clicked()
-    {
-        match generate_text(net) {
-            Ok(out) => net.generated = out,
-            Err(e)  => net.generated = format!("[error] {e}"),
+    let prompt_resp = egui::ScrollArea::vertical()
+        .id_salt("prompt_scroll")
+        .max_height(140.0)
+        .show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(&mut net.prompt)
+                .desired_width(f32::INFINITY)
+                .desired_rows(4))
+        })
+        .inner;
+
+    // In real-time mode, restart generation whenever the prompt changes.
+    if net.realtime_text && prompt_resp.changed() {
+        net.generator = None; // cancels current run
+        net.generated.clear();
+        match build_generator_config(net) {
+            Ok(cfg) => {
+                net.generated = format!("{}|", net.prompt);
+                net.generator = Some(crate::generator::spawn(cfg));
+            }
+            Err(e) => net.generated = format!("[error] {e}"),
         }
     }
+
+    // ── Generate / Stop button ────────────────────────────────────────────────
+    ui.add_space(4.0);
+    let btn_label = if still_generating { "⏹ Stop" } else { "▶ Generate" };
+    if ui.add_sized(
+        [ui.available_width(), 28.0],
+        egui::Button::new(RichText::new(btn_label).strong()),
+    ).clicked() {
+        if still_generating {
+            net.generator = None; // drop → stop
+        } else if !net.realtime_text {
+            net.generator = None;
+            net.generated.clear();
+            match build_generator_config(net) {
+                Ok(cfg) => {
+                    net.generated = format!("{}|", net.prompt);
+                    net.generator = Some(crate::generator::spawn(cfg));
+                }
+                Err(e) => net.generated = format!("[error] {e}"),
+            }
+        }
+    }
+
+    // ── Output ────────────────────────────────────────────────────────────────
     ui.add_space(6.0);
     ui.label(RichText::new("Output").color(theme::TEXT).strong());
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        ui.label(RichText::new(&net.generated).monospace().color(theme::TEXT));
-    });
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .stick_to_bottom(still_generating)
+        .show(ui, |ui| {
+            ui.label(RichText::new(&net.generated).monospace().color(theme::TEXT));
+        });
 }
 
-fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
+/// Validate inference params and build a [`GeneratorConfig`] ready to spawn.
+fn build_generator_config(
+    net: &NetworkInstance,
+) -> Result<crate::generator::GeneratorConfig, String> {
     use crate::corpus::random_embedding_table;
     let Some(model) = &net.model else { return Err("no model".into()); };
-    if net.vocab.is_empty() { return Err("vocab is empty".into()); }
-    let v   = net.vocab.len();
-    let ctx = net.corpus.context_size.max(1);
+    if net.vocab.is_empty() { return Err("vocab is empty — build it in the Vocab tab".into()); }
+    let v    = net.vocab.len();
+    let ctx  = net.corpus.context_size.max(1);
     let emb  = net.embedding_kind;
     let edim = net.embed_dim.max(1);
     let seed = net.seed;
-    let expected_in = emb.input_dim(ctx, v, edim);
-    if model.input_dim != expected_in {
+
+    if model.input_dim != emb.input_dim(ctx, v, edim) {
         return Err(format!(
-            "model input_dim={} but embedding expects {} (ctx={} vocab={} embed_dim={})",
-            model.input_dim, expected_in, ctx, v, edim
+            "model input_dim={} but embedding expects {} — rebuild the model",
+            model.input_dim, emb.input_dim(ctx, v, edim)
         ));
     }
     if model.output_dim() != v {
-        return Err(format!("model output_dim={} but vocab={}", model.output_dim(), v));
+        return Err(format!(
+            "model output_dim={} but vocab size={} — rebuild the model",
+            model.output_dim(), v
+        ));
     }
-    let emb_table = emb.uses_dense_embed()
-        .then(|| random_embedding_table(v, edim, seed));
+
     let idf: Vec<f32> = if emb == EmbeddingKind::TfIdf && !net.corpus.encoded_tokens.is_empty() {
         let total = net.corpus.encoded_tokens.len() as f32;
         let mut counts = vec![0usize; v];
         for &t in &net.corpus.encoded_tokens { counts[t.min(v - 1)] += 1; }
-        counts.iter().map(|&c| if c == 0 { 0.0 } else { (1.0 + total / c as f32).ln() }).collect()
+        counts.iter()
+            .map(|&c| if c == 0 { 0.0 } else { (1.0 + total / c as f32).ln() })
+            .collect()
     } else {
         vec![1.0; v]
     };
-    let mut history = net.vocab.encode(&net.prompt);
-    // If the prompt encoded to nothing, seed with token 1 (the first real token)
-    // rather than 0 (<unk>/EOS) which would stop generation immediately.
-    if history.is_empty() { history.push(1.min(v - 1)); }
-    let mut rng = SplitMix64::new(seed.wrapping_add(history.len() as u64).wrapping_add(0xBEEF));
-    let mut out_tokens = Vec::new();
-    let temp = net.temperature.max(1e-3);
-    let word_mode = net.vocab.mode == crate::vocab::VocabMode::Word;
-    for _ in 0..net.max_tokens {
-        let input_vec = build_input_vec(&history, ctx, v, edim, emb, emb_table.as_deref(), &idf);
-        let logits = model.predict(&Tensor::new(vec![1, expected_in], input_vec));
-        let mut row: Vec<f32> = logits.data.iter().map(|x| x / temp).collect();
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        for r in row.iter_mut() { *r = (*r - max).exp(); }
-        let sum: f32 = row.iter().sum();
-        if sum <= 0.0 || !sum.is_finite() { break; }
-        for r in row.iter_mut() { *r /= sum; }
-        let u = rng.next_f32();
-        let mut acc = 0.0_f32; let mut chosen = 0;
-        for (i, p) in row.iter().enumerate() {
-            acc += *p;
-            if u <= acc { chosen = i; break; }
-        }
-        // Token 0 (<unk>) is the end-of-sequence sentinel — stop here.
-        if chosen == 0 { break; }
-        out_tokens.push(chosen);
-        history.push(chosen);
-    }
-    let mut out = net.prompt.clone();
-    out.push('|');
-    for (i, id) in out_tokens.iter().enumerate() {
-        if *id >= net.vocab.tokens.len() { continue; }
-        // In word mode tokens are whole words; insert a space before each so
-        // the output reads as normal text rather than concatenated words.
-        if word_mode && (i > 0 || !net.prompt.is_empty()) {
-            out.push(' ');
-        }
-        out.push_str(&net.vocab.tokens[*id]);
-    }
-    Ok(out)
-}
 
-fn build_input_vec(
-    history: &[usize],
-    ctx: usize,
-    v: usize,
-    edim: usize,
-    emb: EmbeddingKind,
-    emb_table: Option<&[f32]>,
-    idf: &[f32],
-) -> Vec<f32> {
-    use crate::corpus::positional_enc_pub;
-    match emb {
-        EmbeddingKind::OneHot | EmbeddingKind::TfIdf => {
-            let mut input = vec![0.0_f32; ctx * v];
-            for k in 0..ctx {
-                let idx = history.len().checked_sub(ctx - k).map(|i| history[i]).unwrap_or(0);
-                let id = idx.min(v - 1);
-                input[k * v + id] = if emb == EmbeddingKind::TfIdf { idf[id] } else { 1.0 };
-            }
-            input
-        }
-        EmbeddingKind::FastText | EmbeddingKind::Transformer => {
-            let e = edim.max(1);
-            let table = emb_table.unwrap_or(&[]);
-            let mut input = vec![0.0_f32; ctx * e];
-            for k in 0..ctx {
-                let idx = history.len().checked_sub(ctx - k).map(|i| history[i]).unwrap_or(0);
-                let id = idx.min(v - 1);
-                let row_start = id * e;
-                let base = k * e;
-                for d in 0..e {
-                    let mut val = if row_start + d < table.len() { table[row_start + d] } else { 0.0 };
-                    if emb == EmbeddingKind::Transformer { val += positional_enc_pub(k, d, e); }
-                    input[base + d] = val;
-                }
-            }
-            input
-        }
-    }
+    // Pre-compute the embedding table on the UI thread so the generator thread
+    // doesn't redo it for every restart.
+    let _emb_table = emb.uses_dense_embed()
+        .then(|| random_embedding_table(v, edim, seed));
+
+    let mut history = net.vocab.encode(&net.prompt);
+    let prompt_nonempty = !history.is_empty();
+    if history.is_empty() { history.push(1.min(v - 1)); }
+
+    Ok(crate::generator::GeneratorConfig {
+        model: model.clone(),
+        vocab_tokens: net.vocab.tokens.clone(),
+        vocab_mode: net.vocab.mode,
+        embedding: emb,
+        embed_dim: edim,
+        context_size: ctx,
+        seed,
+        temperature: net.temperature,
+        max_tokens: net.max_tokens,
+        idf,
+        history,
+        prompt_nonempty,
+    })
 }
 
 // ===== PLUGINS TAB =====

@@ -1,15 +1,10 @@
 //! egui application — tabbed workbench shell.
-//!
-//! The app is organised around a `NetworkStore` (multiple networks) and a tab
-//! selector. The active network is displayed in a dropdown at the top of the
-//! window; switching networks instantly reloads weights and reflects the new
-//! state in every tab.
 
 use crate::corpus::{Corpus, CorpusTemplate};
 use crate::docs;
 use crate::networks::{EmbeddingKind, NetworkInstance, NetworkKind, NetworkStore, OptChoice};
 use crate::paths;
-use crate::plot::{scatter_2d, LinePlot};
+use crate::plot::{scatter_2d, scatter_2d_with_query, LinePlot};
 use crate::plugins::PluginRegistry;
 use crate::theme;
 use crate::trainer::{self, TrainingConfig, TrainingState};
@@ -25,13 +20,7 @@ use std::time::Duration;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Tab {
-    Docs,
-    Networks,
-    Corpus,
-    Vocab,
-    Training,
-    Inference,
-    Plugins,
+    Docs, Networks, Corpus, Vocab, Training, Inference, Plugins,
 }
 
 impl Tab {
@@ -41,18 +30,14 @@ impl Tab {
     ];
     pub fn label(&self) -> &'static str {
         match self {
-            Tab::Docs => "Docs",
-            Tab::Networks => "Networks",
-            Tab::Corpus => "Corpus",
-            Tab::Vocab => "Vocab",
-            Tab::Training => "Training",
-            Tab::Inference => "Inference",
+            Tab::Docs => "Docs", Tab::Networks => "Networks",
+            Tab::Corpus => "Corpus", Tab::Vocab => "Vocab",
+            Tab::Training => "Training", Tab::Inference => "Inference",
             Tab::Plugins => "Plugins",
         }
     }
 }
 
-/// "Create Network" dialog state.
 #[derive(Default)]
 struct CreateDialog {
     open: bool,
@@ -84,30 +69,20 @@ impl NeuralCabinApp {
             rng: SplitMix64::new(0xA11CE),
             pending_delete: None,
         };
-
-        // Auto-load every network that was previously saved to appdata.
         let saved = paths::list_saved_networks().unwrap_or_default();
         if saved.is_empty() {
-            // Seed with a starter Simplex XOR network on first launch.
             let mut starter = NetworkInstance::new_simplex(0, "xor-mlp".into(), 0x5EED);
             starter.corpus.template = CorpusTemplate::Xor;
             starter.corpus.build_numeric(starter.seed);
             app.store.add(starter);
         } else {
             for (name, path) in &saved {
-                match persistence::load(path) {
-                    Ok(f) => {
-                        let net = network_from_file(f, name.clone());
-                        app.store.add_loaded(net);
-                    }
-                    Err(_) => {
-                        // File is unreadable; skip silently — a broken save
-                        // should not prevent the app from launching.
-                    }
+                if let Ok(f) = persistence::load(path) {
+                    let net = network_from_file(f, name.clone());
+                    app.store.add_loaded(net);
                 }
             }
         }
-
         app
     }
 
@@ -126,8 +101,7 @@ impl NeuralCabinApp {
         match self.store.active().map(|n| &n.kind) {
             Some(NetworkKind::NextTokenGen) => true,
             Some(NetworkKind::Plugin { plugin_id, .. }) => self
-                .plugins
-                .find_by_id(plugin_id)
+                .plugins.find_by_id(plugin_id)
                 .map(|p| p.manifest.manages_vocab)
                 .unwrap_or(false),
             _ => false,
@@ -155,30 +129,61 @@ impl NeuralCabinApp {
 
 impl eframe::App for NeuralCabinApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.theme_applied {
-            theme::apply(ctx);
-            self.theme_applied = true;
-        }
-        if let Some(id) = self.pending_delete.take() {
-            self.store.remove(id);
-        }
+        if !self.theme_applied { theme::apply(ctx); self.theme_applied = true; }
+        if let Some(id) = self.pending_delete.take() { self.store.remove(id); }
         if self.any_training() {
             ctx.request_repaint_after(Duration::from_millis(75));
         }
         self.poll_active_trainer();
         self.rebuild_create_options();
 
+        // Handle files dropped anywhere on the window — route to the active
+        // tab's most-relevant path field.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            let first = dropped[0].display().to_string();
+            match self.tab {
+                Tab::Corpus => {
+                    if let Some(net) = self.store.active_mut() {
+                        match net.kind {
+                            NetworkKind::NextTokenGen => {
+                                net.corpus.upload_path = first.clone();
+                                let _ = net.corpus.upload_text_file(&first);
+                            }
+                            _ => net.corpus.csv_path = first,
+                        }
+                    }
+                }
+                Tab::Vocab => {
+                    if let Some(net) = self.store.active_mut() {
+                        net.vocab.upload_path = first.clone();
+                        let _ = net.vocab.load_file(&first);
+                        net.sync_text_dims();
+                    }
+                }
+                Tab::Plugins => {
+                    self.plugins.upload_path = first.clone();
+                    self.plugins.install(&first);
+                }
+                _ => {}
+            }
+        }
+
         self.top_bar(ctx);
         self.tab_strip(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.tab {
-                Tab::Docs => self.docs_tab(ui),
-                Tab::Networks => self.networks_tab(ui),
-                Tab::Corpus => self.corpus_tab(ui),
-                Tab::Vocab => self.vocab_tab(ui),
-                Tab::Training => self.training_tab(ui),
+                Tab::Docs      => self.docs_tab(ui),
+                Tab::Networks  => self.networks_tab(ui),
+                Tab::Corpus    => self.corpus_tab(ui),
+                Tab::Vocab     => self.vocab_tab(ui),
+                Tab::Training  => self.training_tab(ui),
                 Tab::Inference => self.inference_tab(ui),
-                Tab::Plugins => self.plugins_tab(ui),
+                Tab::Plugins   => self.plugins_tab(ui),
             }
         });
     }
@@ -191,21 +196,11 @@ impl NeuralCabinApp {
         egui::TopBottomPanel::top("top").exact_height(46.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new("NeuralCabin")
-                        .color(theme::TEXT)
-                        .size(18.0)
-                        .strong(),
-                );
+                ui.label(RichText::new("NeuralCabin").color(theme::TEXT).size(18.0).strong());
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new("pure-Rust workbench")
-                        .color(theme::TEXT_FAINT)
-                        .italics()
-                        .size(11.5),
-                );
+                ui.label(RichText::new("pure-Rust workbench")
+                    .color(theme::TEXT_FAINT).italics().size(11.5));
                 ui.add_space(20.0);
-
                 let active_label = self.store.active()
                     .map(|n| format!("◆ {}  ·  {}", n.name, n.kind.label()))
                     .unwrap_or_else(|| "◇ no network".into());
@@ -216,9 +211,8 @@ impl NeuralCabinApp {
                         let ids: Vec<(u64, String, String)> = self.store.iter()
                             .map(|n| (n.id, n.name.clone(), n.kind.label())).collect();
                         for (id, name, kind) in ids {
-                            let label = format!("{name}  ·  {kind}");
                             let selected = self.store.active == Some(id);
-                            if ui.selectable_label(selected, label).clicked() {
+                            if ui.selectable_label(selected, format!("{name}  ·  {kind}")).clicked() {
                                 self.store.select(id);
                             }
                         }
@@ -228,15 +222,13 @@ impl NeuralCabinApp {
                             self.create.open = true;
                         }
                     });
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
                     ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                         .color(theme::TEXT_FAINT).size(11.0));
                     ui.add_space(12.0);
                     let alive = if self.any_training() { 1.0 } else { 0.0 };
-                    let label = if alive > 0.0 { "training" } else { "idle" };
-                    theme::pulse_dot(ui, alive, label);
+                    theme::pulse_dot(ui, alive, if alive > 0.0 { "training" } else { "idle" });
                 });
             });
         });
@@ -247,28 +239,21 @@ impl NeuralCabinApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
-                    let mut text = RichText::new(tab.label()).size(13.5);
-                    let enabled = match tab {
-                        Tab::Vocab => self.vocab_enabled(),
-                        _ => true,
-                    };
-                    if !enabled { text = text.color(theme::TEXT_FAINT); }
+                    let enabled = !matches!(tab, Tab::Vocab) || self.vocab_enabled();
                     let selected = self.tab == tab;
-                    if selected { text = text.color(theme::ACCENT).strong(); }
+                    let mut text = RichText::new(tab.label()).size(13.5);
+                    if !enabled { text = text.color(theme::TEXT_FAINT); }
+                    if selected  { text = text.color(theme::ACCENT).strong(); }
                     let resp = ui.add_enabled(
                         enabled,
-                        egui::Button::new(text)
-                            .frame(false)
-                            .min_size(egui::vec2(0.0, 28.0)),
+                        egui::Button::new(text).frame(false).min_size(egui::vec2(0.0, 28.0)),
                     );
                     if resp.clicked() { self.tab = tab; }
                     if selected {
                         let r = resp.rect;
                         ui.painter().line_segment(
-                            [
-                                egui::pos2(r.left() + 6.0, r.bottom()),
-                                egui::pos2(r.right() - 6.0, r.bottom()),
-                            ],
+                            [egui::pos2(r.left() + 6.0, r.bottom()),
+                             egui::pos2(r.right() - 6.0, r.bottom())],
                             egui::Stroke::new(2.0, theme::ACCENT),
                         );
                     }
@@ -284,26 +269,21 @@ impl NeuralCabinApp {
 impl NeuralCabinApp {
     fn docs_tab(&mut self, ui: &mut egui::Ui) {
         let sections = docs::sections();
-        egui::SidePanel::left("docs_nav")
-            .resizable(true)
-            .default_width(220.0)
-            .show_inside(ui, |ui| {
-                theme::section_heading(ui, "Sections");
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (i, s) in sections.iter().enumerate() {
-                        let selected = self.docs_section == i;
-                        let mut text = RichText::new(s.title).size(13.0);
-                        if selected { text = text.color(theme::ACCENT).strong(); }
-                        if ui.add(
-                            egui::Button::new(text)
-                                .frame(false)
-                                .min_size(egui::vec2(ui.available_width(), 22.0)),
-                        ).clicked() {
-                            self.docs_section = i;
-                        }
+        egui::SidePanel::left("docs_nav").resizable(true).default_width(220.0).show_inside(ui, |ui| {
+            theme::section_heading(ui, "Sections");
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (i, s) in sections.iter().enumerate() {
+                    let selected = self.docs_section == i;
+                    let mut text = RichText::new(s.title).size(13.0);
+                    if selected { text = text.color(theme::ACCENT).strong(); }
+                    if ui.add(egui::Button::new(text).frame(false)
+                        .min_size(egui::vec2(ui.available_width(), 22.0))).clicked()
+                    {
+                        self.docs_section = i;
                     }
-                });
+                }
             });
+        });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let s = &sections[self.docs_section.min(sections.len() - 1)];
             ui.label(RichText::new(s.title).size(22.0).strong());
@@ -320,8 +300,8 @@ impl NeuralCabinApp {
                             ui.label(RichText::new(line.trim_start_matches("- ")).color(theme::TEXT));
                         });
                     } else if line.starts_with("```") {
-                        // skip fence markers
-                    } else if line == "------------" || line == "---------------" || line == "-------" {
+                        // skip fence
+                    } else if line.starts_with("-------") {
                         theme::hairline(ui);
                     } else if line.ends_with(':')
                         && line.len() < 60
@@ -342,17 +322,11 @@ impl NeuralCabinApp {
 
 impl NeuralCabinApp {
     fn networks_tab(&mut self, ui: &mut egui::Ui) {
-        egui::SidePanel::left("networks_list")
-            .resizable(true)
-            .default_width(240.0)
+        egui::SidePanel::left("networks_list").resizable(true).default_width(240.0)
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("＋  Create Network").strong())
-                            .min_size(egui::vec2(ui.available_width(), 28.0)),
-                    )
-                    .clicked()
+                if ui.add(egui::Button::new(RichText::new("＋  Create Network").strong())
+                    .min_size(egui::vec2(ui.available_width(), 28.0))).clicked()
                 {
                     self.create.open = true;
                     self.create.name = format!("net-{}", self.store.next_id);
@@ -361,11 +335,8 @@ impl NeuralCabinApp {
                 theme::hairline(ui);
                 ui.add_space(4.0);
                 let active = self.store.active;
-                let entries: Vec<(u64, String, String)> = self
-                    .store
-                    .iter()
-                    .map(|n| (n.id, n.name.clone(), n.kind.label()))
-                    .collect();
+                let entries: Vec<(u64, String, String)> = self.store.iter()
+                    .map(|n| (n.id, n.name.clone(), n.kind.label())).collect();
                 let mut to_select: Option<u64> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (id, name, kind) in entries {
@@ -373,36 +344,23 @@ impl NeuralCabinApp {
                         let mut text = RichText::new(format!("◆  {name}")).size(13.5);
                         if selected { text = text.color(theme::ACCENT).strong(); }
                         let avail = ui.available_width();
-                        if ui
-                            .add(
-                                egui::Button::new(text)
-                                    .frame(selected)
-                                    .min_size(egui::vec2(avail, 24.0)),
-                            )
-                            .clicked()
+                        if ui.add(egui::Button::new(text).frame(selected)
+                            .min_size(egui::vec2(avail, 24.0))).clicked()
                         {
                             to_select = Some(id);
                         }
-                        ui.label(
-                            RichText::new(format!("    {kind}"))
-                                .color(theme::TEXT_WEAK)
-                                .size(11.0),
-                        );
+                        ui.label(RichText::new(format!("    {kind}"))
+                            .color(theme::TEXT_WEAK).size(11.0));
                         ui.add_space(2.0);
                     }
                 });
                 if let Some(id) = to_select { self.store.select(id); }
-
                 if self.create.open {
-                    ui.add_space(8.0);
-                    theme::hairline(ui);
-                    ui.add_space(4.0);
+                    ui.add_space(8.0); theme::hairline(ui); ui.add_space(4.0);
                     self.create_dialog(ui);
                 }
             });
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.network_editor(ui);
-        });
+        egui::CentralPanel::default().show_inside(ui, |ui| { self.network_editor(ui); });
     }
 
     fn create_dialog(&mut self, ui: &mut egui::Ui) {
@@ -417,13 +375,8 @@ impl NeuralCabinApp {
             let selected = self.create.kind_idx == i;
             let mut text = RichText::new(format!("• {}", kind.label())).size(12.5);
             if selected { text = text.color(theme::ACCENT).strong(); }
-            if ui
-                .add(
-                    egui::Button::new(text)
-                        .frame(selected)
-                        .min_size(egui::vec2(ui.available_width(), 22.0)),
-                )
-                .clicked()
+            if ui.add(egui::Button::new(text).frame(selected)
+                .min_size(egui::vec2(ui.available_width(), 22.0))).clicked()
             {
                 self.create.kind_idx = i;
             }
@@ -431,33 +384,23 @@ impl NeuralCabinApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button("Create").clicked() {
-                let name = if self.create.name.trim().is_empty() {
-                    format!("net-{}", self.store.next_id)
-                } else {
-                    self.create.name.trim().to_string()
-                };
+                let name = self.create.name.trim().to_string();
+                let name = if name.is_empty() { format!("net-{}", self.store.next_id) } else { name };
                 let seed = self.rng.next_u64();
-                let kind = self
-                    .create
-                    .base_options
-                    .get(self.create.kind_idx)
-                    .cloned()
-                    .unwrap_or(NetworkKind::Simplex);
+                let kind = self.create.base_options.get(self.create.kind_idx)
+                    .cloned().unwrap_or(NetworkKind::Simplex);
                 let net = match kind {
                     NetworkKind::Simplex => NetworkInstance::new_simplex(0, name, seed),
                     NetworkKind::NextTokenGen => NetworkInstance::new_next_token(0, name, seed),
-                    NetworkKind::Plugin { plugin_id, type_name } => {
-                        NetworkInstance::new_plugin(0, name, plugin_id, type_name, seed)
-                    }
+                    NetworkKind::Plugin { plugin_id, type_name } =>
+                        NetworkInstance::new_plugin(0, name, plugin_id, type_name, seed),
                 };
-                let new_id = self.store.add(net);
-                self.store.select(new_id);
+                let id = self.store.add(net);
+                self.store.select(id);
                 self.create.open = false;
                 self.create.name.clear();
             }
-            if ui.button("Cancel").clicked() {
-                self.create.open = false;
-            }
+            if ui.button("Cancel").clicked() { self.create.open = false; }
         });
     }
 
@@ -476,7 +419,6 @@ impl NeuralCabinApp {
             });
             return;
         };
-
         let is_ntg = matches!(net.kind, NetworkKind::NextTokenGen);
         let last_linear = net.last_linear_idx();
 
@@ -484,10 +426,8 @@ impl NeuralCabinApp {
             ui.label(RichText::new(&net.name).size(20.0).strong());
             ui.label(RichText::new(net.kind.label()).color(theme::TEXT_WEAK));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(RichText::new("✕  Delete network").color(theme::TEXT_WEAK))
-                    .on_hover_text("Remove this network from the workspace")
-                    .clicked()
+                if ui.button(RichText::new("✕  Delete network").color(theme::TEXT_WEAK))
+                    .on_hover_text("Remove this network from the workspace").clicked()
                 {
                     if let Some(id) = active_id { *pending_delete = Some(id); }
                 }
@@ -505,21 +445,14 @@ impl NeuralCabinApp {
             if ui.add(egui::DragValue::new(&mut s)).changed() { net.seed = s as u64; }
         });
 
-        // Input dim — locked for NextTokenGen (driven by vocab × context).
         if is_ntg {
             ui.horizontal(|ui| {
                 ui.label("Input dim:");
-                ui.label(
-                    RichText::new(format!("{} (auto — vocab × context)", net.input_dim))
-                        .color(theme::TEXT_FAINT)
-                        .size(11.5),
-                );
+                ui.label(RichText::new(format!("{} (auto — vocab × context)", net.input_dim))
+                    .color(theme::TEXT_FAINT).size(11.5));
             });
-            ui.label(
-                RichText::new("  ↳ Output dim is also locked to vocab size.")
-                    .color(theme::TEXT_FAINT)
-                    .size(11.0),
-            );
+            ui.label(RichText::new("  ↳ Output dim is also locked to vocab size.")
+                .color(theme::TEXT_FAINT).size(11.0));
         } else {
             ui.horizontal(|ui| {
                 ui.label("Input dim:");
@@ -536,9 +469,7 @@ impl NeuralCabinApp {
         let mut current_dim = net.input_dim;
         for (i, spec) in net.layer_specs.iter_mut().enumerate() {
             let is_first_linear = i == 0 && matches!(spec, LayerSpec::Linear { .. });
-            let is_last_linear  = Some(i) == last_linear;
-            let locked = is_ntg && (is_first_linear || is_last_linear);
-
+            let locked = is_ntg && (is_first_linear || Some(i) == last_linear);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}.", i + 1));
@@ -549,10 +480,8 @@ impl NeuralCabinApp {
                             ui.label(format!("in={in_dim}"));
                             ui.label("→ out=");
                             if locked {
-                                ui.label(
-                                    RichText::new(format!("{out_dim} (locked)"))
-                                        .color(theme::TEXT_FAINT),
-                                );
+                                ui.label(RichText::new(format!("{out_dim} (locked)"))
+                                    .color(theme::TEXT_FAINT));
                             } else {
                                 let mut o = *out_dim as i32;
                                 if ui.add(egui::DragValue::new(&mut o).range(1..=8192)).changed() {
@@ -580,8 +509,7 @@ impl NeuralCabinApp {
 
         ui.horizontal(|ui| {
             if ui.button("＋ Linear").clicked() {
-                let in_dim = current_dim;
-                net.layer_specs.push(LayerSpec::Linear { in_dim, out_dim: net.pending_linear_units });
+                net.layer_specs.push(LayerSpec::Linear { in_dim: current_dim, out_dim: net.pending_linear_units });
             }
             ui.label("units:");
             let mut u = net.pending_linear_units as i32;
@@ -602,19 +530,15 @@ impl NeuralCabinApp {
         });
 
         ui.add_space(6.0);
-        if ui
-            .add_sized(
-                [ui.available_width(), 30.0],
-                egui::Button::new(RichText::new("Build / Reset Model").strong()),
-            )
-            .clicked()
+        if ui.add_sized([ui.available_width(), 30.0],
+            egui::Button::new(RichText::new("Build / Reset Model").strong())).clicked()
         {
             net.build_model();
         }
         if let Some(msg) = &net.build_message {
-            let color = if msg.starts_with("Layer ") || msg.starts_with("Model ")
-            { theme::DANGER } else { theme::TEXT_WEAK };
-            ui.colored_label(color, msg);
+            let c = if msg.starts_with("Layer ") || msg.starts_with("Model ")
+                { theme::DANGER } else { theme::TEXT_WEAK };
+            ui.colored_label(c, msg);
         }
         if let Some(model) = &net.model {
             ui.add_space(4.0);
@@ -630,21 +554,11 @@ impl NeuralCabinApp {
         ui.add_space(10.0);
         theme::section_heading(ui, "Persistence");
         let stem = paths::sanitize_filename(&net.name);
-        ui.label(
-            RichText::new(format!("File: {stem}.json"))
-                .color(theme::TEXT_WEAK)
-                .size(11.5),
-        );
-        ui.label(
-            RichText::new(format!("Location: {storage_path}"))
-                .color(theme::TEXT_FAINT)
-                .size(11.0),
-        );
+        ui.label(RichText::new(format!("File: {stem}.json")).color(theme::TEXT_WEAK).size(11.5));
+        ui.label(RichText::new(format!("Location: {storage_path}")).color(theme::TEXT_FAINT).size(11.0));
         ui.add_space(4.0);
-        if ui
-            .button(RichText::new("💾  Save").strong())
-            .on_hover_text("Save this network (architecture, weights, corpus, vocab) to the app data folder")
-            .clicked()
+        if ui.button(RichText::new("💾  Save").strong())
+            .on_hover_text("Save architecture, weights, corpus, and vocab to app data").clicked()
         {
             save_active(net);
         }
@@ -663,88 +577,61 @@ fn save_active(net: &mut NetworkInstance) {
     };
     let dir = match paths::networks_dir() {
         Ok(d) => d,
-        Err(e) => {
-            net.persistence_message = Some(format!("appdata error: {e}"));
-            return;
-        }
+        Err(e) => { net.persistence_message = Some(format!("appdata error: {e}")); return; }
     };
-    let stem = paths::sanitize_filename(&net.name);
-    let path = dir.join(format!("{stem}.json"));
-    let mut file = ModelFile::wrap(
-        model.clone(),
-        Some(net.loss_choice),
-        Some(net.current_optimizer()),
-    );
-    // Full network state (v2).
-    file.network_kind      = Some(net.kind.to_persist_string());
-    file.network_name      = Some(net.name.clone());
-    file.seed              = Some(net.seed);
-    file.corpus_text_body  = Some(net.corpus.text_body.clone());
-    file.corpus_text_paths = Some(net.corpus.text_paths.clone());
-    file.corpus_context_size = Some(net.corpus.context_size);
-    file.vocab_tokens      = Some(net.vocab.tokens.clone());
-    file.vocab_mode        = Some(net.vocab.mode.to_str().to_string());
-    file.embedding_kind    = Some(net.embedding_kind.to_str().to_string());
-    file.embed_dim         = Some(net.embed_dim);
-
+    let path = dir.join(format!("{}.json", paths::sanitize_filename(&net.name)));
+    let mut file = ModelFile::wrap(model.clone(), Some(net.loss_choice), Some(net.current_optimizer()));
+    file.network_kind       = Some(net.kind.to_persist_string());
+    file.network_name       = Some(net.name.clone());
+    file.seed               = Some(net.seed);
+    file.corpus_text_body   = Some(net.corpus.text_body.clone());
+    file.corpus_text_paths  = Some(net.corpus.text_paths.clone());
+    file.corpus_context_size= Some(net.corpus.context_size);
+    file.vocab_tokens       = Some(net.vocab.tokens.clone());
+    file.vocab_mode         = Some(net.vocab.mode.to_str().to_string());
+    file.embedding_kind     = Some(net.embedding_kind.to_str().to_string());
+    file.embed_dim          = Some(net.embed_dim);
     match persistence::save(&path, &file) {
         Ok(()) => net.persistence_message = Some(format!("Saved → {}", path.display())),
         Err(e) => net.persistence_message = Some(format!("Save failed: {e}")),
     }
 }
 
-/// Reconstruct a `NetworkInstance` from a `ModelFile`. The `name` argument is
-/// used only if `file.network_name` is absent (e.g., legacy v1 files).
 fn network_from_file(f: ModelFile, name: String) -> NetworkInstance {
-    let kind = f.network_kind
-        .as_deref()
+    let kind = f.network_kind.as_deref()
         .map(NetworkKind::from_persist_string)
         .unwrap_or(NetworkKind::Simplex);
-
     let name = f.network_name.clone().filter(|s| !s.is_empty()).unwrap_or(name);
     let seed = f.seed.unwrap_or(0x5EED);
-
     let input_dim = f.model.input_dim;
     let layer_specs: Vec<LayerSpec> = f.model.layers.iter().map(|l| match l {
         neuralcabin_engine::nn::Layer::Linear(ll) =>
             LayerSpec::Linear { in_dim: ll.in_dim, out_dim: ll.out_dim },
         neuralcabin_engine::nn::Layer::Activation(a) => LayerSpec::Activation(*a),
     }).collect();
-
-    // Build the shell with the correct kind-specific defaults…
     let mut net = match &kind {
         NetworkKind::Simplex     => NetworkInstance::new_simplex(0, name, seed),
         NetworkKind::NextTokenGen=> NetworkInstance::new_next_token(0, name, seed),
         NetworkKind::Plugin { plugin_id, type_name } =>
             NetworkInstance::new_plugin(0, name, plugin_id.clone(), type_name.clone(), seed),
     };
-
-    // …then overwrite with the actual saved values.
-    net.kind        = kind;
-    net.input_dim   = input_dim;
+    net.kind = kind;
+    net.input_dim = input_dim;
     net.layer_specs = layer_specs;
-    net.model       = Some(f.model);
-
+    net.model = Some(f.model);
     if let Some(l) = f.loss      { net.loss_choice = l; }
     if let Some(o) = f.optimizer { net.set_optimizer(o); }
-
-    // Corpus.
-    if let Some(body) = f.corpus_text_body   { net.corpus.text_body   = body; }
-    if let Some(paths) = f.corpus_text_paths { net.corpus.text_paths  = paths; }
-    if let Some(ctx) = f.corpus_context_size { net.corpus.context_size = ctx; }
-
-    // Vocab.
-    if let Some(tokens) = f.vocab_tokens { net.vocab.tokens = tokens; }
-    if let Some(m)      = f.vocab_mode.as_deref().and_then(VocabMode::from_str) {
+    if let Some(b) = f.corpus_text_body   { net.corpus.text_body   = b; }
+    if let Some(p) = f.corpus_text_paths  { net.corpus.text_paths  = p; }
+    if let Some(c) = f.corpus_context_size { net.corpus.context_size = c; }
+    if let Some(t) = f.vocab_tokens { net.vocab.tokens = t; }
+    if let Some(m) = f.vocab_mode.as_deref().and_then(VocabMode::from_str) {
         net.vocab.mode = m;
     }
-
-    // Embedding.
-    if let Some(emb) = f.embedding_kind.as_deref() {
-        net.embedding_kind = EmbeddingKind::from_str(emb);
+    if let Some(e) = f.embedding_kind.as_deref() {
+        net.embedding_kind = EmbeddingKind::from_str(e);
     }
     if let Some(d) = f.embed_dim { net.embed_dim = d; }
-
     net.inference_inputs = vec![0.0; input_dim];
     net
 }
@@ -764,9 +651,8 @@ impl NeuralCabinApp {
             NetworkKind::NextTokenGen => corpus_text_panel(ui, &mut net.corpus, &net.vocab),
             NetworkKind::Simplex => corpus_numeric_panel(ui, &mut net.corpus, net.seed, false),
             NetworkKind::Plugin { .. } => {
-                ui.label(RichText::new(
-                    "Plugin networks default to numeric corpora — pick a template:",
-                ).color(theme::TEXT_WEAK));
+                ui.label(RichText::new("Plugin networks default to numeric corpora:")
+                    .color(theme::TEXT_WEAK));
                 corpus_numeric_panel(ui, &mut net.corpus, net.seed, true);
             }
         }
@@ -781,9 +667,7 @@ fn corpus_numeric_panel(ui: &mut egui::Ui, corpus: &mut Corpus, seed: u64, allow
                 corpus.template = *tpl;
             }
         }
-        if allow_text
-            && ui.selectable_label(corpus.template == CorpusTemplate::Text, "Text").clicked()
-        {
+        if allow_text && ui.selectable_label(corpus.template == CorpusTemplate::Text, "Text").clicked() {
             corpus.template = CorpusTemplate::Text;
         }
     });
@@ -815,10 +699,7 @@ fn corpus_numeric_panel(ui: &mut egui::Ui, corpus: &mut Corpus, seed: u64, allow
             });
         }
         CorpusTemplate::Csv => {
-            ui.horizontal(|ui| {
-                ui.label("Path:");
-                ui.add(egui::TextEdit::singleline(&mut corpus.csv_path).desired_width(360.0));
-            });
+            file_pick_row(ui, "File:", &mut corpus.csv_path, &[("CSV", &["csv"])], false);
             ui.horizontal(|ui| {
                 ui.checkbox(&mut corpus.csv_has_header, "Has header");
                 ui.label("num_classes (blank = regression):");
@@ -839,18 +720,10 @@ fn corpus_numeric_panel(ui: &mut egui::Ui, corpus: &mut Corpus, seed: u64, allow
                 }
                 ui.checkbox(&mut corpus.custom_classification, "one-hot classification");
             });
-            theme::caption(
-                ui,
-                "Each line is one row: comma-separated values, inputs first then outputs. \
-                 Blank lines and lines starting with # are ignored.",
-            );
+            theme::caption(ui, "Each line: comma-separated values, inputs first then outputs.");
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut corpus.custom_rows)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(10)
-                        .code_editor(),
-                );
+                ui.add(egui::TextEdit::multiline(&mut corpus.custom_rows)
+                    .desired_width(f32::INFINITY).desired_rows(10).code_editor());
             });
         }
         CorpusTemplate::Xor | CorpusTemplate::Text => {}
@@ -876,8 +749,7 @@ fn corpus_numeric_panel(ui: &mut egui::Ui, corpus: &mut Corpus, seed: u64, allow
                     let x = ds.features.data[i * 2];
                     let y = ds.features.data[i * 2 + 1];
                     let row = &ds.labels.data[i * num_classes..(i + 1) * num_classes];
-                    let mut best = 0;
-                    let mut bv = f32::NEG_INFINITY;
+                    let mut best = 0; let mut bv = f32::NEG_INFINITY;
                     for (k, v) in row.iter().enumerate() { if *v > bv { bv = *v; best = k; } }
                     points.push((x, y, best));
                 }
@@ -898,37 +770,29 @@ fn corpus_text_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
         ui.label(RichText::new(format!("vocab = {} tokens", vocab.len())).color(theme::TEXT_WEAK));
     });
     ui.add_space(4.0);
-    ui.label(RichText::new("Corpus body — paste documentation, chats, source, anything.")
+    ui.label(RichText::new("Corpus body — paste text, code, chats, documentation…")
         .color(theme::TEXT_WEAK).size(11.5));
     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-        ui.add(
-            egui::TextEdit::multiline(&mut corpus.text_body)
-                .desired_width(f32::INFINITY)
-                .desired_rows(12)
-                .code_editor(),
-        );
+        ui.add(egui::TextEdit::multiline(&mut corpus.text_body)
+            .desired_width(f32::INFINITY).desired_rows(12).code_editor());
     });
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("Append file:");
-        ui.add(egui::TextEdit::singleline(&mut corpus.upload_path).desired_width(360.0));
-        if ui.button("Upload").clicked() {
-            let path = corpus.upload_path.clone();
-            if let Err(e) = corpus.upload_text_file(&path) {
-                corpus.message = Some(format!("Upload failed: {e}"));
-            }
+
+    // File upload row with native picker.
+    file_pick_row(ui, "Append file:", &mut corpus.upload_path,
+        &[("Text", &["txt", "md", "rs", "py", "js", "ts", "json"])], false);
+    if ui.button("Upload").clicked() {
+        let path = corpus.upload_path.clone();
+        if let Err(e) = corpus.upload_text_file(&path) {
+            corpus.message = Some(format!("Upload failed: {e}"));
         }
-    });
+    }
     if !corpus.text_paths.is_empty() {
         ui.label(RichText::new(format!("Files: {}", corpus.text_paths.join(", ")))
             .color(theme::TEXT_FAINT).size(11.0));
     }
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        if ui.button("Re-tokenise").clicked() {
-            corpus.retokenise(vocab);
-        }
-    });
+    if ui.button("Re-tokenise").clicked() { corpus.retokenise(vocab); }
     if let Some(m) = &corpus.message {
         ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
     }
@@ -951,24 +815,20 @@ impl NeuralCabinApp {
                 ui.label(RichText::new("Vocab is only available for next-token-generation networks.")
                     .color(theme::TEXT_WEAK));
                 ui.add_space(4.0);
-                ui.label(RichText::new("(or for plugin networks whose manifest sets manages_vocab = true)")
+                ui.label(RichText::new("(or for plugin networks with manages_vocab = true)")
                     .color(theme::TEXT_FAINT).size(11.0));
             });
             return;
         }
-        let plugin_managed = matches!(&net.kind, NetworkKind::Plugin { .. });
-        if plugin_managed {
-            ui.label(RichText::new("Plugin-managed vocab — the active plugin owns this tab.")
-                .color(theme::TEXT_WEAK));
+        if matches!(&net.kind, NetworkKind::Plugin { .. }) {
+            ui.label(RichText::new("Plugin-managed vocab.").color(theme::TEXT_WEAK));
             ui.add_space(4.0);
         }
 
-        // ── Embedding type picker ──────────────────────────────────────────
+        // ── Embedding type ────────────────────────────────────────────────────
         ui.add_space(4.0);
         theme::section_heading(ui, "Embedding");
-        theme::caption(ui,
-            "Controls how tokens are converted to numeric vectors before the MLP.\
-             \nAll modes are pure-Rust, no external model downloads required.");
+        theme::caption(ui, "How tokens are converted to numbers before the MLP (all pure-Rust, no downloads).");
         ui.add_space(4.0);
         let mut emb_changed = false;
         ui.horizontal_wrapped(|ui| {
@@ -976,17 +836,14 @@ impl NeuralCabinApp {
                 let selected = net.embedding_kind == *kind;
                 let mut text = RichText::new(kind.name()).size(12.5);
                 if selected { text = text.color(theme::ACCENT).strong(); }
-                if ui.add(
-                    egui::Button::new(text)
-                        .frame(selected)
-                        .min_size(egui::vec2(0.0, 24.0)),
-                ).clicked() && !selected {
+                if ui.add(egui::Button::new(text).frame(selected)
+                    .min_size(egui::vec2(0.0, 24.0))).clicked() && !selected
+                {
                     net.embedding_kind = *kind;
                     emb_changed = true;
                 }
             }
         });
-
         if net.embedding_kind.uses_dense_embed() {
             ui.horizontal(|ui| {
                 ui.label("Embedding dim:");
@@ -996,33 +853,28 @@ impl NeuralCabinApp {
                     emb_changed = true;
                 }
             });
-            theme::caption(ui,
-                "Embeddings are seeded from the network seed — same seed → same table.");
+            theme::caption(ui, "Seeded from network seed — same seed = same table.");
         }
-
         match net.embedding_kind {
             EmbeddingKind::OneHot =>
-                theme::caption(ui, "Each token position → a sparse 0/1 vector of length vocab_size."),
+                theme::caption(ui, "Sparse 0/1 vector per position, length = vocab_size."),
             EmbeddingKind::TfIdf =>
-                theme::caption(ui, "Each token position → an IDF-weighted vector.  Rare tokens get higher weight."),
+                theme::caption(ui, "IDF-weighted: rare tokens get higher weight."),
             EmbeddingKind::FastText =>
-                theme::caption(ui, "Each token → a dense vector of embed_dim floats (Word2Vec/FastText style, trained end-to-end)."),
+                theme::caption(ui, "Dense embed_dim vector per token — trained end-to-end."),
             EmbeddingKind::Transformer =>
-                theme::caption(ui, "Dense embedding + sinusoidal positional encoding (simplified Transformer-style)."),
+                theme::caption(ui, "Dense embedding + sinusoidal positional encoding."),
         }
-
-        if emb_changed {
-            net.sync_text_dims();
-        }
+        if emb_changed { net.sync_text_dims(); }
 
         ui.add_space(8.0);
         theme::hairline(ui);
-
-        // ── Vocab generation ────────────────────────────────────────────────
         ui.add_space(4.0);
+
+        // ── Tokenisation ──────────────────────────────────────────────────────
         theme::section_heading(ui, "Tokenisation");
         ui.horizontal(|ui| {
-            ui.label("Auto-generate from corpus:");
+            ui.label("Auto-generate:");
             let mut new_mode: Option<VocabMode> = None;
             for m in VocabMode::all() {
                 if ui.selectable_label(net.vocab.mode == *m, m.name()).clicked() {
@@ -1034,15 +886,11 @@ impl NeuralCabinApp {
                 net.sync_text_dims();
             }
         });
-
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Wipe").clicked() { net.vocab.clear(); }
-            ui.add(
-                egui::TextEdit::singleline(&mut net.vocab.draft_token)
-                    .hint_text("token to add")
-                    .desired_width(180.0),
-            );
+            ui.add(egui::TextEdit::singleline(&mut net.vocab.draft_token)
+                .hint_text("token to add").desired_width(180.0));
             if ui.button("Add").clicked() {
                 let t = net.vocab.draft_token.trim().to_string();
                 if !t.is_empty() {
@@ -1052,33 +900,33 @@ impl NeuralCabinApp {
                 }
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Upload (one token per line):");
-            ui.add(egui::TextEdit::singleline(&mut net.vocab.upload_path).desired_width(280.0));
-            if ui.button("Load").clicked() {
-                let path = net.vocab.upload_path.clone();
-                if let Err(e) = net.vocab.load_file(&path) {
-                    net.vocab.message = Some(format!("Load failed: {e}"));
-                } else {
-                    net.sync_text_dims();
-                }
-            }
-        });
 
-        // Build-training-set button with current embedding.
-        ui.add_space(4.0);
+        // File picker row for vocab upload.
+        file_pick_row(ui, "Upload (one token/line):", &mut net.vocab.upload_path,
+            &[("Text", &["txt"])], false);
+        if ui.button("Load vocab file").clicked() {
+            let path = net.vocab.upload_path.clone();
+            if let Err(e) = net.vocab.load_file(&path) {
+                net.vocab.message = Some(format!("Load failed: {e}"));
+            } else {
+                net.sync_text_dims();
+            }
+        }
+
         let emb = net.embedding_kind;
         let edim = net.embed_dim;
         let seed = net.seed;
         let vocab_clone = net.vocab.clone();
+        ui.add_space(4.0);
         if ui.button("Build training set").clicked() {
-            match net.corpus.build_text_dataset(&vocab_clone, emb, edim, seed) {
-                Ok(_) => {}
-                Err(e) => net.corpus.message = Some(format!("Build failed: {e}")),
+            if let Err(e) = net.corpus.build_text_dataset(&vocab_clone, emb, edim, seed) {
+                net.corpus.message = Some(format!("Build failed: {e}"));
             }
         }
-
         if let Some(m) = &net.vocab.message {
+            ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+        }
+        if let Some(m) = &net.corpus.message {
             ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
         }
         ui.add_space(8.0);
@@ -1088,7 +936,7 @@ impl NeuralCabinApp {
             for (i, tok) in net.vocab.tokens.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{i:>5}  ")).color(theme::TEXT_FAINT).monospace());
-                    let display = if tok.is_empty() { "<empty>".to_string() } else { tok.replace('\n', "\\n") };
+                    let display = if tok.is_empty() { "<empty>".into() } else { tok.replace('\n', "\\n") };
                     ui.label(RichText::new(display).monospace().color(theme::TEXT));
                     if i > 0 && ui.small_button("✕").clicked() { to_remove = Some(i); }
                 });
@@ -1120,13 +968,16 @@ impl NeuralCabinApp {
             }
             ui.add_space(20.0);
             ui.label("Optimiser:");
-            ui.selectable_value(&mut net.opt_choice, OptChoice::Sgd, "SGD");
-            ui.selectable_value(&mut net.opt_choice, OptChoice::Adam, "Adam");
+            for choice in [OptChoice::Sgd, OptChoice::Adam, OptChoice::AdamW, OptChoice::Lamb] {
+                ui.selectable_value(&mut net.opt_choice, choice, choice.name());
+            }
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Learning rate:");
-            if ui.add(egui::DragValue::new(&mut net.learning_rate).speed(0.001).range(1e-6..=10.0)).changed() {
+            if ui.add(egui::DragValue::new(&mut net.learning_rate)
+                .speed(0.001).range(1e-6..=10.0)).changed()
+            {
                 if let Some(h) = &net.trainer { h.set_lr(net.learning_rate); }
             }
             match net.opt_choice {
@@ -1134,7 +985,7 @@ impl NeuralCabinApp {
                     ui.label("momentum:");
                     ui.add(egui::DragValue::new(&mut net.momentum).speed(0.01).range(0.0..=0.999));
                 }
-                OptChoice::Adam => {
+                OptChoice::Adam | OptChoice::AdamW | OptChoice::Lamb => {
                     ui.label("β₁:");
                     ui.add(egui::DragValue::new(&mut net.beta1).speed(0.001).range(0.0..=0.999));
                     ui.label("β₂:");
@@ -1142,6 +993,15 @@ impl NeuralCabinApp {
                 }
             }
         });
+
+        // Weight decay row (AdamW / LAMB only).
+        if matches!(net.opt_choice, OptChoice::AdamW | OptChoice::Lamb) {
+            ui.horizontal(|ui| {
+                ui.label("Weight decay λ:");
+                ui.add(egui::DragValue::new(&mut net.weight_decay).speed(0.001).range(0.0..=1.0));
+                theme::caption(ui, "Applied directly to parameters (decoupled from gradient).");
+            });
+        }
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Epochs:");
@@ -1161,10 +1021,8 @@ impl NeuralCabinApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if !training {
-                if ui
-                    .add(egui::Button::new(RichText::new("▶  Train").strong())
-                        .min_size(egui::vec2(110.0, 28.0)))
-                    .clicked()
+                if ui.add(egui::Button::new(RichText::new("▶  Train").strong())
+                    .min_size(egui::vec2(110.0, 28.0))).clicked()
                 {
                     start_training(net);
                 }
@@ -1192,56 +1050,28 @@ impl NeuralCabinApp {
             ui.label(format!("epoch {}/{}", s.epoch, s.total_epochs));
             ui.separator();
             ui.label(format!("loss = {:.5}", s.last_loss));
-            if let Some(v) = s.last_val_loss {
-                ui.separator();
-                ui.label(format!("val loss = {:.5}", v));
-            }
-            if let Some(a) = s.last_accuracy {
-                ui.separator();
-                ui.label(format!("accuracy = {:.2}%", a * 100.0));
-            }
+            if let Some(v) = s.last_val_loss { ui.separator(); ui.label(format!("val = {:.5}", v)); }
+            if let Some(a) = s.last_accuracy { ui.separator(); ui.label(format!("acc = {:.2}%", a * 100.0)); }
             ui.separator();
             ui.label(format!("elapsed = {:.1}s", s.elapsed_secs));
         });
-        if let Some(e) = &s.error {
-            ui.colored_label(theme::DANGER, e);
-        }
+        if let Some(e) = &s.error { ui.colored_label(theme::DANGER, e); }
 
         ui.add_space(8.0);
         let series_owned: Vec<(String, Vec<f32>, Color32)> = vec![
             ("train".into(), s.loss_history.clone(), theme::TEXT),
             ("val".into(), s.val_loss_history.clone(), theme::TEXT_WEAK),
         ];
-        let series_ref: Vec<(&str, &[f32], Color32)> = series_owned
-            .iter()
-            .map(|(n, v, c)| (n.as_str(), v.as_slice(), *c))
-            .collect();
-        LinePlot {
-            title: "Loss",
-            series: series_ref,
-            log_y: net.use_log_y,
-            min_height: 220.0,
-        }
-        .show(ui);
+        let series_ref: Vec<(&str, &[f32], Color32)> = series_owned.iter()
+            .map(|(n, v, c)| (n.as_str(), v.as_slice(), *c)).collect();
+        LinePlot { title: "Loss", series: series_ref, log_y: net.use_log_y, min_height: 220.0 }.show(ui);
 
         if !s.accuracy_history.is_empty() {
             ui.add_space(4.0);
-            let acc = [(
-                "accuracy".to_string(),
-                s.accuracy_history.clone(),
-                theme::TEXT,
-            )];
-            let acc_ref: Vec<(&str, &[f32], Color32)> = acc
-                .iter()
-                .map(|(n, v, c)| (n.as_str(), v.as_slice(), *c))
-                .collect();
-            LinePlot {
-                title: "Validation accuracy",
-                series: acc_ref,
-                log_y: false,
-                min_height: 140.0,
-            }
-            .show(ui);
+            let acc = [("accuracy".to_string(), s.accuracy_history.clone(), theme::TEXT)];
+            let acc_ref: Vec<(&str, &[f32], Color32)> = acc.iter()
+                .map(|(n, v, c)| (n.as_str(), v.as_slice(), *c)).collect();
+            LinePlot { title: "Validation accuracy", series: acc_ref, log_y: false, min_height: 140.0 }.show(ui);
         }
     }
 }
@@ -1254,9 +1084,7 @@ fn start_training(net: &mut NetworkInstance) {
     if net.corpus.dataset.is_none() {
         if matches!(net.kind, NetworkKind::NextTokenGen) {
             let vocab_clone = net.vocab.clone();
-            let emb   = net.embedding_kind;
-            let edim  = net.embed_dim;
-            let seed  = net.seed;
+            let emb = net.embedding_kind; let edim = net.embed_dim; let seed = net.seed;
             if let Err(e) = net.corpus.build_text_dataset(&vocab_clone, emb, edim, seed) {
                 net.build_message = Some(format!("Cannot start: {e}"));
                 return;
@@ -1293,11 +1121,7 @@ fn start_training(net: &mut NetworkInstance) {
         validation_frac: net.val_frac.clamp(0.0, 0.9),
         seed: net.seed,
     };
-    net.last_state = TrainingState {
-        running: true,
-        total_epochs: net.epochs,
-        ..Default::default()
-    };
+    net.last_state = TrainingState { running: true, total_epochs: net.epochs, ..Default::default() };
     net.trainer = Some(trainer::spawn(model, dataset, cfg));
 }
 
@@ -1308,8 +1132,7 @@ impl NeuralCabinApp {
         let active_kind = self.store.active().map(|n| n.kind.clone());
         let plugin_managed = match &active_kind {
             Some(NetworkKind::Plugin { plugin_id, .. }) => self
-                .plugins
-                .find_by_id(plugin_id)
+                .plugins.find_by_id(plugin_id)
                 .map(|p| p.manifest.manages_inference)
                 .unwrap_or(false),
             _ => false,
@@ -1322,8 +1145,7 @@ impl NeuralCabinApp {
         theme::hairline(ui);
         ui.add_space(4.0);
         if net.model.is_none() {
-            ui.label(RichText::new("Build the model first (Networks tab).")
-                .color(theme::TEXT_WEAK));
+            ui.label(RichText::new("Build the model first (Networks tab).").color(theme::TEXT_WEAK));
             return;
         }
         match &net.kind {
@@ -1335,10 +1157,7 @@ impl NeuralCabinApp {
                         "Plugin '{plugin_id}' manages this tab (type: {type_name})."
                     )).color(theme::TEXT_WEAK));
                     ui.add_space(4.0);
-                    theme::caption(
-                        ui,
-                        "Falling back to Simplex inputs until the plugin runtime is wired in.",
-                    );
+                    theme::caption(ui, "Falling back to Simplex inputs.");
                 }
                 simplex_inference(ui, net);
             }
@@ -1347,16 +1166,27 @@ impl NeuralCabinApp {
 }
 
 fn simplex_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
-    let Some(model) = &net.model else { return; };
-    if net.inference_inputs.len() != model.input_dim {
-        net.inference_inputs.resize(model.input_dim, 0.0);
+    let input_dim = if let Some(m) = &net.model { m.input_dim } else { return; };
+    if net.inference_inputs.len() != input_dim {
+        net.inference_inputs.resize(input_dim, 0.0);
     }
+
+    // Header row: dim info + real-time toggle + clear buttons.
     ui.horizontal(|ui| {
-        ui.label(format!("Inputs ({}):", model.input_dim));
+        ui.label(format!("Inputs ({input_dim}:)"));
         ui.checkbox(&mut net.realtime_inference, "Real-time");
+        ui.add_space(8.0);
+        if ui.button("Clear Input").clicked() {
+            net.inference_inputs.iter_mut().for_each(|v| *v = 0.0);
+            net.inference_output = None;
+        }
+        if ui.button("Clear Output").clicked() {
+            net.inference_output = None;
+        }
     });
+
     let mut changed = false;
-    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
         for (i, v) in net.inference_inputs.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("x{i}:"));
@@ -1364,16 +1194,16 @@ fn simplex_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
             });
         }
     });
+
     ui.add_space(4.0);
-    let predict_clicked = ui
-        .add_sized(
-            [ui.available_width(), 28.0],
-            egui::Button::new(RichText::new("Predict").strong()),
-        )
-        .clicked();
+    let predict_clicked = ui.add_sized(
+        [ui.available_width(), 28.0],
+        egui::Button::new(RichText::new("Predict").strong()),
+    ).clicked();
     if predict_clicked || (net.realtime_inference && changed) {
         run_simplex_predict(net);
     }
+
     if let Some(out) = &net.inference_output {
         ui.add_space(8.0);
         ui.label(RichText::new("Output").color(theme::TEXT).strong());
@@ -1381,17 +1211,43 @@ fn simplex_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
             ui.label(RichText::new(format!("y{i}: {v:.6}")).monospace());
         }
         if out.data.len() > 1 {
-            let mut best = 0;
-            let mut bv = f32::NEG_INFINITY;
+            let mut best = 0; let mut bv = f32::NEG_INFINITY;
             for (i, v) in out.data.iter().enumerate() { if *v > bv { bv = *v; best = i; } }
             ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!("argmax = class {best}  (p = {bv:.3})"))
-                    .color(theme::TEXT)
-                    .strong(),
-            );
+            ui.label(RichText::new(format!("argmax = class {best}  (p = {bv:.3})"))
+                .color(theme::TEXT).strong());
         }
     }
+
+    // 2-D scatter overlay — shown when the corpus is 2-D classification.
+    if input_dim == 2 {
+        if let Some(ds) = &net.corpus.dataset {
+            if ds.n_features() == 2 {
+                if let TaskKind::Classification { num_classes } = ds.task {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Position in corpus scatter").color(theme::TEXT_WEAK));
+                    let mut points = Vec::with_capacity(ds.n());
+                    for i in 0..ds.n() {
+                        let x = ds.features.data[i * 2];
+                        let y = ds.features.data[i * 2 + 1];
+                        let row = &ds.labels.data[i * num_classes..(i + 1) * num_classes];
+                        let mut best = 0; let mut bv = f32::NEG_INFINITY;
+                        for (k, v) in row.iter().enumerate() { if *v > bv { bv = *v; best = k; } }
+                        points.push((x, y, best));
+                    }
+                    let qx = net.inference_inputs[0];
+                    let qy = net.inference_inputs[1];
+                    let q_class = net.inference_output.as_ref().map(|out| {
+                        let mut best = 0; let mut bv = f32::NEG_INFINITY;
+                        for (i, v) in out.data.iter().enumerate() { if *v > bv { bv = *v; best = i; } }
+                        best
+                    });
+                    scatter_2d_with_query(ui, &points, (qx, qy), q_class, 220.0);
+                }
+            }
+        }
+    }
+
     if net.realtime_inference {
         ui.ctx().request_repaint_after(Duration::from_millis(80));
     }
@@ -1416,52 +1272,44 @@ fn text_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
         if ui.add(egui::DragValue::new(&mut m).range(1..=4096)).changed() {
             net.max_tokens = m.max(1) as usize;
         }
-        ui.label(RichText::new(format!("vocab = {}", net.vocab.len())).color(theme::TEXT_WEAK));
-        ui.label(RichText::new(format!("embedding = {}", net.embedding_kind.name()))
+        ui.label(RichText::new(format!("vocab={}", net.vocab.len())).color(theme::TEXT_WEAK));
+        ui.label(RichText::new(format!("emb={}", net.embedding_kind.name()))
             .color(theme::TEXT_FAINT).size(11.0));
     });
+    ui.horizontal(|ui| {
+        if ui.button("Clear Input").clicked()  { net.prompt.clear(); }
+        if ui.button("Clear Output").clicked() { net.generated.clear(); }
+    });
     ui.label(RichText::new("Prompt").color(theme::TEXT_WEAK).size(11.5));
-    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-        ui.add(
-            egui::TextEdit::multiline(&mut net.prompt)
-                .desired_width(f32::INFINITY)
-                .desired_rows(4),
-        );
+    egui::ScrollArea::vertical().id_salt("prompt_scroll").max_height(140.0).show(ui, |ui| {
+        ui.add(egui::TextEdit::multiline(&mut net.prompt)
+            .desired_width(f32::INFINITY).desired_rows(4));
     });
     ui.add_space(4.0);
-    if ui
-        .add_sized(
-            [ui.available_width(), 28.0],
-            egui::Button::new(RichText::new("Generate").strong()),
-        )
-        .clicked()
+    if ui.add_sized([ui.available_width(), 28.0],
+        egui::Button::new(RichText::new("Generate").strong())).clicked()
     {
         match generate_text(net) {
             Ok(out) => net.generated = out,
-            Err(e) => net.generated = format!("[error] {e}"),
+            Err(e)  => net.generated = format!("[error] {e}"),
         }
     }
     ui.add_space(6.0);
     ui.label(RichText::new("Output").color(theme::TEXT).strong());
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            ui.label(RichText::new(&net.generated).monospace().color(theme::TEXT));
-        });
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        ui.label(RichText::new(&net.generated).monospace().color(theme::TEXT));
+    });
 }
 
 fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
     use crate::corpus::random_embedding_table;
-
     let Some(model) = &net.model else { return Err("no model".into()); };
     if net.vocab.is_empty() { return Err("vocab is empty".into()); }
     let v   = net.vocab.len();
     let ctx = net.corpus.context_size.max(1);
-    let emb = net.embedding_kind;
+    let emb  = net.embedding_kind;
     let edim = net.embed_dim.max(1);
     let seed = net.seed;
-
-    // Validate input/output dims.
     let expected_in = emb.input_dim(ctx, v, edim);
     if model.input_dim != expected_in {
         return Err(format!(
@@ -1472,15 +1320,8 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
     if model.output_dim() != v {
         return Err(format!("model output_dim={} but vocab={}", model.output_dim(), v));
     }
-
-    // Pre-build embedding table for dense modes.
-    let emb_table = if emb.uses_dense_embed() {
-        Some(random_embedding_table(v, edim, seed))
-    } else {
-        None
-    };
-
-    // For TF-IDF: pre-compute IDF from the encoded corpus.
+    let emb_table = emb.uses_dense_embed()
+        .then(|| random_embedding_table(v, edim, seed));
     let idf: Vec<f32> = if emb == EmbeddingKind::TfIdf && !net.corpus.encoded_tokens.is_empty() {
         let total = net.corpus.encoded_tokens.len() as f32;
         let mut counts = vec![0usize; v];
@@ -1489,19 +1330,14 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
     } else {
         vec![1.0; v]
     };
-
-    let mut history: Vec<usize> = net.vocab.encode(&net.prompt);
+    let mut history = net.vocab.encode(&net.prompt);
     if history.is_empty() { history.push(0); }
     let mut rng = SplitMix64::new(seed.wrapping_add(history.len() as u64).wrapping_add(0xBEEF));
-    let mut out_tokens: Vec<usize> = Vec::new();
+    let mut out_tokens = Vec::new();
     let temp = net.temperature.max(1e-3);
-
     for _ in 0..net.max_tokens {
-        let input_vec = build_input_vec(
-            &history, ctx, v, edim, emb, emb_table.as_deref(), &idf,
-        );
+        let input_vec = build_input_vec(&history, ctx, v, edim, emb, emb_table.as_deref(), &idf);
         let logits = model.predict(&Tensor::new(vec![1, expected_in], input_vec));
-        // Temperature-scaled softmax.
         let mut row: Vec<f32> = logits.data.iter().map(|x| x / temp).collect();
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         for r in row.iter_mut() { *r = (*r - max).exp(); }
@@ -1509,8 +1345,7 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
         if sum <= 0.0 || !sum.is_finite() { break; }
         for r in row.iter_mut() { *r /= sum; }
         let u = rng.next_f32();
-        let mut acc = 0.0_f32;
-        let mut chosen = 0;
+        let mut acc = 0.0_f32; let mut chosen = 0;
         for (i, p) in row.iter().enumerate() {
             acc += *p;
             if u <= acc { chosen = i; break; }
@@ -1518,18 +1353,14 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
         out_tokens.push(chosen);
         history.push(chosen);
     }
-
     let mut out = net.prompt.clone();
     out.push('|');
     for id in out_tokens {
-        if id < net.vocab.tokens.len() {
-            out.push_str(&net.vocab.tokens[id]);
-        }
+        if id < net.vocab.tokens.len() { out.push_str(&net.vocab.tokens[id]); }
     }
     Ok(out)
 }
 
-/// Build one input vector from the history tail for text inference.
 fn build_input_vec(
     history: &[usize],
     ctx: usize,
@@ -1540,17 +1371,13 @@ fn build_input_vec(
     idf: &[f32],
 ) -> Vec<f32> {
     use crate::corpus::positional_enc_pub;
-
     match emb {
         EmbeddingKind::OneHot | EmbeddingKind::TfIdf => {
             let mut input = vec![0.0_f32; ctx * v];
             for k in 0..ctx {
-                let idx = if history.len() + k >= ctx {
-                    history[history.len() + k - ctx]
-                } else { 0 };
+                let idx = history.len().checked_sub(ctx - k).map(|i| history[i]).unwrap_or(0);
                 let id = idx.min(v - 1);
-                let weight = if emb == EmbeddingKind::TfIdf { idf[id] } else { 1.0 };
-                input[k * v + id] = weight;
+                input[k * v + id] = if emb == EmbeddingKind::TfIdf { idf[id] } else { 1.0 };
             }
             input
         }
@@ -1559,17 +1386,13 @@ fn build_input_vec(
             let table = emb_table.unwrap_or(&[]);
             let mut input = vec![0.0_f32; ctx * e];
             for k in 0..ctx {
-                let idx = if history.len() + k >= ctx {
-                    history[history.len() + k - ctx]
-                } else { 0 };
+                let idx = history.len().checked_sub(ctx - k).map(|i| history[i]).unwrap_or(0);
                 let id = idx.min(v - 1);
                 let row_start = id * e;
                 let base = k * e;
                 for d in 0..e {
                     let mut val = if row_start + d < table.len() { table[row_start + d] } else { 0.0 };
-                    if emb == EmbeddingKind::Transformer {
-                        val += positional_enc_pub(k, d, e);
-                    }
+                    if emb == EmbeddingKind::Transformer { val += positional_enc_pub(k, d, e); }
                     input[base + d] = val;
                 }
             }
@@ -1588,42 +1411,38 @@ impl NeuralCabinApp {
         ui.horizontal(|ui| {
             if ui.button("📖 Open Plugin docs").clicked() {
                 self.tab = Tab::Docs;
-                let target_id = "plugins";
-                if let Some((idx, _)) = docs::sections().iter().enumerate().find(|(_, s)| s.id == target_id) {
+                if let Some((idx, _)) = docs::sections().iter().enumerate()
+                    .find(|(_, s)| s.id == "plugins")
+                {
                     self.docs_section = idx;
                 }
             }
         });
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Path:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.plugins.upload_path)
-                    .desired_width(420.0)
-                    .hint_text("path to .zip / .json / folder"),
-            );
-            if ui.button("Install").clicked() {
-                let path = self.plugins.upload_path.clone();
-                self.plugins.install(&path);
+        // Plugin file picker.
+        file_pick_row(ui, "Source:", &mut self.plugins.upload_path,
+            &[("Plugin", &["zip", "json"])], false);
+        // Also offer folder picker.
+        if ui.small_button("Pick folder…").clicked() {
+            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                self.plugins.upload_path = p.display().to_string();
             }
-        });
+        }
+        if ui.button("Install").clicked() {
+            let path = self.plugins.upload_path.clone();
+            self.plugins.install(&path);
+        }
         if let Some(m) = &self.plugins.message {
             ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
         }
         ui.add_space(6.0);
 
-        egui::SidePanel::left("plugins_list_inner")
-            .resizable(true)
-            .default_width(240.0)
+        egui::SidePanel::left("plugins_list_inner").resizable(true).default_width(240.0)
             .show_inside(ui, |ui| {
                 theme::section_heading(ui, "Installed");
-                let names: Vec<String> = self
-                    .plugins
-                    .plugins
-                    .iter()
-                    .map(|p| p.manifest.name.clone())
-                    .collect();
+                let names: Vec<String> = self.plugins.plugins.iter()
+                    .map(|p| p.manifest.name.clone()).collect();
                 if names.is_empty() {
                     ui.label(RichText::new("No plugins installed.").color(theme::TEXT_FAINT));
                 }
@@ -1634,13 +1453,8 @@ impl NeuralCabinApp {
                     ui.horizontal(|ui| {
                         let mut text = RichText::new(format!("◆ {name}")).size(13.0);
                         if selected == Some(i) { text = text.color(theme::ACCENT).strong(); }
-                        if ui
-                            .add(
-                                egui::Button::new(text)
-                                    .frame(selected == Some(i))
-                                    .min_size(egui::vec2(ui.available_width() - 28.0, 24.0)),
-                            )
-                            .clicked()
+                        if ui.add(egui::Button::new(text).frame(selected == Some(i))
+                            .min_size(egui::vec2(ui.available_width() - 28.0, 24.0))).clicked()
                         {
                             want_select = Some(i);
                         }
@@ -1656,10 +1470,7 @@ impl NeuralCabinApp {
                 empty_state(ui, "Select a plugin on the left to configure it.");
                 return;
             };
-            if idx >= self.plugins.plugins.len() {
-                self.plugins.selected = None;
-                return;
-            }
+            if idx >= self.plugins.plugins.len() { self.plugins.selected = None; return; }
             let entry = &mut self.plugins.plugins[idx];
             ui.label(RichText::new(&entry.manifest.name).size(20.0).strong());
             ui.label(RichText::new(format!(
@@ -1673,35 +1484,25 @@ impl NeuralCabinApp {
                 ui.label(RichText::new(&entry.manifest.description).color(theme::TEXT));
                 ui.add_space(4.0);
             }
-            ui.label(RichText::new(format!(
-                "Network types: {}",
-                if entry.manifest.network_types.is_empty() {
-                    "(none)".into()
-                } else {
-                    entry.manifest.network_types.join(", ")
-                }
-            )).color(theme::TEXT_WEAK));
+            ui.label(RichText::new(format!("Network types: {}",
+                if entry.manifest.network_types.is_empty() { "(none)".into() }
+                else { entry.manifest.network_types.join(", ") })).color(theme::TEXT_WEAK));
             ui.label(RichText::new(format!(
                 "Manages vocab: {}    ·    Manages inference: {}",
                 entry.manifest.manages_vocab, entry.manifest.manages_inference
             )).color(theme::TEXT_WEAK));
             ui.label(RichText::new(format!("Source: {}", entry.source_path.display()))
                 .color(theme::TEXT_FAINT).size(11.0));
-
             ui.add_space(8.0);
             theme::section_heading(ui, "Settings (JSON)");
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut entry.settings_json)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(8)
-                        .code_editor(),
-                );
+                ui.add(egui::TextEdit::multiline(&mut entry.settings_json)
+                    .desired_width(f32::INFINITY).desired_rows(8).code_editor());
             });
             ui.add_space(4.0);
             if ui.button("Validate JSON").clicked() {
                 match serde_json::from_str::<serde_json::Value>(&entry.settings_json) {
-                    Ok(_) => self.plugins.message = Some("Settings JSON is valid.".into()),
+                    Ok(_)  => self.plugins.message = Some("Settings JSON is valid.".into()),
                     Err(e) => self.plugins.message = Some(format!("Invalid JSON: {e}")),
                 }
             }
@@ -1709,9 +1510,46 @@ impl NeuralCabinApp {
     }
 }
 
+// ===== SHARED HELPERS =====
+
 fn empty_state(ui: &mut egui::Ui, msg: &str) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         ui.label(RichText::new(msg).color(theme::TEXT_WEAK));
+    });
+}
+
+/// A compact file-picker row: shows the filename + a "Browse…" button.
+/// Opens a native OS file dialog. `filters` is a list of (name, extensions).
+fn file_pick_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    path: &mut String,
+    filters: &[(&str, &[&str])],
+    _folder: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let short = if path.is_empty() {
+            "none".to_string()
+        } else {
+            std::path::Path::new(path.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path.as_str())
+                .to_string()
+        };
+        ui.label(RichText::new(short)
+            .color(if path.is_empty() { theme::TEXT_FAINT } else { theme::TEXT_WEAK })
+            .size(11.5));
+        if ui.button("Browse…").clicked() {
+            let mut dlg = rfd::FileDialog::new();
+            for (name, exts) in filters {
+                dlg = dlg.add_filter(*name, exts);
+            }
+            if let Some(p) = dlg.pick_file() {
+                *path = p.display().to_string();
+            }
+        }
     });
 }

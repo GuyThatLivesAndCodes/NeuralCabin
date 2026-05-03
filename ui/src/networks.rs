@@ -51,12 +51,16 @@ impl NetworkKind {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum OptChoice { Sgd, Adam }
+pub enum OptChoice { Sgd, Adam, AdamW, Lamb }
 
 impl OptChoice {
-    #[allow(dead_code)]
     pub fn name(&self) -> &'static str {
-        match self { OptChoice::Sgd => "SGD", OptChoice::Adam => "Adam" }
+        match self {
+            OptChoice::Sgd   => "SGD",
+            OptChoice::Adam  => "Adam",
+            OptChoice::AdamW => "AdamW",
+            OptChoice::Lamb  => "LAMB",
+        }
     }
 }
 
@@ -166,6 +170,7 @@ pub struct NetworkInstance {
     pub beta1: f32,
     pub beta2: f32,
     pub epsilon: f32,
+    pub weight_decay: f32,
     pub epochs: usize,
     pub batch_size: usize,
     pub val_frac: f32,
@@ -263,6 +268,7 @@ impl NetworkInstance {
             beta1: 0.9,
             beta2: 0.999,
             epsilon: 1e-8,
+            weight_decay: 0.01,
             epochs: 1000,
             batch_size: 32,
             val_frac: 0.2,
@@ -282,12 +288,22 @@ impl NetworkInstance {
 
     pub fn current_optimizer(&self) -> OptimizerKind {
         match self.opt_choice {
-            OptChoice::Sgd => OptimizerKind::Sgd { lr: self.learning_rate, momentum: self.momentum },
+            OptChoice::Sgd => OptimizerKind::Sgd {
+                lr: self.learning_rate, momentum: self.momentum,
+            },
             OptChoice::Adam => OptimizerKind::Adam {
-                lr: self.learning_rate,
-                beta1: self.beta1,
-                beta2: self.beta2,
-                eps: self.epsilon,
+                lr: self.learning_rate, beta1: self.beta1,
+                beta2: self.beta2, eps: self.epsilon,
+            },
+            OptChoice::AdamW => OptimizerKind::AdamW {
+                lr: self.learning_rate, beta1: self.beta1,
+                beta2: self.beta2, eps: self.epsilon,
+                weight_decay: self.weight_decay,
+            },
+            OptChoice::Lamb => OptimizerKind::Lamb {
+                lr: self.learning_rate, beta1: self.beta1,
+                beta2: self.beta2, eps: self.epsilon,
+                weight_decay: self.weight_decay,
             },
         }
     }
@@ -326,9 +342,19 @@ impl NetworkInstance {
             OptimizerKind::Adam { lr, beta1, beta2, eps } => {
                 self.opt_choice = OptChoice::Adam;
                 self.learning_rate = lr;
-                self.beta1 = beta1;
-                self.beta2 = beta2;
-                self.epsilon = eps;
+                self.beta1 = beta1; self.beta2 = beta2; self.epsilon = eps;
+            }
+            OptimizerKind::AdamW { lr, beta1, beta2, eps, weight_decay } => {
+                self.opt_choice = OptChoice::AdamW;
+                self.learning_rate = lr;
+                self.beta1 = beta1; self.beta2 = beta2; self.epsilon = eps;
+                self.weight_decay = weight_decay;
+            }
+            OptimizerKind::Lamb { lr, beta1, beta2, eps, weight_decay } => {
+                self.opt_choice = OptChoice::Lamb;
+                self.learning_rate = lr;
+                self.beta1 = beta1; self.beta2 = beta2; self.epsilon = eps;
+                self.weight_decay = weight_decay;
             }
         }
     }

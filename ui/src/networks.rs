@@ -12,6 +12,7 @@ use neuralcabin_engine::{Activation, Loss};
 pub enum NetworkKind {
     Simplex,
     NextTokenGen,
+    Gpt,
     Plugin { plugin_id: String, type_name: String },
 }
 
@@ -20,6 +21,7 @@ impl NetworkKind {
         match self {
             NetworkKind::Simplex => "Simplex (MLP)".into(),
             NetworkKind::NextTokenGen => "Next-Token Generation".into(),
+            NetworkKind::Gpt => "GPT (Pretraining)".into(),
             NetworkKind::Plugin { plugin_id, type_name } => {
                 format!("Plugin · {plugin_id} / {type_name}")
             }
@@ -30,6 +32,7 @@ impl NetworkKind {
         match self {
             NetworkKind::Simplex => "Simplex".into(),
             NetworkKind::NextTokenGen => "NextTokenGen".into(),
+            NetworkKind::Gpt => "Gpt".into(),
             NetworkKind::Plugin { plugin_id, type_name } => {
                 format!("Plugin:{plugin_id}:{type_name}")
             }
@@ -39,6 +42,8 @@ impl NetworkKind {
     pub fn from_persist_string(s: &str) -> Self {
         if s == "NextTokenGen" {
             NetworkKind::NextTokenGen
+        } else if s == "Gpt" {
+            NetworkKind::Gpt
         } else if let Some(rest) = s.strip_prefix("Plugin:") {
             let mut parts = rest.splitn(2, ':');
             let pid = parts.next().unwrap_or("").to_string();
@@ -219,6 +224,21 @@ impl NetworkInstance {
             LayerSpec::Activation(Activation::Identity),
         ];
         let mut me = Self::common(id, name, NetworkKind::NextTokenGen, 1, layers, seed);
+        me.corpus.template = CorpusTemplate::Text;
+        me.loss_choice = Loss::CrossEntropy;
+        me
+    }
+
+    pub fn new_gpt(id: u64, name: String, seed: u64) -> Self {
+        let layers = vec![
+            LayerSpec::Linear { in_dim: 1, out_dim: 64 },
+            LayerSpec::Activation(Activation::Tanh),
+            LayerSpec::Linear { in_dim: 64, out_dim: 32 },
+            LayerSpec::Activation(Activation::Tanh),
+            LayerSpec::Linear { in_dim: 32, out_dim: 1 },
+            LayerSpec::Activation(Activation::Identity),
+        ];
+        let mut me = Self::common(id, name, NetworkKind::Gpt, 1, layers, seed);
         me.corpus.template = CorpusTemplate::Text;
         me.loss_choice = Loss::CrossEntropy;
         me

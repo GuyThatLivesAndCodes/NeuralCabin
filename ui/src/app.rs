@@ -87,7 +87,7 @@ impl NeuralCabinApp {
     }
 
     fn rebuild_create_options(&mut self) {
-        let mut opts = vec![NetworkKind::Simplex, NetworkKind::NextTokenGen];
+        let mut opts = vec![NetworkKind::Simplex, NetworkKind::NextTokenGen, NetworkKind::Gpt];
         for (pid, ty) in self.plugins.all_network_types() {
             opts.push(NetworkKind::Plugin { plugin_id: pid, type_name: ty });
         }
@@ -99,7 +99,7 @@ impl NeuralCabinApp {
 
     fn vocab_enabled(&self) -> bool {
         match self.store.active().map(|n| &n.kind) {
-            Some(NetworkKind::NextTokenGen) => true,
+            Some(NetworkKind::NextTokenGen) | Some(NetworkKind::Gpt) => true,
             Some(NetworkKind::Plugin { plugin_id, .. }) => self
                 .plugins.find_by_id(plugin_id)
                 .map(|p| p.manifest.manages_vocab)
@@ -484,6 +484,7 @@ impl NeuralCabinApp {
                 let net = match kind {
                     NetworkKind::Simplex => NetworkInstance::new_simplex(0, name, seed),
                     NetworkKind::NextTokenGen => NetworkInstance::new_next_token(0, name, seed),
+                    NetworkKind::Gpt => NetworkInstance::new_gpt(0, name, seed),
                     NetworkKind::Plugin { plugin_id, type_name } =>
                         NetworkInstance::new_plugin(0, name, plugin_id, type_name, seed),
                 };
@@ -704,6 +705,7 @@ fn network_from_file(f: ModelFile, name: String) -> NetworkInstance {
     let mut net = match &kind {
         NetworkKind::Simplex     => NetworkInstance::new_simplex(0, name, seed),
         NetworkKind::NextTokenGen=> NetworkInstance::new_next_token(0, name, seed),
+        NetworkKind::Gpt         => NetworkInstance::new_gpt(0, name, seed),
         NetworkKind::Plugin { plugin_id, type_name } =>
             NetworkInstance::new_plugin(0, name, plugin_id.clone(), type_name.clone(), seed),
     };
@@ -741,6 +743,7 @@ impl NeuralCabinApp {
         ui.add_space(6.0);
         match &net.kind {
             NetworkKind::NextTokenGen => corpus_text_panel(ui, &mut net.corpus, &net.vocab),
+            NetworkKind::Gpt => corpus_gpt_panel(ui, &mut net.corpus, &net.vocab),
             NetworkKind::Simplex => corpus_numeric_panel(ui, &mut net.corpus, net.seed, false),
             NetworkKind::Plugin { .. } => {
                 ui.label(RichText::new("Plugin networks default to numeric corpora:")
@@ -885,6 +888,91 @@ fn corpus_text_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
     }
     ui.add_space(6.0);
     if ui.button("Re-tokenise").clicked() { corpus.retokenise(vocab); }
+    if let Some(m) = &corpus.message {
+        ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+    }
+}
+
+fn corpus_gpt_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
+    corpus.template = CorpusTemplate::Text;
+    ui.horizontal(|ui| {
+        ui.label("Context size:");
+        let mut c = corpus.context_size as i32;
+        if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+            corpus.context_size = c.max(1) as usize;
+        }
+        ui.label(RichText::new(format!("vocab = {} tokens", vocab.len())).color(theme::TEXT_WEAK));
+    });
+    ui.add_space(4.0);
+
+    ui.label(RichText::new("Pretraining files — upload .txt, .md, .py, .json, .csv, etc.")
+        .color(theme::TEXT_WEAK).size(11.5));
+    ui.add_space(4.0);
+
+    file_pick_row(ui, "Add file:", &mut corpus.upload_path,
+        &[("Text", &["txt", "md", "rs", "py", "js", "ts", "json", "csv"])], false);
+    if ui.button("Add File").clicked() {
+        let path = corpus.upload_path.clone();
+        if let Err(e) = corpus.add_gpt_file(&path, vocab) {
+            corpus.message = Some(format!("Failed to add file: {e}"));
+        } else {
+            corpus.upload_path.clear();
+        }
+    }
+
+    if !corpus.gpt_files.is_empty() {
+        let total_tokens: usize = corpus.gpt_files.iter().map(|f| f.token_count).sum();
+        let total_bytes: usize = corpus.gpt_files.iter().map(|f| f.byte_size).sum();
+
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!(
+            "Total: {} files, {} tokens, {:.1} MB",
+            corpus.gpt_files.len(),
+            total_tokens,
+            total_bytes as f64 / (1024.0 * 1024.0)
+        )).color(theme::ACCENT).strong());
+
+        let mut to_remove = None;
+        egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+            for (i, file) in corpus.gpt_files.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("✕").min_size(egui::vec2(24.0, 18.0))).clicked() {
+                        to_remove = Some(i);
+                    }
+                    ui.label(RichText::new(&file.name).size(12.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{} tokens", file.token_count))
+                            .color(theme::TEXT_WEAK).size(10.5));
+                    });
+                });
+            }
+        });
+        if let Some(i) = to_remove {
+            corpus.gpt_files.remove(i);
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.checkbox(&mut corpus.gpt_use_file_boundaries, "Add file-boundary tokens");
+    theme::caption(ui, "Inserts <|file:name|> between files to help the model track sources.");
+
+    ui.add_space(8.0);
+    if ui.button("Build Pretraining Set").clicked() {
+        let mut text = String::new();
+        for file in &corpus.gpt_files {
+            if corpus.gpt_use_file_boundaries {
+                text.push_str(&format!("<|file:{}|>\n", file.name));
+            }
+            if let Ok(content) = std::fs::read_to_string(&file.path) {
+                text.push_str(&content);
+                text.push('\n');
+            }
+        }
+        corpus.text_body = text;
+        corpus.retokenise(vocab);
+        corpus.message = Some("Pretraining set built.".into());
+    }
+
     if let Some(m) = &corpus.message {
         ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
     }
@@ -1249,7 +1337,7 @@ impl NeuralCabinApp {
         }
         match &net.kind {
             NetworkKind::Simplex => simplex_inference(ui, net),
-            NetworkKind::NextTokenGen => text_inference(ui, net),
+            NetworkKind::NextTokenGen | NetworkKind::Gpt => text_inference(ui, net),
             NetworkKind::Plugin { plugin_id, type_name } => {
                 if plugin_managed {
                     ui.label(RichText::new(format!(

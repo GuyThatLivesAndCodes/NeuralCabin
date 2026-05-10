@@ -1162,7 +1162,6 @@ fn gpt_finetuning_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
 impl NeuralCabinApp {
     fn vocab_tab(&mut self, ui: &mut egui::Ui) {
         let allowed = self.vocab_enabled();
-        let mut dim_check: Option<DimensionCheck> = None;
         let Some(net) = self.store.active_mut() else {
             empty_state(ui, "No network selected.");
             return;

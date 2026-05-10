@@ -253,9 +253,7 @@ impl NeuralCabinApp {
     fn show_rebuild_modal(&mut self, ctx: &egui::Context) {
         if !self.rebuild_modal.open { return; }
 
-        let mut modal_open = self.rebuild_modal.open;
         egui::Window::new("Rebuild Model?")
-            .open(&mut modal_open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
             .resizable(false)
@@ -273,7 +271,7 @@ impl NeuralCabinApp {
                 });
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Accept (rebuild)").clicked() {
+                    if ui.button("✓ Accept (rebuild)").clicked() {
                         if let Some(id) = self.rebuild_modal.network_id {
                             if let Some(net) = self.store.list.iter_mut().find(|n| n.id == id) {
                                 net.build_model();
@@ -281,12 +279,11 @@ impl NeuralCabinApp {
                         }
                         self.rebuild_modal.open = false;
                     }
-                    if ui.button("Deny (skip for now)").clicked() {
+                    if ui.button("✗ Deny (skip)").clicked() {
                         self.rebuild_modal.open = false;
                     }
                 });
             });
-        self.rebuild_modal.open = modal_open;
     }
 }
 
@@ -1133,8 +1130,14 @@ fn gpt_finetuning_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
     });
     ui.add_space(4.0);
 
-    ui.label(RichText::new("Conversation format — paste User:/Assistant: pairs")
-        .color(theme::TEXT_WEAK).size(11.5));
+    ui.label(RichText::new("Conversation Training Data (JSONL format)")
+        .color(theme::TEXT_WEAK).size(12.0).strong());
+    theme::caption(ui, "Each line is a JSON object with \"messages\" array containing {\"role\": \"user\"|\"assistant\", \"content\": \"...\"}");
+    ui.label(RichText::new("Example:")
+        .color(theme::TEXT_FAINT).size(10.0).italics());
+    theme::caption(ui, r#"{"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]}"#);
+    ui.add_space(6.0);
+
     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
         ui.add(egui::TextEdit::multiline(&mut corpus.text_body)
             .desired_width(f32::INFINITY).desired_rows(12).code_editor());
@@ -1142,7 +1145,7 @@ fn gpt_finetuning_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
     ui.add_space(4.0);
 
     file_pick_row(ui, "Append file:", &mut corpus.upload_path,
-        &[("Text", &["txt", "md"])], false);
+        &[("Text", &["jsonl", "txt", "md"])], false);
     if ui.button("Upload").clicked() {
         let path = corpus.upload_path.clone();
         if let Err(e) = corpus.upload_text_file(&path) {
@@ -1619,7 +1622,13 @@ impl NeuralCabinApp {
         }
         match &net.kind {
             NetworkKind::Simplex => simplex_inference(ui, net),
-            NetworkKind::NextTokenGen | NetworkKind::Gpt => text_inference(ui, net),
+            NetworkKind::NextTokenGen => text_inference(ui, net),
+            NetworkKind::Gpt => {
+                match net.gpt_stage {
+                    GptStage::Pretraining => text_inference(ui, net),
+                    GptStage::FineTuning => gpt_chat_inference(ui, net),
+                }
+            }
             NetworkKind::Plugin { plugin_id, type_name } => {
                 if plugin_managed {
                     ui.label(RichText::new(format!(
@@ -1842,6 +1851,87 @@ fn text_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
         .show(ui, |ui| {
             ui.label(RichText::new(&net.generated).monospace().color(theme::TEXT));
         });
+}
+
+fn gpt_chat_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
+    ui.label(RichText::new("Chat Interface").color(theme::TEXT_WEAK).size(11.5));
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Temperature:");
+        ui.add(egui::DragValue::new(&mut net.temperature).speed(0.01).range(0.05..=4.0));
+        ui.add_space(6.0);
+        ui.label("Max tokens:");
+        let mut m = net.max_tokens as i32;
+        if ui.add(egui::DragValue::new(&mut m).range(1..=4096)).changed() {
+            net.max_tokens = m.max(1) as usize;
+        }
+    });
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        if ui.button("Clear Chat").clicked() {
+            net.chat_messages.clear();
+            net.chat_input.clear();
+        }
+    });
+    ui.add_space(8.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("chat_scroll")
+        .max_height(300.0)
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            let mut to_remove: Option<usize> = None;
+            for (i, (role, content)) in net.chat_messages.iter().enumerate() {
+                let is_user = role == "user";
+                let label_color = if is_user { theme::ACCENT } else { theme::TEXT };
+
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        let role_label = if is_user { "👤 User" } else { "🤖 Assistant" };
+                        ui.label(RichText::new(role_label).color(label_color).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                to_remove = Some(i);
+                            }
+                            if ui.small_button("↻").clicked() && !is_user {
+                                net.chat_input = content.clone();
+                            }
+                            if ui.small_button("✎").clicked() {
+                                net.chat_input = content.clone();
+                                to_remove = Some(i);
+                            }
+                        });
+                    });
+                    ui.label(RichText::new(content).monospace());
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(i) = to_remove {
+                net.chat_messages.remove(i);
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.label("Message:");
+    egui::ScrollArea::vertical()
+        .id_salt("input_scroll")
+        .max_height(100.0)
+        .show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(&mut net.chat_input)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3))
+        });
+
+    ui.horizontal(|ui| {
+        if ui.button("Send Message").clicked() && !net.chat_input.trim().is_empty() {
+            let msg = net.chat_input.trim().to_string();
+            net.chat_messages.push(("user".to_string(), msg.clone()));
+            net.chat_input.clear();
+            // TODO: Generate assistant response
+        }
+    });
 }
 
 /// Validate inference params and build a [`GeneratorConfig`] ready to spawn.

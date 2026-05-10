@@ -233,6 +233,10 @@ pub struct NetworkInstance {
     /// Re-run generation automatically whenever the prompt changes.
     pub realtime_text: bool,
 
+    // Chat interface (GPT fine-tuning).
+    pub chat_messages: Vec<(String, String)>, // (role, content) pairs: ("user" or "assistant")
+    pub chat_input: String,
+
     // Persistence.
     pub persistence_message: Option<String>,
 }
@@ -347,6 +351,8 @@ impl NetworkInstance {
             max_tokens: 64,
             generator: None,
             realtime_text: false,
+            chat_messages: Vec::new(),
+            chat_input: String::new(),
             persistence_message: None,
         }
     }

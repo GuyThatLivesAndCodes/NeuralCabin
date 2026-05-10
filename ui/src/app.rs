@@ -529,6 +529,8 @@ impl NeuralCabinApp {
         theme::hairline(ui);
         ui.add_space(4.0);
 
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+
         ui.horizontal(|ui| {
             ui.label("Rename:");
             ui.add(egui::TextEdit::singleline(&mut net.name).desired_width(220.0));
@@ -629,34 +631,19 @@ impl NeuralCabinApp {
         {
             net.build_model();
         }
-        let mut reset_net = false;
+        let mut should_rebuild = false;
         if let Some(msg) = &net.build_message {
             let is_struct_error = msg.starts_with("Layer ") || msg.starts_with("Model ");
             let c = if is_struct_error { theme::DANGER } else { theme::TEXT_WEAK };
             ui.horizontal(|ui| {
                 ui.colored_label(c, msg);
                 if is_struct_error && ui.button("Reset to Template").clicked() {
-                    reset_net = true;
+                    should_rebuild = true;
                 }
             });
         }
-        if reset_net {
-            match net.kind {
-                NetworkKind::Simplex => {
-                    let new = NetworkInstance::new_simplex(net.id, net.name.clone(), net.seed);
-                    *net = new;
-                }
-                NetworkKind::NextTokenGen => {
-                    let new = NetworkInstance::new_next_token(net.id, net.name.clone(), net.seed);
-                    *net = new;
-                }
-                NetworkKind::Gpt => {
-                    let new = NetworkInstance::new_gpt(net.id, net.name.clone(), net.seed);
-                    *net = new;
-                }
-                _ => {}
-            }
-            net.build_message = Some("Reset to template.".into());
+        if should_rebuild {
+            net.build_model();
         }
         if let Some(model) = &net.model {
             ui.add_space(4.0);
@@ -683,6 +670,7 @@ impl NeuralCabinApp {
         if let Some(m) = &net.persistence_message {
             ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
         }
+        });
     }
 }
 
@@ -1345,34 +1333,19 @@ impl NeuralCabinApp {
             theme::pulse_dot(ui, if training { 1.0 } else { 0.0 }, "");
         });
 
-        let mut reset_to_template = false;
+        let mut should_rebuild_model = false;
         if let Some(m) = &net.build_message {
             let is_struct_error = m.starts_with("Layer ") || m.starts_with("Model ") || m.starts_with("Cannot start:");
             let c = if is_struct_error { theme::DANGER } else { theme::TEXT_WEAK };
             ui.horizontal(|ui| {
                 ui.colored_label(c, m);
                 if is_struct_error && ui.button("Reset to Template").clicked() {
-                    reset_to_template = true;
+                    should_rebuild_model = true;
                 }
             });
         }
-        if reset_to_template {
-            match net.kind {
-                NetworkKind::Simplex => {
-                    let new = NetworkInstance::new_simplex(net.id, net.name.clone(), net.seed);
-                    *net = new;
-                }
-                NetworkKind::NextTokenGen => {
-                    let new = NetworkInstance::new_next_token(net.id, net.name.clone(), net.seed);
-                    *net = new;
-                }
-                NetworkKind::Gpt => {
-                    let new = NetworkInstance::new_gpt(net.id, net.name.clone(), net.seed);
-                    *net = new;
-                }
-                _ => {}
-            }
-            net.build_message = Some("Reset to template.".into());
+        if should_rebuild_model {
+            net.build_model();
         }
 
         ui.add_space(6.0);

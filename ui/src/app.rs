@@ -709,6 +709,9 @@ fn save_active(net: &mut NetworkInstance) {
     file.vocab_mode         = Some(net.vocab.mode.to_str().to_string());
     file.embedding_kind     = Some(net.embedding_kind.to_str().to_string());
     file.embed_dim          = Some(net.embed_dim);
+    file.gpt_stage          = Some(net.gpt_stage.to_str().to_string());
+    file.gpt_frozen_layers  = Some(net.gpt_frozen_layers.clone());
+    file.gpt_mask_user_tokens = Some(net.gpt_mask_user_tokens);
     match persistence::save(&path, &file) {
         Ok(()) => net.persistence_message = Some(format!("Saved → {}", path.display())),
         Err(e) => net.persistence_message = Some(format!("Save failed: {e}")),
@@ -751,6 +754,15 @@ fn network_from_file(f: ModelFile, name: String) -> NetworkInstance {
         net.embedding_kind = EmbeddingKind::from_str(e);
     }
     if let Some(d) = f.embed_dim { net.embed_dim = d; }
+    if let Some(stage) = f.gpt_stage.as_deref() {
+        net.gpt_stage = GptStage::from_str(stage);
+    }
+    if let Some(frozen) = f.gpt_frozen_layers {
+        net.gpt_frozen_layers = frozen;
+    }
+    if let Some(mask) = f.gpt_mask_user_tokens {
+        net.gpt_mask_user_tokens = mask;
+    }
     net.inference_inputs = vec![0.0; input_dim];
     net
 }

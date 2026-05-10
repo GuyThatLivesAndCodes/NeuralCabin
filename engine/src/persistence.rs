@@ -61,6 +61,19 @@ pub struct ModelFile {
     /// Dense embedding dimension (FastText / Transformer modes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed_dim: Option<usize>,
+
+    // ── GPT-specific fields ──────────────────────────────────────────────────
+    /// "Pretraining" | "FineTuning"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_stage: Option<String>,
+
+    /// Which layers are frozen (per-layer booleans).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_frozen_layers: Option<Vec<bool>>,
+
+    /// Train on assistant tokens only (mask user tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_mask_user_tokens: Option<bool>,
 }
 
 pub const FORMAT_VERSION: u32 = 2;
@@ -84,6 +97,9 @@ impl ModelFile {
             vocab_mode: None,
             embedding_kind: None,
             embed_dim: None,
+            gpt_stage: None,
+            gpt_frozen_layers: None,
+            gpt_mask_user_tokens: None,
         }
     }
 }

@@ -538,7 +538,7 @@ impl NeuralCabinApp {
             if ui.add(egui::DragValue::new(&mut s)).changed() { net.seed = s as u64; }
         });
 
-        if is_ntg {
+        if is_ntg || matches!(net.kind, NetworkKind::Gpt) {
             ui.horizontal(|ui| {
                 ui.label("Input dim:");
                 ui.label(RichText::new(format!("{} (auto — vocab × context)", net.input_dim))
@@ -562,7 +562,8 @@ impl NeuralCabinApp {
         let mut current_dim = net.input_dim;
         for (i, spec) in net.layer_specs.iter_mut().enumerate() {
             let is_first_linear = i == 0 && matches!(spec, LayerSpec::Linear { .. });
-            let locked = is_ntg && (is_first_linear || Some(i) == last_linear);
+            let is_text_model = is_ntg || matches!(net.kind, NetworkKind::Gpt);
+            let locked = is_text_model && (is_first_linear || Some(i) == last_linear);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}.", i + 1));
@@ -628,10 +629,34 @@ impl NeuralCabinApp {
         {
             net.build_model();
         }
+        let mut reset_net = false;
         if let Some(msg) = &net.build_message {
-            let c = if msg.starts_with("Layer ") || msg.starts_with("Model ")
-                { theme::DANGER } else { theme::TEXT_WEAK };
-            ui.colored_label(c, msg);
+            let is_struct_error = msg.starts_with("Layer ") || msg.starts_with("Model ");
+            let c = if is_struct_error { theme::DANGER } else { theme::TEXT_WEAK };
+            ui.horizontal(|ui| {
+                ui.colored_label(c, msg);
+                if is_struct_error && ui.button("Reset to Template").clicked() {
+                    reset_net = true;
+                }
+            });
+        }
+        if reset_net {
+            match net.kind {
+                NetworkKind::Simplex => {
+                    let new = NetworkInstance::new_simplex(net.id, net.name.clone(), net.seed);
+                    *net = new;
+                }
+                NetworkKind::NextTokenGen => {
+                    let new = NetworkInstance::new_next_token(net.id, net.name.clone(), net.seed);
+                    *net = new;
+                }
+                NetworkKind::Gpt => {
+                    let new = NetworkInstance::new_gpt(net.id, net.name.clone(), net.seed);
+                    *net = new;
+                }
+                _ => {}
+            }
+            net.build_message = Some("Reset to template.".into());
         }
         if let Some(model) = &net.model {
             ui.add_space(4.0);
@@ -1308,8 +1333,34 @@ impl NeuralCabinApp {
             theme::pulse_dot(ui, if training { 1.0 } else { 0.0 }, "");
         });
 
+        let mut reset_to_template = false;
         if let Some(m) = &net.build_message {
-            ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+            let is_struct_error = m.starts_with("Layer ") || m.starts_with("Model ") || m.starts_with("Cannot start:");
+            let c = if is_struct_error { theme::DANGER } else { theme::TEXT_WEAK };
+            ui.horizontal(|ui| {
+                ui.colored_label(c, m);
+                if is_struct_error && ui.button("Reset to Template").clicked() {
+                    reset_to_template = true;
+                }
+            });
+        }
+        if reset_to_template {
+            match net.kind {
+                NetworkKind::Simplex => {
+                    let new = NetworkInstance::new_simplex(net.id, net.name.clone(), net.seed);
+                    *net = new;
+                }
+                NetworkKind::NextTokenGen => {
+                    let new = NetworkInstance::new_next_token(net.id, net.name.clone(), net.seed);
+                    *net = new;
+                }
+                NetworkKind::Gpt => {
+                    let new = NetworkInstance::new_gpt(net.id, net.name.clone(), net.seed);
+                    *net = new;
+                }
+                _ => {}
+            }
+            net.build_message = Some("Reset to template.".into());
         }
 
         ui.add_space(6.0);

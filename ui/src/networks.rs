@@ -447,12 +447,26 @@ impl NetworkInstance {
     /// Recompute input_dim from vocab/context/embedding settings.
     /// Call this whenever vocab size, context size, or embedding kind changes.
     pub fn sync_text_dims(&mut self) {
-        if !matches!(self.kind, NetworkKind::NextTokenGen) { return; }
-        let v = self.vocab.len().max(1);
-        let ctx = self.corpus.context_size.max(1);
-        let new_in = self.embedding_kind.input_dim(ctx, v, self.embed_dim);
-        self.set_input_dim(new_in);
-        self.set_output_dim(v);
+        match self.kind {
+            NetworkKind::NextTokenGen | NetworkKind::Gpt => {
+                let v = self.vocab.len().max(1);
+                let ctx = self.corpus.context_size.max(1);
+                let new_in = self.embedding_kind.input_dim(ctx, v, self.embed_dim);
+                self.set_input_dim(new_in);
+                self.set_output_dim(v);
+            }
+            _ => {}
+        }
+    }
+
+    /// Get the output dimension from the last Linear layer spec.
+    pub fn output_dim(&self) -> usize {
+        for spec in self.layer_specs.iter().rev() {
+            if let LayerSpec::Linear { out_dim, .. } = spec {
+                return *out_dim;
+            }
+        }
+        1
     }
 
     /// Index of the last `Linear` layer spec, if any.

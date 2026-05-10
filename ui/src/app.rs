@@ -46,11 +46,31 @@ struct CreateDialog {
     base_options: Vec<NetworkKind>,
 }
 
+#[derive(Default, Clone)]
+struct DimensionCheck {
+    network_id: u64,
+    old_input_dim: usize,
+    old_output_dim: usize,
+    new_input_dim: usize,
+    new_output_dim: usize,
+}
+
+#[derive(Default)]
+struct RebuildModal {
+    open: bool,
+    network_id: Option<u64>,
+    old_input_dim: usize,
+    old_output_dim: usize,
+    new_input_dim: usize,
+    new_output_dim: usize,
+}
+
 pub struct NeuralCabinApp {
     tab: Tab,
     store: NetworkStore,
     plugins: PluginRegistry,
     create: CreateDialog,
+    rebuild_modal: RebuildModal,
     docs_section: usize,
     theme_applied: bool,
     rng: SplitMix64,
@@ -64,6 +84,7 @@ impl NeuralCabinApp {
             store: NetworkStore::default(),
             plugins: PluginRegistry::default(),
             create: CreateDialog::default(),
+            rebuild_modal: RebuildModal::default(),
             docs_section: 0,
             theme_applied: false,
             rng: SplitMix64::new(0xA11CE),
@@ -125,6 +146,18 @@ impl NeuralCabinApp {
     fn any_training(&self) -> bool {
         self.store.list.iter().any(|n| n.trainer.is_some())
     }
+
+    /// Mark that dimensions need to be checked and potentially show rebuild modal.
+    fn flag_dimension_check(&mut self, net_id: u64, old_in: usize, old_out: usize, new_in: usize, new_out: usize) {
+        if new_in != old_in || new_out != old_out {
+            self.rebuild_modal.network_id = Some(net_id);
+            self.rebuild_modal.old_input_dim = old_in;
+            self.rebuild_modal.old_output_dim = old_out;
+            self.rebuild_modal.new_input_dim = new_in;
+            self.rebuild_modal.new_output_dim = new_out;
+            self.rebuild_modal.open = true;
+        }
+    }
 }
 
 impl eframe::App for NeuralCabinApp {
@@ -159,10 +192,36 @@ impl eframe::App for NeuralCabinApp {
                     }
                 }
                 Tab::Vocab => {
-                    if let Some(net) = self.store.active_mut() {
+                    let dim_check = if let Some(net) = self.store.active_mut() {
                         net.vocab.upload_path = first.clone();
                         let _ = net.vocab.load_file(&first);
+                        let old_in = net.input_dim;
+                        let old_out = net.output_dim();
                         net.sync_text_dims();
+                        let new_in = net.input_dim;
+                        let new_out = net.output_dim();
+                        if new_in != old_in || new_out != old_out {
+                            Some(DimensionCheck {
+                                network_id: net.id,
+                                old_input_dim: old_in,
+                                old_output_dim: old_out,
+                                new_input_dim: new_in,
+                                new_output_dim: new_out,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(check) = dim_check {
+                        self.flag_dimension_check(
+                            check.network_id,
+                            check.old_input_dim,
+                            check.old_output_dim,
+                            check.new_input_dim,
+                            check.new_output_dim,
+                        );
                     }
                 }
                 Tab::Plugins => {
@@ -186,6 +245,48 @@ impl eframe::App for NeuralCabinApp {
                 Tab::Plugins   => self.plugins_tab(ui),
             }
         });
+        self.show_rebuild_modal(ctx);
+    }
+}
+
+impl NeuralCabinApp {
+    fn show_rebuild_modal(&mut self, ctx: &egui::Context) {
+        if !self.rebuild_modal.open { return; }
+
+        let mut modal_open = self.rebuild_modal.open;
+        egui::Window::new("Rebuild Model?")
+            .open(&mut modal_open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Corpus or vocabulary changes require model dimensions to be updated.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!(
+                        "Input: {} → {}  •  Output: {} → {}",
+                        self.rebuild_modal.old_input_dim,
+                        self.rebuild_modal.new_input_dim,
+                        self.rebuild_modal.old_output_dim,
+                        self.rebuild_modal.new_output_dim
+                    )).color(theme::TEXT_WEAK).monospace());
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Accept (rebuild)").clicked() {
+                        if let Some(id) = self.rebuild_modal.network_id {
+                            if let Some(net) = self.store.list.iter_mut().find(|n| n.id == id) {
+                                net.build_model();
+                            }
+                        }
+                        self.rebuild_modal.open = false;
+                    }
+                    if ui.button("Deny (skip for now)").clicked() {
+                        self.rebuild_modal.open = false;
+                    }
+                });
+            });
+        self.rebuild_modal.open = modal_open;
     }
 }
 
@@ -1061,6 +1162,7 @@ fn gpt_finetuning_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
 impl NeuralCabinApp {
     fn vocab_tab(&mut self, ui: &mut egui::Ui) {
         let allowed = self.vocab_enabled();
+        let mut dim_check: Option<DimensionCheck> = None;
         let Some(net) = self.store.active_mut() else {
             empty_state(ui, "No network selected.");
             return;
@@ -1123,7 +1225,23 @@ impl NeuralCabinApp {
             EmbeddingKind::Transformer =>
                 theme::caption(ui, "Dense embedding + sinusoidal positional encoding."),
         }
-        if emb_changed { net.sync_text_dims(); }
+        let mut dim_check: Option<DimensionCheck> = None;
+        if emb_changed {
+            let old_in = net.input_dim;
+            let old_out = net.output_dim();
+            net.sync_text_dims();
+            let new_in = net.input_dim;
+            let new_out = net.output_dim();
+            if new_in != old_in || new_out != old_out {
+                dim_check = Some(DimensionCheck {
+                    network_id: net.id,
+                    old_input_dim: old_in,
+                    old_output_dim: old_out,
+                    new_input_dim: new_in,
+                    new_output_dim: new_out,
+                });
+            }
+        }
 
         ui.add_space(8.0);
         theme::hairline(ui);
@@ -1140,8 +1258,21 @@ impl NeuralCabinApp {
                 }
             }
             if let Some(m) = new_mode {
+                let old_in = net.input_dim;
+                let old_out = net.output_dim();
                 net.vocab.auto_generate(&net.corpus.text_body, m);
                 net.sync_text_dims();
+                let new_in = net.input_dim;
+                let new_out = net.output_dim();
+                if new_in != old_in || new_out != old_out {
+                    dim_check = Some(DimensionCheck {
+                        network_id: net.id,
+                        old_input_dim: old_in,
+                        old_output_dim: old_out,
+                        new_input_dim: new_in,
+                        new_output_dim: new_out,
+                    });
+                }
             }
         });
         ui.add_space(6.0);
@@ -1152,9 +1283,22 @@ impl NeuralCabinApp {
             if ui.button("Add").clicked() {
                 let t = net.vocab.draft_token.trim().to_string();
                 if !t.is_empty() {
+                    let old_in = net.input_dim;
+                    let old_out = net.output_dim();
                     net.vocab.add_unique(t);
                     net.vocab.draft_token.clear();
                     net.sync_text_dims();
+                    let new_in = net.input_dim;
+                    let new_out = net.output_dim();
+                    if new_in != old_in || new_out != old_out {
+                        dim_check = Some(DimensionCheck {
+                            network_id: net.id,
+                            old_input_dim: old_in,
+                            old_output_dim: old_out,
+                            new_input_dim: new_in,
+                            new_output_dim: new_out,
+                        });
+                    }
                 }
             }
         });
@@ -1167,7 +1311,20 @@ impl NeuralCabinApp {
             if let Err(e) = net.vocab.load_file(&path) {
                 net.vocab.message = Some(format!("Load failed: {e}"));
             } else {
+                let old_in = net.input_dim;
+                let old_out = net.output_dim();
                 net.sync_text_dims();
+                let new_in = net.input_dim;
+                let new_out = net.output_dim();
+                if new_in != old_in || new_out != old_out {
+                    dim_check = Some(DimensionCheck {
+                        network_id: net.id,
+                        old_input_dim: old_in,
+                        old_output_dim: old_out,
+                        new_input_dim: new_in,
+                        new_output_dim: new_out,
+                    });
+                }
             }
         }
 
@@ -1208,6 +1365,15 @@ impl NeuralCabinApp {
             }
             if let Some(i) = to_remove { net.vocab.tokens.remove(i); }
         });
+
+        if let Some(check) = dim_check {
+            let net_id = check.network_id;
+            let old_in = check.old_input_dim;
+            let old_out = check.old_output_dim;
+            let new_in = check.new_input_dim;
+            let new_out = check.new_output_dim;
+            self.flag_dimension_check(net_id, old_in, old_out, new_in, new_out);
+        }
     }
 }
 

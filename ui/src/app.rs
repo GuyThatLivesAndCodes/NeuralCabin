@@ -347,7 +347,7 @@ impl NeuralCabinApp {
 
             if cfg!(target_os = "windows") {
                 if let Ok(mut child) = Command::new("powershell")
-                    .args(&["-NoProfile", "-Command", "Set-Clipboard"])
+                    .args(["-NoProfile", "-Command", "Set-Clipboard"])
                     .stdin(Stdio::piped())
                     .spawn()
                 {
@@ -368,7 +368,7 @@ impl NeuralCabinApp {
                 }
             } else {
                 if let Ok(mut child) = Command::new("xclip")
-                    .args(&["-selection", "clipboard"])
+                    .args(["-selection", "clipboard"])
                     .stdin(Stdio::piped())
                     .spawn()
                 {

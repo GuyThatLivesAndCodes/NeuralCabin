@@ -286,7 +286,25 @@ impl NeuralCabinApp {
         });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let s = &sections[self.docs_section.min(sections.len() - 1)];
-            ui.label(RichText::new(s.title).size(22.0).strong());
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(s.title).size(22.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⬇ All Docs").clicked() {
+                        self.download_all_docs();
+                    }
+                    if ui.button("⬇ Page").clicked() {
+                        self.download_current_doc(s);
+                    }
+                    if ui.button("📋 Copy").clicked() {
+                        self.copy_doc_to_clipboard(s);
+                    }
+                });
+            });
+
+            ui.label(RichText::new(format!("Last Updated: {}", s.last_updated))
+                .color(theme::TEXT_WEAK).size(10.0));
+
             theme::hairline(ui);
             ui.add_space(6.0);
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -315,6 +333,80 @@ impl NeuralCabinApp {
                 }
             });
         });
+    }
+
+    fn copy_doc_to_clipboard(&self, section: &docs::DocSection) {
+        let mut content = String::new();
+        content.push_str(&format!("# {}\n\n", section.title));
+        content.push_str(&format!("Last Updated: {}\n\n", section.last_updated));
+        content.push_str(section.body);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::process::{Command, Stdio};
+
+            if cfg!(target_os = "windows") {
+                if let Ok(mut child) = Command::new("powershell")
+                    .args(&["-NoProfile", "-Command", "Set-Clipboard"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(content.as_bytes());
+                    }
+                }
+            } else if cfg!(target_os = "macos") {
+                if let Ok(mut child) = Command::new("pbcopy")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(content.as_bytes());
+                    }
+                }
+            } else {
+                if let Ok(mut child) = Command::new("xclip")
+                    .args(&["-selection", "clipboard"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(content.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn download_current_doc(&self, section: &docs::DocSection) {
+        let filename = format!("{}.txt", section.id);
+        let mut content = String::new();
+        content.push_str(&format!("# {}\n\n", section.title));
+        content.push_str(&format!("Last Updated: {}\n\n", section.last_updated));
+        content.push_str(section.body);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(download_dir) = dirs::download_dir() {
+                let path = download_dir.join(&filename);
+                let _ = std::fs::write(&path, content);
+            }
+        }
+    }
+
+    fn download_all_docs(&self) {
+        let content = docs::export_all_as_markdown();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(download_dir) = dirs::download_dir() {
+                let path = download_dir.join("NeuralCabin-Docs-Full.txt");
+                let _ = std::fs::write(&path, content);
+            }
+        }
     }
 }
 

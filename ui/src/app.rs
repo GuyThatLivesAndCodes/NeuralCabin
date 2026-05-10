@@ -2,7 +2,7 @@
 
 use crate::corpus::{Corpus, CorpusTemplate};
 use crate::docs;
-use crate::networks::{EmbeddingKind, NetworkInstance, NetworkKind, NetworkStore, OptChoice};
+use crate::networks::{EmbeddingKind, GptStage, NetworkInstance, NetworkKind, NetworkStore, OptChoice};
 use crate::paths;
 use crate::plot::{scatter_2d, scatter_2d_with_query, LinePlot};
 use crate::plugins::PluginRegistry;
@@ -743,7 +743,12 @@ impl NeuralCabinApp {
         ui.add_space(6.0);
         match &net.kind {
             NetworkKind::NextTokenGen => corpus_text_panel(ui, &mut net.corpus, &net.vocab),
-            NetworkKind::Gpt => corpus_gpt_panel(ui, &mut net.corpus, &net.vocab),
+            NetworkKind::Gpt => {
+                match net.gpt_stage {
+                    GptStage::Pretraining => corpus_gpt_panel(ui, &mut net.corpus, &net.vocab),
+                    GptStage::FineTuning => gpt_finetuning_panel(ui, &mut net.corpus, &net.vocab),
+                }
+            }
             NetworkKind::Simplex => corpus_numeric_panel(ui, &mut net.corpus, net.seed, false),
             NetworkKind::Plugin { .. } => {
                 ui.label(RichText::new("Plugin networks default to numeric corpora:")
@@ -959,20 +964,68 @@ fn corpus_gpt_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
     ui.add_space(8.0);
     if ui.button("Build Pretraining Set").clicked() {
         let mut text = String::new();
+        let mut failed_count = 0;
         for file in &corpus.gpt_files {
             if corpus.gpt_use_file_boundaries {
                 text.push_str(&format!("<|file:{}|>\n", file.name));
             }
-            if let Ok(content) = std::fs::read_to_string(&file.path) {
-                text.push_str(&content);
-                text.push('\n');
+            match std::fs::read_to_string(&file.path) {
+                Ok(content) => {
+                    text.push_str(&content);
+                    text.push('\n');
+                }
+                Err(_) => failed_count += 1,
             }
         }
         corpus.text_body = text;
         corpus.retokenise(vocab);
-        corpus.message = Some("Pretraining set built.".into());
+        if failed_count > 0 {
+            corpus.message = Some(format!(
+                "Built pretraining set ({} files ok, {} not readable).",
+                corpus.gpt_files.len() - failed_count,
+                failed_count
+            ));
+        } else {
+            corpus.message = Some("Pretraining set built.".into());
+        }
     }
 
+    if let Some(m) = &corpus.message {
+        ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+    }
+}
+
+fn gpt_finetuning_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
+    corpus.template = CorpusTemplate::Text;
+    ui.horizontal(|ui| {
+        ui.label("Context size:");
+        let mut c = corpus.context_size as i32;
+        if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+            corpus.context_size = c.max(1) as usize;
+        }
+        ui.label(RichText::new(format!("vocab = {} tokens", vocab.len())).color(theme::TEXT_WEAK));
+    });
+    ui.add_space(4.0);
+
+    ui.label(RichText::new("Conversation format — paste User:/Assistant: pairs")
+        .color(theme::TEXT_WEAK).size(11.5));
+    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+        ui.add(egui::TextEdit::multiline(&mut corpus.text_body)
+            .desired_width(f32::INFINITY).desired_rows(12).code_editor());
+    });
+    ui.add_space(4.0);
+
+    file_pick_row(ui, "Append file:", &mut corpus.upload_path,
+        &[("Text", &["txt", "md"])], false);
+    if ui.button("Upload").clicked() {
+        let path = corpus.upload_path.clone();
+        if let Err(e) = corpus.upload_text_file(&path) {
+            corpus.message = Some(format!("Upload failed: {e}"));
+        }
+    }
+
+    ui.add_space(6.0);
+    if ui.button("Re-tokenise").clicked() { corpus.retokenise(vocab); }
     if let Some(m) = &corpus.message {
         ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
     }
@@ -992,7 +1045,7 @@ impl NeuralCabinApp {
         if !allowed {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Vocab is only available for next-token-generation networks.")
+                ui.label(RichText::new("Vocab is only available for next-token-generation and GPT networks.")
                     .color(theme::TEXT_WEAK));
                 ui.add_space(4.0);
                 ui.label(RichText::new("(or for plugin networks with manages_vocab = true)")
@@ -1188,6 +1241,34 @@ impl NeuralCabinApp {
                 ui.add(egui::DragValue::new(&mut net.weight_decay).speed(0.001).range(0.0..=1.0));
                 theme::caption(ui, "Applied directly to parameters (decoupled from gradient).");
             });
+        }
+
+        // GPT-specific controls (stage, fine-tuning mode, layer freezing).
+        if matches!(net.kind, NetworkKind::Gpt) {
+            ui.add_space(6.0);
+            theme::section_heading(ui, "GPT Training Stage");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Mode:");
+                ui.selectable_value(&mut net.gpt_stage, GptStage::Pretraining, "Pretraining");
+                ui.selectable_value(&mut net.gpt_stage, GptStage::FineTuning, "Fine-tuning");
+            });
+
+            if net.gpt_stage == GptStage::FineTuning {
+                ui.add_space(4.0);
+                ui.checkbox(&mut net.gpt_mask_user_tokens, "Train on assistant tokens only");
+                theme::caption(ui, "Zero out gradients for user-token positions.");
+
+                if !net.gpt_frozen_layers.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label("Freeze layers:");
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, frozen) in net.gpt_frozen_layers.iter_mut().enumerate() {
+                            ui.checkbox(frozen, format!("L{}", i));
+                        }
+                    });
+                }
+            }
+            ui.add_space(4.0);
         }
 
         ui.horizontal_wrapped(|ui| {
@@ -1465,6 +1546,13 @@ fn text_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
     }
     if still_generating {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    // Show stage info for GPT networks
+    if matches!(net.kind, NetworkKind::Gpt) {
+        ui.label(RichText::new(format!("Stage: {}", net.gpt_stage.name()))
+            .color(theme::TEXT_WEAK).size(11.0));
+        ui.add_space(4.0);
     }
 
     // ── Controls row ──────────────────────────────────────────────────────────

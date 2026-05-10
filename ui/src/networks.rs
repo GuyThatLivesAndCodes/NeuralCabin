@@ -56,6 +56,36 @@ impl NetworkKind {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GptStage {
+    Pretraining,
+    FineTuning,
+}
+
+impl GptStage {
+    pub fn name(&self) -> &'static str {
+        match self {
+            GptStage::Pretraining => "Pretraining",
+            GptStage::FineTuning => "Fine-tuning",
+        }
+    }
+
+    pub fn to_str(self) -> &'static str {
+        match self {
+            GptStage::Pretraining => "Pretraining",
+            GptStage::FineTuning => "FineTuning",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        if s == "FineTuning" {
+            GptStage::FineTuning
+        } else {
+            GptStage::Pretraining
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OptChoice { Sgd, Adam, AdamW, Lamb }
 
 impl OptChoice {
@@ -167,6 +197,11 @@ pub struct NetworkInstance {
     pub embedding_kind: EmbeddingKind,
     pub embed_dim: usize,
 
+    // GPT-specific: training stage and fine-tuning settings.
+    pub gpt_stage: GptStage,
+    pub gpt_frozen_layers: Vec<bool>,
+    pub gpt_mask_user_tokens: bool,
+
     // Training hyperparameters.
     pub loss_choice: Loss,
     pub opt_choice: OptChoice,
@@ -270,6 +305,7 @@ impl NetworkInstance {
         layer_specs: Vec<LayerSpec>,
         seed: u64,
     ) -> Self {
+        let num_layers = layer_specs.len();
         Self {
             id,
             name,
@@ -285,6 +321,9 @@ impl NetworkInstance {
             vocab: Vocab::default(),
             embedding_kind: EmbeddingKind::OneHot,
             embed_dim: 32,
+            gpt_stage: GptStage::Pretraining,
+            gpt_frozen_layers: vec![false; num_layers],
+            gpt_mask_user_tokens: false,
             loss_choice: Loss::MeanSquaredError,
             opt_choice: OptChoice::Adam,
             learning_rate: 0.05,

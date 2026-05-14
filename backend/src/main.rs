@@ -45,6 +45,14 @@ impl AppState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // Support headless XOR demo mode
+    if args.iter().any(|a| a == "--xor-demo") {
+        headless_xor_demo();
+        return;
+    }
+
     let port = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -79,10 +87,56 @@ async fn main() {
     println!("   Open your browser: {url}");
     println!("   Press Ctrl+C to stop.");
 
-    // Try to open the browser automatically (best effort — ignore errors)
-    let _ = open_browser(&url);
+    // Try to open browser in background (don't block server start)
+    let url_clone = url.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = open_browser(&url_clone);
+    });
 
     axum::serve(listener, app).await.expect("Server error");
+}
+
+/// Headless XOR training demo (for CI testing)
+fn headless_xor_demo() {
+    use neuralcabin_engine::nn::{LayerSpec, Model};
+    use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
+    use neuralcabin_engine::tensor::Tensor;
+    use neuralcabin_engine::{Activation, Loss};
+
+    println!("Training XOR MLP (headless)...");
+    let specs = vec![
+        LayerSpec::Linear { in_dim: 2, out_dim: 8 },
+        LayerSpec::Activation(Activation::Tanh),
+        LayerSpec::Linear { in_dim: 8, out_dim: 1 },
+        LayerSpec::Activation(Activation::Sigmoid),
+    ];
+    let mut model = Model::from_specs(2, &specs, 42);
+    let mut opt = Optimizer::new(
+        OptimizerKind::Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        &model.parameter_shapes(),
+    );
+    let x = Tensor::new(vec![4, 2], vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    let y = Tensor::new(vec![4, 1], vec![0.0, 1.0, 1.0, 0.0]);
+    let mut last = f32::INFINITY;
+    for epoch in 1..=2000 {
+        last = model.train_step(&mut opt, Loss::MeanSquaredError, &x, &y);
+        if epoch % 200 == 0 {
+            println!("  epoch {epoch:>5}  loss = {last:.6}");
+        }
+    }
+    println!("Final loss = {last:.6}");
+    let pred = model.predict(&x);
+    println!("Predictions:");
+    for (i, p) in pred.data.iter().enumerate() {
+        let xi = &x.data[i * 2..(i + 1) * 2];
+        let ti = y.data[i];
+        println!("  XOR({}, {}) -> {p:.4}  (target {ti})", xi[0], xi[1]);
+    }
+    if last > 0.05 {
+        eprintln!("convergence check failed: final loss {last} > 0.05");
+        std::process::exit(1);
+    }
 }
 
 async fn serve_frontend(uri: Uri) -> Response {

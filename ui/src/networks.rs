@@ -12,6 +12,7 @@ use neuralcabin_engine::{Activation, Loss};
 pub enum NetworkKind {
     Simplex,
     NextTokenGen,
+    Gpt,
     Plugin { plugin_id: String, type_name: String },
 }
 
@@ -20,6 +21,7 @@ impl NetworkKind {
         match self {
             NetworkKind::Simplex => "Simplex (MLP)".into(),
             NetworkKind::NextTokenGen => "Next-Token Generation".into(),
+            NetworkKind::Gpt => "GPT (Pretraining)".into(),
             NetworkKind::Plugin { plugin_id, type_name } => {
                 format!("Plugin · {plugin_id} / {type_name}")
             }
@@ -30,6 +32,7 @@ impl NetworkKind {
         match self {
             NetworkKind::Simplex => "Simplex".into(),
             NetworkKind::NextTokenGen => "NextTokenGen".into(),
+            NetworkKind::Gpt => "Gpt".into(),
             NetworkKind::Plugin { plugin_id, type_name } => {
                 format!("Plugin:{plugin_id}:{type_name}")
             }
@@ -39,6 +42,8 @@ impl NetworkKind {
     pub fn from_persist_string(s: &str) -> Self {
         if s == "NextTokenGen" {
             NetworkKind::NextTokenGen
+        } else if s == "Gpt" {
+            NetworkKind::Gpt
         } else if let Some(rest) = s.strip_prefix("Plugin:") {
             let mut parts = rest.splitn(2, ':');
             let pid = parts.next().unwrap_or("").to_string();
@@ -46,6 +51,36 @@ impl NetworkKind {
             NetworkKind::Plugin { plugin_id: pid, type_name: ty }
         } else {
             NetworkKind::Simplex
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GptStage {
+    Pretraining,
+    FineTuning,
+}
+
+impl GptStage {
+    pub fn name(&self) -> &'static str {
+        match self {
+            GptStage::Pretraining => "Pretraining",
+            GptStage::FineTuning => "Fine-tuning",
+        }
+    }
+
+    pub fn to_str(self) -> &'static str {
+        match self {
+            GptStage::Pretraining => "Pretraining",
+            GptStage::FineTuning => "FineTuning",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        if s == "FineTuning" {
+            GptStage::FineTuning
+        } else {
+            GptStage::Pretraining
         }
     }
 }
@@ -162,6 +197,11 @@ pub struct NetworkInstance {
     pub embedding_kind: EmbeddingKind,
     pub embed_dim: usize,
 
+    // GPT-specific: training stage and fine-tuning settings.
+    pub gpt_stage: GptStage,
+    pub gpt_frozen_layers: Vec<bool>,
+    pub gpt_mask_user_tokens: bool,
+
     // Training hyperparameters.
     pub loss_choice: Loss,
     pub opt_choice: OptChoice,
@@ -192,6 +232,10 @@ pub struct NetworkInstance {
     pub generator: Option<crate::generator::GeneratorHandle>,
     /// Re-run generation automatically whenever the prompt changes.
     pub realtime_text: bool,
+
+    // Chat interface (GPT fine-tuning).
+    pub chat_messages: Vec<(String, String)>, // (role, content) pairs: ("user" or "assistant")
+    pub chat_input: String,
 
     // Persistence.
     pub persistence_message: Option<String>,
@@ -224,6 +268,21 @@ impl NetworkInstance {
         me
     }
 
+    pub fn new_gpt(id: u64, name: String, seed: u64) -> Self {
+        let layers = vec![
+            LayerSpec::Linear { in_dim: 1, out_dim: 64 },
+            LayerSpec::Activation(Activation::Tanh),
+            LayerSpec::Linear { in_dim: 64, out_dim: 32 },
+            LayerSpec::Activation(Activation::Tanh),
+            LayerSpec::Linear { in_dim: 32, out_dim: 1 },
+            LayerSpec::Activation(Activation::Identity),
+        ];
+        let mut me = Self::common(id, name, NetworkKind::Gpt, 1, layers, seed);
+        me.corpus.template = CorpusTemplate::Text;
+        me.loss_choice = Loss::CrossEntropy;
+        me
+    }
+
     pub fn new_plugin(id: u64, name: String, plugin_id: String, type_name: String, seed: u64) -> Self {
         let layers = vec![
             LayerSpec::Linear { in_dim: 2, out_dim: 16 },
@@ -250,6 +309,7 @@ impl NetworkInstance {
         layer_specs: Vec<LayerSpec>,
         seed: u64,
     ) -> Self {
+        let num_layers = layer_specs.len();
         Self {
             id,
             name,
@@ -265,6 +325,9 @@ impl NetworkInstance {
             vocab: Vocab::default(),
             embedding_kind: EmbeddingKind::OneHot,
             embed_dim: 32,
+            gpt_stage: GptStage::Pretraining,
+            gpt_frozen_layers: vec![false; num_layers],
+            gpt_mask_user_tokens: false,
             loss_choice: Loss::MeanSquaredError,
             opt_choice: OptChoice::Adam,
             learning_rate: 0.05,
@@ -288,6 +351,8 @@ impl NetworkInstance {
             max_tokens: 64,
             generator: None,
             realtime_text: false,
+            chat_messages: Vec::new(),
+            chat_input: String::new(),
             persistence_message: None,
         }
     }
@@ -388,12 +453,26 @@ impl NetworkInstance {
     /// Recompute input_dim from vocab/context/embedding settings.
     /// Call this whenever vocab size, context size, or embedding kind changes.
     pub fn sync_text_dims(&mut self) {
-        if !matches!(self.kind, NetworkKind::NextTokenGen) { return; }
-        let v = self.vocab.len().max(1);
-        let ctx = self.corpus.context_size.max(1);
-        let new_in = self.embedding_kind.input_dim(ctx, v, self.embed_dim);
-        self.set_input_dim(new_in);
-        self.set_output_dim(v);
+        match self.kind {
+            NetworkKind::NextTokenGen | NetworkKind::Gpt => {
+                let v = self.vocab.len().max(1);
+                let ctx = self.corpus.context_size.max(1);
+                let new_in = self.embedding_kind.input_dim(ctx, v, self.embed_dim);
+                self.set_input_dim(new_in);
+                self.set_output_dim(v);
+            }
+            _ => {}
+        }
+    }
+
+    /// Get the output dimension from the last Linear layer spec.
+    pub fn output_dim(&self) -> usize {
+        for spec in self.layer_specs.iter().rev() {
+            if let LayerSpec::Linear { out_dim, .. } = spec {
+                return *out_dim;
+            }
+        }
+        1
     }
 
     /// Index of the last `Linear` layer spec, if any.

@@ -2,7 +2,7 @@
 
 use crate::corpus::{Corpus, CorpusTemplate};
 use crate::docs;
-use crate::networks::{EmbeddingKind, NetworkInstance, NetworkKind, NetworkStore, OptChoice};
+use crate::networks::{EmbeddingKind, GptStage, NetworkInstance, NetworkKind, NetworkStore, OptChoice};
 use crate::paths;
 use crate::plot::{scatter_2d, scatter_2d_with_query, LinePlot};
 use crate::plugins::PluginRegistry;
@@ -46,11 +46,31 @@ struct CreateDialog {
     base_options: Vec<NetworkKind>,
 }
 
+#[derive(Default, Clone)]
+struct DimensionCheck {
+    network_id: u64,
+    old_input_dim: usize,
+    old_output_dim: usize,
+    new_input_dim: usize,
+    new_output_dim: usize,
+}
+
+#[derive(Default)]
+struct RebuildModal {
+    open: bool,
+    network_id: Option<u64>,
+    old_input_dim: usize,
+    old_output_dim: usize,
+    new_input_dim: usize,
+    new_output_dim: usize,
+}
+
 pub struct NeuralCabinApp {
     tab: Tab,
     store: NetworkStore,
     plugins: PluginRegistry,
     create: CreateDialog,
+    rebuild_modal: RebuildModal,
     docs_section: usize,
     theme_applied: bool,
     rng: SplitMix64,
@@ -64,6 +84,7 @@ impl NeuralCabinApp {
             store: NetworkStore::default(),
             plugins: PluginRegistry::default(),
             create: CreateDialog::default(),
+            rebuild_modal: RebuildModal::default(),
             docs_section: 0,
             theme_applied: false,
             rng: SplitMix64::new(0xA11CE),
@@ -87,7 +108,7 @@ impl NeuralCabinApp {
     }
 
     fn rebuild_create_options(&mut self) {
-        let mut opts = vec![NetworkKind::Simplex, NetworkKind::NextTokenGen];
+        let mut opts = vec![NetworkKind::Simplex, NetworkKind::NextTokenGen, NetworkKind::Gpt];
         for (pid, ty) in self.plugins.all_network_types() {
             opts.push(NetworkKind::Plugin { plugin_id: pid, type_name: ty });
         }
@@ -99,7 +120,7 @@ impl NeuralCabinApp {
 
     fn vocab_enabled(&self) -> bool {
         match self.store.active().map(|n| &n.kind) {
-            Some(NetworkKind::NextTokenGen) => true,
+            Some(NetworkKind::NextTokenGen) | Some(NetworkKind::Gpt) => true,
             Some(NetworkKind::Plugin { plugin_id, .. }) => self
                 .plugins.find_by_id(plugin_id)
                 .map(|p| p.manifest.manages_vocab)
@@ -124,6 +145,18 @@ impl NeuralCabinApp {
 
     fn any_training(&self) -> bool {
         self.store.list.iter().any(|n| n.trainer.is_some())
+    }
+
+    /// Mark that dimensions need to be checked and potentially show rebuild modal.
+    fn flag_dimension_check(&mut self, net_id: u64, old_in: usize, old_out: usize, new_in: usize, new_out: usize) {
+        if new_in != old_in || new_out != old_out {
+            self.rebuild_modal.network_id = Some(net_id);
+            self.rebuild_modal.old_input_dim = old_in;
+            self.rebuild_modal.old_output_dim = old_out;
+            self.rebuild_modal.new_input_dim = new_in;
+            self.rebuild_modal.new_output_dim = new_out;
+            self.rebuild_modal.open = true;
+        }
     }
 }
 
@@ -159,10 +192,36 @@ impl eframe::App for NeuralCabinApp {
                     }
                 }
                 Tab::Vocab => {
-                    if let Some(net) = self.store.active_mut() {
+                    let dim_check = if let Some(net) = self.store.active_mut() {
                         net.vocab.upload_path = first.clone();
                         let _ = net.vocab.load_file(&first);
+                        let old_in = net.input_dim;
+                        let old_out = net.output_dim();
                         net.sync_text_dims();
+                        let new_in = net.input_dim;
+                        let new_out = net.output_dim();
+                        if new_in != old_in || new_out != old_out {
+                            Some(DimensionCheck {
+                                network_id: net.id,
+                                old_input_dim: old_in,
+                                old_output_dim: old_out,
+                                new_input_dim: new_in,
+                                new_output_dim: new_out,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(check) = dim_check {
+                        self.flag_dimension_check(
+                            check.network_id,
+                            check.old_input_dim,
+                            check.old_output_dim,
+                            check.new_input_dim,
+                            check.new_output_dim,
+                        );
                     }
                 }
                 Tab::Plugins => {
@@ -186,6 +245,45 @@ impl eframe::App for NeuralCabinApp {
                 Tab::Plugins   => self.plugins_tab(ui),
             }
         });
+        self.show_rebuild_modal(ctx);
+    }
+}
+
+impl NeuralCabinApp {
+    fn show_rebuild_modal(&mut self, ctx: &egui::Context) {
+        if !self.rebuild_modal.open { return; }
+
+        egui::Window::new("Rebuild Model?")
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Corpus or vocabulary changes require model dimensions to be updated.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!(
+                        "Input: {} → {}  •  Output: {} → {}",
+                        self.rebuild_modal.old_input_dim,
+                        self.rebuild_modal.new_input_dim,
+                        self.rebuild_modal.old_output_dim,
+                        self.rebuild_modal.new_output_dim
+                    )).color(theme::TEXT_WEAK).monospace());
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("✓ Accept (rebuild)").clicked() {
+                        if let Some(id) = self.rebuild_modal.network_id {
+                            if let Some(net) = self.store.list.iter_mut().find(|n| n.id == id) {
+                                net.build_model();
+                            }
+                        }
+                        self.rebuild_modal.open = false;
+                    }
+                    if ui.button("✗ Deny (skip)").clicked() {
+                        self.rebuild_modal.open = false;
+                    }
+                });
+            });
     }
 }
 
@@ -286,7 +384,25 @@ impl NeuralCabinApp {
         });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let s = &sections[self.docs_section.min(sections.len() - 1)];
-            ui.label(RichText::new(s.title).size(22.0).strong());
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(s.title).size(22.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⬇ All Docs").clicked() {
+                        self.download_all_docs();
+                    }
+                    if ui.button("⬇ Page").clicked() {
+                        self.download_current_doc(s);
+                    }
+                    if ui.button("📋 Copy").clicked() {
+                        self.copy_doc_to_clipboard(s);
+                    }
+                });
+            });
+
+            ui.label(RichText::new(format!("Last Updated: {}", s.last_updated))
+                .color(theme::TEXT_WEAK).size(10.0));
+
             theme::hairline(ui);
             ui.add_space(6.0);
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -315,6 +431,80 @@ impl NeuralCabinApp {
                 }
             });
         });
+    }
+
+    fn copy_doc_to_clipboard(&self, section: &docs::DocSection) {
+        let mut content = String::new();
+        content.push_str(&format!("# {}\n\n", section.title));
+        content.push_str(&format!("Last Updated: {}\n\n", section.last_updated));
+        content.push_str(section.body);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::process::{Command, Stdio};
+
+            if cfg!(target_os = "windows") {
+                if let Ok(mut child) = Command::new("powershell")
+                    .args(["-NoProfile", "-Command", "Set-Clipboard"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(content.as_bytes());
+                    }
+                }
+            } else if cfg!(target_os = "macos") {
+                if let Ok(mut child) = Command::new("pbcopy")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(content.as_bytes());
+                    }
+                }
+            } else {
+                if let Ok(mut child) = Command::new("xclip")
+                    .args(["-selection", "clipboard"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(content.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn download_current_doc(&self, section: &docs::DocSection) {
+        let filename = format!("{}.txt", section.id);
+        let mut content = String::new();
+        content.push_str(&format!("# {}\n\n", section.title));
+        content.push_str(&format!("Last Updated: {}\n\n", section.last_updated));
+        content.push_str(section.body);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(download_dir) = dirs::download_dir() {
+                let path = download_dir.join(&filename);
+                let _ = std::fs::write(&path, content);
+            }
+        }
+    }
+
+    fn download_all_docs(&self) {
+        let content = docs::export_all_as_markdown();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(download_dir) = dirs::download_dir() {
+                let path = download_dir.join("NeuralCabin-Docs-Full.txt");
+                let _ = std::fs::write(&path, content);
+            }
+        }
     }
 }
 
@@ -392,6 +582,7 @@ impl NeuralCabinApp {
                 let net = match kind {
                     NetworkKind::Simplex => NetworkInstance::new_simplex(0, name, seed),
                     NetworkKind::NextTokenGen => NetworkInstance::new_next_token(0, name, seed),
+                    NetworkKind::Gpt => NetworkInstance::new_gpt(0, name, seed),
                     NetworkKind::Plugin { plugin_id, type_name } =>
                         NetworkInstance::new_plugin(0, name, plugin_id, type_name, seed),
                 };
@@ -436,6 +627,8 @@ impl NeuralCabinApp {
         theme::hairline(ui);
         ui.add_space(4.0);
 
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+
         ui.horizontal(|ui| {
             ui.label("Rename:");
             ui.add(egui::TextEdit::singleline(&mut net.name).desired_width(220.0));
@@ -445,7 +638,7 @@ impl NeuralCabinApp {
             if ui.add(egui::DragValue::new(&mut s)).changed() { net.seed = s as u64; }
         });
 
-        if is_ntg {
+        if is_ntg || matches!(net.kind, NetworkKind::Gpt) {
             ui.horizontal(|ui| {
                 ui.label("Input dim:");
                 ui.label(RichText::new(format!("{} (auto — vocab × context)", net.input_dim))
@@ -469,7 +662,8 @@ impl NeuralCabinApp {
         let mut current_dim = net.input_dim;
         for (i, spec) in net.layer_specs.iter_mut().enumerate() {
             let is_first_linear = i == 0 && matches!(spec, LayerSpec::Linear { .. });
-            let locked = is_ntg && (is_first_linear || Some(i) == last_linear);
+            let is_text_model = is_ntg || matches!(net.kind, NetworkKind::Gpt);
+            let locked = is_text_model && (is_first_linear || Some(i) == last_linear);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}.", i + 1));
@@ -535,10 +729,19 @@ impl NeuralCabinApp {
         {
             net.build_model();
         }
+        let mut should_rebuild = false;
         if let Some(msg) = &net.build_message {
-            let c = if msg.starts_with("Layer ") || msg.starts_with("Model ")
-                { theme::DANGER } else { theme::TEXT_WEAK };
-            ui.colored_label(c, msg);
+            let is_struct_error = msg.starts_with("Layer ") || msg.starts_with("Model ");
+            let c = if is_struct_error { theme::DANGER } else { theme::TEXT_WEAK };
+            ui.horizontal(|ui| {
+                ui.colored_label(c, msg);
+                if is_struct_error && ui.button("Reset to Template").clicked() {
+                    should_rebuild = true;
+                }
+            });
+        }
+        if should_rebuild {
+            net.build_model();
         }
         if let Some(model) = &net.model {
             ui.add_space(4.0);
@@ -565,6 +768,7 @@ impl NeuralCabinApp {
         if let Some(m) = &net.persistence_message {
             ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
         }
+        });
     }
 }
 
@@ -591,6 +795,9 @@ fn save_active(net: &mut NetworkInstance) {
     file.vocab_mode         = Some(net.vocab.mode.to_str().to_string());
     file.embedding_kind     = Some(net.embedding_kind.to_str().to_string());
     file.embed_dim          = Some(net.embed_dim);
+    file.gpt_stage          = Some(net.gpt_stage.to_str().to_string());
+    file.gpt_frozen_layers  = Some(net.gpt_frozen_layers.clone());
+    file.gpt_mask_user_tokens = Some(net.gpt_mask_user_tokens);
     match persistence::save(&path, &file) {
         Ok(()) => net.persistence_message = Some(format!("Saved → {}", path.display())),
         Err(e) => net.persistence_message = Some(format!("Save failed: {e}")),
@@ -612,6 +819,7 @@ fn network_from_file(f: ModelFile, name: String) -> NetworkInstance {
     let mut net = match &kind {
         NetworkKind::Simplex     => NetworkInstance::new_simplex(0, name, seed),
         NetworkKind::NextTokenGen=> NetworkInstance::new_next_token(0, name, seed),
+        NetworkKind::Gpt         => NetworkInstance::new_gpt(0, name, seed),
         NetworkKind::Plugin { plugin_id, type_name } =>
             NetworkInstance::new_plugin(0, name, plugin_id.clone(), type_name.clone(), seed),
     };
@@ -632,6 +840,15 @@ fn network_from_file(f: ModelFile, name: String) -> NetworkInstance {
         net.embedding_kind = EmbeddingKind::from_str(e);
     }
     if let Some(d) = f.embed_dim { net.embed_dim = d; }
+    if let Some(stage) = f.gpt_stage.as_deref() {
+        net.gpt_stage = GptStage::from_str(stage);
+    }
+    if let Some(frozen) = f.gpt_frozen_layers {
+        net.gpt_frozen_layers = frozen;
+    }
+    if let Some(mask) = f.gpt_mask_user_tokens {
+        net.gpt_mask_user_tokens = mask;
+    }
     net.inference_inputs = vec![0.0; input_dim];
     net
 }
@@ -649,6 +866,12 @@ impl NeuralCabinApp {
         ui.add_space(6.0);
         match &net.kind {
             NetworkKind::NextTokenGen => corpus_text_panel(ui, &mut net.corpus, &net.vocab),
+            NetworkKind::Gpt => {
+                match net.gpt_stage {
+                    GptStage::Pretraining => corpus_gpt_panel(ui, &mut net.corpus, &net.vocab),
+                    GptStage::FineTuning => gpt_finetuning_panel(ui, &mut net.corpus, &net.vocab),
+                }
+            }
             NetworkKind::Simplex => corpus_numeric_panel(ui, &mut net.corpus, net.seed, false),
             NetworkKind::Plugin { .. } => {
                 ui.label(RichText::new("Plugin networks default to numeric corpora:")
@@ -798,6 +1021,145 @@ fn corpus_text_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
     }
 }
 
+fn corpus_gpt_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
+    corpus.template = CorpusTemplate::Text;
+    ui.horizontal(|ui| {
+        ui.label("Context size:");
+        let mut c = corpus.context_size as i32;
+        if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+            corpus.context_size = c.max(1) as usize;
+        }
+        ui.label(RichText::new(format!("vocab = {} tokens", vocab.len())).color(theme::TEXT_WEAK));
+    });
+    ui.add_space(4.0);
+
+    ui.label(RichText::new("Pretraining files — upload .txt, .md, .py, .json, .csv, etc.")
+        .color(theme::TEXT_WEAK).size(11.5));
+    ui.add_space(4.0);
+
+    file_pick_row(ui, "Add file:", &mut corpus.upload_path,
+        &[("Text", &["txt", "md", "rs", "py", "js", "ts", "json", "csv"])], false);
+    if ui.button("Add File").clicked() {
+        let path = corpus.upload_path.clone();
+        if let Err(e) = corpus.add_gpt_file(&path, vocab) {
+            corpus.message = Some(format!("Failed to add file: {e}"));
+        } else {
+            corpus.upload_path.clear();
+        }
+    }
+
+    if !corpus.gpt_files.is_empty() {
+        let total_tokens: usize = corpus.gpt_files.iter().map(|f| f.token_count).sum();
+        let total_bytes: usize = corpus.gpt_files.iter().map(|f| f.byte_size).sum();
+
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!(
+            "Total: {} files, {} tokens, {:.1} MB",
+            corpus.gpt_files.len(),
+            total_tokens,
+            total_bytes as f64 / (1024.0 * 1024.0)
+        )).color(theme::ACCENT).strong());
+
+        let mut to_remove = None;
+        egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+            for (i, file) in corpus.gpt_files.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("✕").min_size(egui::vec2(24.0, 18.0))).clicked() {
+                        to_remove = Some(i);
+                    }
+                    ui.label(RichText::new(&file.name).size(12.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{} tokens", file.token_count))
+                            .color(theme::TEXT_WEAK).size(10.5));
+                    });
+                });
+            }
+        });
+        if let Some(i) = to_remove {
+            corpus.gpt_files.remove(i);
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.checkbox(&mut corpus.gpt_use_file_boundaries, "Add file-boundary tokens");
+    theme::caption(ui, "Inserts <|file:name|> between files to help the model track sources.");
+
+    ui.add_space(8.0);
+    if ui.button("Build Pretraining Set").clicked() {
+        let mut text = String::new();
+        let mut failed_count = 0;
+        for file in &corpus.gpt_files {
+            if corpus.gpt_use_file_boundaries {
+                text.push_str(&format!("<|file:{}|>\n", file.name));
+            }
+            match std::fs::read_to_string(&file.path) {
+                Ok(content) => {
+                    text.push_str(&content);
+                    text.push('\n');
+                }
+                Err(_) => failed_count += 1,
+            }
+        }
+        corpus.text_body = text;
+        corpus.retokenise(vocab);
+        if failed_count > 0 {
+            corpus.message = Some(format!(
+                "Built pretraining set ({} files ok, {} not readable).",
+                corpus.gpt_files.len() - failed_count,
+                failed_count
+            ));
+        } else {
+            corpus.message = Some("Pretraining set built.".into());
+        }
+    }
+
+    if let Some(m) = &corpus.message {
+        ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+    }
+}
+
+fn gpt_finetuning_panel(ui: &mut egui::Ui, corpus: &mut Corpus, vocab: &Vocab) {
+    corpus.template = CorpusTemplate::Text;
+    ui.horizontal(|ui| {
+        ui.label("Context size:");
+        let mut c = corpus.context_size as i32;
+        if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+            corpus.context_size = c.max(1) as usize;
+        }
+        ui.label(RichText::new(format!("vocab = {} tokens", vocab.len())).color(theme::TEXT_WEAK));
+    });
+    ui.add_space(4.0);
+
+    ui.label(RichText::new("Conversation Training Data (JSONL format)")
+        .color(theme::TEXT_WEAK).size(12.0).strong());
+    theme::caption(ui, "Each line is a JSON object with \"messages\" array containing {\"role\": \"user\"|\"assistant\", \"content\": \"...\"}");
+    ui.label(RichText::new("Example:")
+        .color(theme::TEXT_FAINT).size(10.0).italics());
+    theme::caption(ui, r#"{"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]}"#);
+    ui.add_space(6.0);
+
+    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+        ui.add(egui::TextEdit::multiline(&mut corpus.text_body)
+            .desired_width(f32::INFINITY).desired_rows(12).code_editor());
+    });
+    ui.add_space(4.0);
+
+    file_pick_row(ui, "Append file:", &mut corpus.upload_path,
+        &[("Text", &["jsonl", "txt", "md"])], false);
+    if ui.button("Upload").clicked() {
+        let path = corpus.upload_path.clone();
+        if let Err(e) = corpus.upload_text_file(&path) {
+            corpus.message = Some(format!("Upload failed: {e}"));
+        }
+    }
+
+    ui.add_space(6.0);
+    if ui.button("Re-tokenise").clicked() { corpus.retokenise(vocab); }
+    if let Some(m) = &corpus.message {
+        ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+    }
+}
+
 // ===== VOCAB TAB =====
 
 impl NeuralCabinApp {
@@ -812,7 +1174,7 @@ impl NeuralCabinApp {
         if !allowed {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Vocab is only available for next-token-generation networks.")
+                ui.label(RichText::new("Vocab is only available for next-token-generation and GPT networks.")
                     .color(theme::TEXT_WEAK));
                 ui.add_space(4.0);
                 ui.label(RichText::new("(or for plugin networks with manages_vocab = true)")
@@ -865,7 +1227,23 @@ impl NeuralCabinApp {
             EmbeddingKind::Transformer =>
                 theme::caption(ui, "Dense embedding + sinusoidal positional encoding."),
         }
-        if emb_changed { net.sync_text_dims(); }
+        let mut dim_check: Option<DimensionCheck> = None;
+        if emb_changed {
+            let old_in = net.input_dim;
+            let old_out = net.output_dim();
+            net.sync_text_dims();
+            let new_in = net.input_dim;
+            let new_out = net.output_dim();
+            if new_in != old_in || new_out != old_out {
+                dim_check = Some(DimensionCheck {
+                    network_id: net.id,
+                    old_input_dim: old_in,
+                    old_output_dim: old_out,
+                    new_input_dim: new_in,
+                    new_output_dim: new_out,
+                });
+            }
+        }
 
         ui.add_space(8.0);
         theme::hairline(ui);
@@ -882,8 +1260,21 @@ impl NeuralCabinApp {
                 }
             }
             if let Some(m) = new_mode {
+                let old_in = net.input_dim;
+                let old_out = net.output_dim();
                 net.vocab.auto_generate(&net.corpus.text_body, m);
                 net.sync_text_dims();
+                let new_in = net.input_dim;
+                let new_out = net.output_dim();
+                if new_in != old_in || new_out != old_out {
+                    dim_check = Some(DimensionCheck {
+                        network_id: net.id,
+                        old_input_dim: old_in,
+                        old_output_dim: old_out,
+                        new_input_dim: new_in,
+                        new_output_dim: new_out,
+                    });
+                }
             }
         });
         ui.add_space(6.0);
@@ -894,9 +1285,22 @@ impl NeuralCabinApp {
             if ui.button("Add").clicked() {
                 let t = net.vocab.draft_token.trim().to_string();
                 if !t.is_empty() {
+                    let old_in = net.input_dim;
+                    let old_out = net.output_dim();
                     net.vocab.add_unique(t);
                     net.vocab.draft_token.clear();
                     net.sync_text_dims();
+                    let new_in = net.input_dim;
+                    let new_out = net.output_dim();
+                    if new_in != old_in || new_out != old_out {
+                        dim_check = Some(DimensionCheck {
+                            network_id: net.id,
+                            old_input_dim: old_in,
+                            old_output_dim: old_out,
+                            new_input_dim: new_in,
+                            new_output_dim: new_out,
+                        });
+                    }
                 }
             }
         });
@@ -909,7 +1313,20 @@ impl NeuralCabinApp {
             if let Err(e) = net.vocab.load_file(&path) {
                 net.vocab.message = Some(format!("Load failed: {e}"));
             } else {
+                let old_in = net.input_dim;
+                let old_out = net.output_dim();
                 net.sync_text_dims();
+                let new_in = net.input_dim;
+                let new_out = net.output_dim();
+                if new_in != old_in || new_out != old_out {
+                    dim_check = Some(DimensionCheck {
+                        network_id: net.id,
+                        old_input_dim: old_in,
+                        old_output_dim: old_out,
+                        new_input_dim: new_in,
+                        new_output_dim: new_out,
+                    });
+                }
             }
         }
 
@@ -950,6 +1367,15 @@ impl NeuralCabinApp {
             }
             if let Some(i) = to_remove { net.vocab.tokens.remove(i); }
         });
+
+        if let Some(check) = dim_check {
+            let net_id = check.network_id;
+            let old_in = check.old_input_dim;
+            let old_out = check.old_output_dim;
+            let new_in = check.new_input_dim;
+            let new_out = check.new_output_dim;
+            self.flag_dimension_check(net_id, old_in, old_out, new_in, new_out);
+        }
     }
 }
 
@@ -1010,6 +1436,34 @@ impl NeuralCabinApp {
             });
         }
 
+        // GPT-specific controls (stage, fine-tuning mode, layer freezing).
+        if matches!(net.kind, NetworkKind::Gpt) {
+            ui.add_space(6.0);
+            theme::section_heading(ui, "GPT Training Stage");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Mode:");
+                ui.selectable_value(&mut net.gpt_stage, GptStage::Pretraining, "Pretraining");
+                ui.selectable_value(&mut net.gpt_stage, GptStage::FineTuning, "Fine-tuning");
+            });
+
+            if net.gpt_stage == GptStage::FineTuning {
+                ui.add_space(4.0);
+                ui.checkbox(&mut net.gpt_mask_user_tokens, "Train on assistant tokens only");
+                theme::caption(ui, "Zero out gradients for user-token positions.");
+
+                if !net.gpt_frozen_layers.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label("Freeze layers:");
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, frozen) in net.gpt_frozen_layers.iter_mut().enumerate() {
+                            ui.checkbox(frozen, format!("L{}", i));
+                        }
+                    });
+                }
+            }
+            ui.add_space(4.0);
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.label("Epochs:");
             let mut e = net.epochs as i32;
@@ -1047,8 +1501,19 @@ impl NeuralCabinApp {
             theme::pulse_dot(ui, if training { 1.0 } else { 0.0 }, "");
         });
 
+        let mut should_rebuild_model = false;
         if let Some(m) = &net.build_message {
-            ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
+            let is_struct_error = m.starts_with("Layer ") || m.starts_with("Model ") || m.starts_with("Cannot start:");
+            let c = if is_struct_error { theme::DANGER } else { theme::TEXT_WEAK };
+            ui.horizontal(|ui| {
+                ui.colored_label(c, m);
+                if is_struct_error && ui.button("Reset to Template").clicked() {
+                    should_rebuild_model = true;
+                }
+            });
+        }
+        if should_rebuild_model {
+            net.build_model();
         }
 
         ui.add_space(6.0);
@@ -1158,6 +1623,12 @@ impl NeuralCabinApp {
         match &net.kind {
             NetworkKind::Simplex => simplex_inference(ui, net),
             NetworkKind::NextTokenGen => text_inference(ui, net),
+            NetworkKind::Gpt => {
+                match net.gpt_stage {
+                    GptStage::Pretraining => text_inference(ui, net),
+                    GptStage::FineTuning => gpt_chat_inference(ui, net),
+                }
+            }
             NetworkKind::Plugin { plugin_id, type_name } => {
                 if plugin_managed {
                     ui.label(RichText::new(format!(
@@ -1287,6 +1758,13 @@ fn text_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
 
+    // Show stage info for GPT networks
+    if matches!(net.kind, NetworkKind::Gpt) {
+        ui.label(RichText::new(format!("Stage: {}", net.gpt_stage.name()))
+            .color(theme::TEXT_WEAK).size(11.0));
+        ui.add_space(4.0);
+    }
+
     // ── Controls row ──────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.label("Temperature:");
@@ -1373,6 +1851,87 @@ fn text_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
         .show(ui, |ui| {
             ui.label(RichText::new(&net.generated).monospace().color(theme::TEXT));
         });
+}
+
+fn gpt_chat_inference(ui: &mut egui::Ui, net: &mut NetworkInstance) {
+    ui.label(RichText::new("Chat Interface").color(theme::TEXT_WEAK).size(11.5));
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Temperature:");
+        ui.add(egui::DragValue::new(&mut net.temperature).speed(0.01).range(0.05..=4.0));
+        ui.add_space(6.0);
+        ui.label("Max tokens:");
+        let mut m = net.max_tokens as i32;
+        if ui.add(egui::DragValue::new(&mut m).range(1..=4096)).changed() {
+            net.max_tokens = m.max(1) as usize;
+        }
+    });
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        if ui.button("Clear Chat").clicked() {
+            net.chat_messages.clear();
+            net.chat_input.clear();
+        }
+    });
+    ui.add_space(8.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("chat_scroll")
+        .max_height(300.0)
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            let mut to_remove: Option<usize> = None;
+            for (i, (role, content)) in net.chat_messages.iter().enumerate() {
+                let is_user = role == "user";
+                let label_color = if is_user { theme::ACCENT } else { theme::TEXT };
+
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        let role_label = if is_user { "👤 User" } else { "🤖 Assistant" };
+                        ui.label(RichText::new(role_label).color(label_color).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                to_remove = Some(i);
+                            }
+                            if ui.small_button("↻").clicked() && !is_user {
+                                net.chat_input = content.clone();
+                            }
+                            if ui.small_button("✎").clicked() {
+                                net.chat_input = content.clone();
+                                to_remove = Some(i);
+                            }
+                        });
+                    });
+                    ui.label(RichText::new(content).monospace());
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(i) = to_remove {
+                net.chat_messages.remove(i);
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.label("Message:");
+    egui::ScrollArea::vertical()
+        .id_salt("input_scroll")
+        .max_height(100.0)
+        .show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(&mut net.chat_input)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3))
+        });
+
+    ui.horizontal(|ui| {
+        if ui.button("Send Message").clicked() && !net.chat_input.trim().is_empty() {
+            let msg = net.chat_input.trim().to_string();
+            net.chat_messages.push(("user".to_string(), msg.clone()));
+            net.chat_input.clear();
+            // TODO: Generate assistant response
+        }
+    });
 }
 
 /// Validate inference params and build a [`GeneratorConfig`] ready to spawn.

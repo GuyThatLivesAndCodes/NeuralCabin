@@ -4,14 +4,34 @@ pub struct DocSection {
     pub id: &'static str,
     pub title: &'static str,
     pub body: &'static str,
+    pub last_updated: &'static str,
 }
 
 pub fn sections() -> &'static [DocSection] { SECTIONS }
+
+pub fn export_all_as_markdown() -> String {
+    let mut output = String::new();
+    output.push_str("# NeuralCabin Documentation\n\n");
+    output.push_str("Generated: 2026-05-10\n\n");
+    output.push_str("---\n\n");
+
+    for (idx, section) in SECTIONS.iter().enumerate() {
+        output.push_str(&format!("## {}\n\n", section.title));
+        output.push_str(&format!("**Last Updated:** {}\n\n", section.last_updated));
+        output.push_str(&format!("{}\n\n", section.body));
+        if idx < SECTIONS.len() - 1 {
+            output.push_str("---\n\n");
+        }
+    }
+
+    output
+}
 
 const SECTIONS: &[DocSection] = &[
     DocSection {
         id: "overview",
         title: "Overview",
+        last_updated: "2026-05-10",
         body: "\
 NeuralCabin is a single-binary neural-network workbench written entirely in \
 pure Rust. There are no external numerical or ML crates: tensors, autograd, \
@@ -19,7 +39,7 @@ layers, optimisers, and dataset utilities all live in this repository.
 
 The workbench is organised into seven tabs:
 
-- Docs — this guide.
+- Docs — this guide (copy, download, or export all docs).
 - Networks — list, create, and configure networks.
 - Corpus — build or load the training data.
 - Vocab — manage the token vocabulary for text networks.
@@ -30,11 +50,30 @@ The workbench is organised into seven tabs:
 The selector at the top of the window works like LM Studio's model picker: \
 switching networks instantly loads the new network's state into every tab. \
 All saved networks are loaded automatically at startup — no manual file picking \
-required.",
+required.
+
+-------
+
+What can you build?
+
+NeuralCabin is suitable for a wide range of machine learning tasks:
+
+- Binary classification (XOR, simple logic gates)
+- Multi-class classification (iris, handwritten digits, text categorisation)
+- Regression (sine waves, polynomial fitting, trend prediction)
+- Next-token text generation (language models, code completion)
+- Sequence prediction (time series, music generation)
+- Autoregressive generation (GPT-style text, story writing)
+- Custom networks via plugins (experimental layer types, novel architectures)
+
+Every network trains on CPU with full gradient computation and support for \
+multiple optimisers. The UI is responsive even during training thanks to \
+background threading.",
     },
     DocSection {
         id: "engine",
         title: "How the engine works",
+        last_updated: "2026-05-10",
         body: "\
 Every tensor is a contiguous Vec<f32> with an associated shape. Forward and \
 backward passes are recorded on an autograd tape: each op (matmul, add, ReLU, \
@@ -45,9 +84,41 @@ Optimisers consume the gradient set and update parameters in place. Training \
 runs on a background thread so the UI stays responsive; you can pause, resume, \
 adjust the learning rate, or stop training from the Training tab.
 
+-------
+
+Tensor representation and operations:
+
+Tensors are multi-dimensional arrays stored as contiguous floating-point vectors. \
+Operations include:
+
+- Reshape — change dimensions without copying data
+- Transpose — swap axes; computed on-the-fly in forward pass
+- MatMul — batched matrix multiplication with shape checking
+- Elementwise ops (Add, Mul, Sub, Div) — broadcast-compatible
+- Reductions — sum, mean, max along axes
+- Indexing — slice and gather operations
+
+All operations record themselves on the autograd tape for backpropagation.
+
+-------
+
+Automatic differentiation:
+
+The autograd system uses reverse-mode differentiation (backprop). Each operation \
+records its dependencies and gradient rules. During backward pass:
+
+1. Start with loss = 1.0
+2. Traverse the tape in reverse order
+3. Each node applies its local gradient rule and accumulates gradients to inputs
+4. Leaf gradients accumulate across the full computational graph
+
+This enables efficient training of arbitrarily deep networks.
+
+-------
+
 Available optimisers:
 
-- SGD — stochastic gradient descent with optional momentum.
+- SGD — stochastic gradient descent with optional momentum (classical, stable).
 - Adam — adaptive moment estimation; a good first choice for most tasks.
 - AdamW — Adam with decoupled weight decay (Loshchilov & Hutter, 2017). \
 Weight decay is applied directly to the parameter, not mixed into the gradient, \
@@ -56,11 +127,21 @@ whenever you want regularisation without sacrificing Adam's convergence speed.
 - LAMB — Layer-wise Adaptive Moments for Batch training (You et al., 2019). \
 Scales each layer's update by the ratio of the parameter norm to the update \
 norm, enabling stable training with very large batches. Useful for large \
-next-token-gen networks where batch sizes of 256+ are common.",
+next-token-gen networks where batch sizes of 256+ are common.
+
+-------
+
+Loss functions:
+
+- MSE (Mean Squared Error) — for regression; measures average squared difference.
+- Cross-Entropy — for classification; measures divergence between predicted \
+and true probability distributions. Softmax is applied automatically for \
+multi-class problems.",
     },
     DocSection {
         id: "networks",
         title: "Networks",
+        last_updated: "2026-05-10",
         body: "\
 A network is a named bundle of (kind, layer-stack, hyperparameters, weights). \
 Use the Networks tab to:
@@ -74,11 +155,39 @@ loaded into memory and the top-bar dropdown reflects the selection.
 Networks are saved and loaded automatically. Every saved network reappears \
 in the sidebar on the next launch — no manual loading required. Hitting \
 'Save' serialises the full network state: architecture, trained weights, \
-corpus text, vocabulary, embedding settings, and hyperparameters.",
+corpus text, vocabulary, embedding settings, and hyperparameters.
+
+-------
+
+Layer types:
+
+Linear — dense fully-connected layer with learnable weights and biases.
+  Config: input dimension, output dimension.
+  Parameters: weight matrix (out_dim × in_dim) + bias vector (out_dim).
+
+Activation — non-linearity applied element-wise.
+  Options: ReLU, Sigmoid, Tanh, Softmax (output layer), Identity (no-op).
+
+-------
+
+Network storage:
+
+Networks are stored in your platform's appdata folder. Each network is a \
+single JSON file containing:
+
+- Architecture specification (layer stack, dims, init seed)
+- Trained weights and biases (full precision)
+- Loss and optimiser configuration
+- Corpus and vocabulary (for text networks)
+- Embedding settings
+
+The JSON format is human-readable and version-aware. You can diff two \
+checkpoints to track how weights evolved, or hand-edit metadata.",
     },
     DocSection {
         id: "next-token-gen",
         title: "Next-Token Generation — full guide",
+        last_updated: "2026-05-10",
         body: "\
 Next-Token Generation (NTG) networks predict the most probable next token in \
 a sequence. This is the architecture behind GPT, text predictors, code \
@@ -226,114 +335,275 @@ Set Max tokens to control generation length.",
     DocSection {
         id: "kinds",
         title: "Network kinds",
+        last_updated: "2026-05-10",
         body: "\
-Simplex networks are dense MLPs: a stack of Linear and Activation layers \
-trained with MSE or Cross-Entropy. They are the right tool for XOR, sine \
-regression, spirals, and small CSV problems.
+Simplex — dense MLPs (multi-layer perceptrons):
+  A stack of Linear and Activation layers trained with MSE or Cross-Entropy. \
+  They are the right tool for XOR, sine regression, spirals, small CSV \
+  classification, and general supervised learning on tabular data.
 
-Next-Token-Generation networks predict the next token in a sequence. The \
-Vocab and Corpus tabs are required; input and output dimensions are locked \
-and driven automatically by vocab size and context length. See the \
-'Next-Token Generation — full guide' section for a complete walkthrough.
+  Input/output dimensions: You control both. Input matches your dataset \
+  features; output matches the number of classes (or 1 for regression).
 
-Plugin networks come from third-party plugins installed via the Plugins tab. \
-The plugin manifest decides whether the network type takes over the Vocab and \
-Inference tabs; networks without a manifest opt-in fall back to the Simplex UI.",
+  Best for: Quick experiments, tabular data, binary logic, regression.
+
+Next-Token-Generation (NTG):
+  Predicts the next token in a sequence. The Vocab and Corpus tabs are \
+  required; input and output dimensions are locked and driven automatically \
+  by vocab size and context length.
+
+  Input dimension = context_size × embedding_dimension.
+  Output dimension = vocabulary_size.
+
+  See the 'Next-Token Generation — full guide' section for a complete walkthrough.
+
+  Best for: Language models, text generation, code completion, music, \
+  any sequential / autoregressive task.
+
+Plugin networks:
+  Come from third-party plugins installed via the Plugins tab. The plugin \
+  manifest decides whether the network type takes over the Vocab and Inference \
+  tabs; networks without a manifest opt-in fall back to the Simplex UI.
+
+  Best for: Experimental architectures, domain-specific layer types, \
+  custom inference logic.",
     },
     DocSection {
         id: "corpus",
         title: "Corpus",
+        last_updated: "2026-05-10",
         body: "\
 The Corpus tab defines the data a network trains on.
 
 For Simplex / plugin networks, pick a template:
 
-- XOR — the canonical 4-row binary problem.
-- Sine — noisy 1-D regression.
-- Spirals — interleaved 2-D multi-class scatter.
-- CSV — load a comma-separated file; the last column is the label.
-- Hand-rolled — type rows directly into the text editor.
+- XOR — the canonical 4-row binary problem (2 inputs, 1 output, 4 training samples).
+- Sine — noisy 1-D regression (x → sin(x) with noise; 200 samples).
+- Spirals — interleaved 2-D multi-class scatter (two interlocking spirals; \
+  100 samples × 3 classes).
+- CSV — load a comma-separated file; the last column is the label. CSV loader \
+  handles numeric columns directly; use one-hot encoding in the vocab for \
+  categorical columns.
+- Hand-rolled — type rows directly into the text editor. Each line is a \
+  comma-separated row; last column is the label.
+
+CSV format:
+
+  feature1, feature2, ..., featureN, label
+  1.5, 2.3, ..., 0.9, 0
+  2.1, 3.4, ..., 1.2, 1
+
+The last column is always treated as the label (class or regression target). \
+Numeric columns are used as-is. If num_classes is set in Training, the label \
+is one-hot encoded.
 
 For Next-Token-Generation networks the template is always 'Text'. Paste \
 corpus text directly, or click 'Browse…' (or drag a file onto the window) \
 to append text files. Multiple files accumulate into one corpus. \
 'Re-tokenise' rebuilds the token stream from the current corpus + vocab. \
 'Build training set' (on the Vocab tab) slices the stream into context windows \
-and labels them for training.",
+and labels them for training.
+
+-------
+
+Tips for dataset preparation:
+
+- Normalisation: Simplex networks train better on inputs in [0, 1] or [-1, 1]. \
+  Divide by max or subtract mean then divide by std.
+- Balance: For classification, try to have roughly equal numbers of samples \
+  per class. If imbalanced, consider weighting loss or oversampling.
+- Size: 100–1000 samples is a good starting point. Smaller datasets overfit \
+  quickly (which can be useful for debugging); larger datasets need bigger networks.
+- Noise: Real data is noisy. Small synthetic corpora work well for testing the \
+  pipeline but are very clean — add some random noise if needed.",
     },
     DocSection {
         id: "vocab",
         title: "Vocabulary",
+        last_updated: "2026-05-10",
         body: "\
 The Vocab tab is available only for Next-Token Generation networks (or plugin \
 networks whose manifest opts in).
 
-Embedding type:
-Select how tokens are converted to numeric vectors before the MLP. The options \
-are One-Hot, TF-IDF, FastText / Word2Vec, and Transformer (positional). See \
-the 'Next-Token Generation' guide for a detailed comparison.
+A vocabulary is a mapping of tokens (integers 0..) to meanings. Token 0 is \
+reserved as <unk> (unknown); unknown tokens during encoding fall back to 0.
 
-Tokenisation:
+-------
+
+Embedding type — how tokens become vectors:
+
+Select how tokens are converted to numeric vectors before the MLP. The options:
+
+One-Hot (default):
+Each token position becomes a sparse vector of length vocab_size. Bit \
+i = 1 if the token at that position is token i, else 0. Simple and transparent. \
+Input dim = context_size × vocab_size. No learnable parameters.
+
+TF-IDF:
+Like One-Hot but each 1 is replaced by the token's inverse document frequency: \
+  weight = ln(1 + total_tokens / count_of_token)
+Rare tokens that carry more meaning get higher weights; common filler tokens \
+are downweighted. No extra parameters; input dim = context_size × vocab_size.
+
+FastText / Word2Vec style:
+Each token maps to a dense vector of embed_dim floats (configurable; default \
+32). The embedding table is seeded deterministically from the network seed, so \
+the same table is always used for both training and inference. Input dim = \
+context_size × embed_dim. Dense embeddings let the network generalise across \
+similar tokens and often train faster than one-hot on large vocabularies.
+
+Transformer (positional):
+Same as FastText but adds a sinusoidal positional encoding to each position's \
+embedding:
+  PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+  PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
+This lets the network distinguish 'cat sat' from 'sat cat' even when the \
+context window is large. Most expressive for sequence prediction.
+
+-------
+
+Tokenisation modes — building the vocab from corpus:
+
 - Wipe — reset to just the <unk> placeholder.
 - Add — manually add a single token.
 - Upload — load a newline-separated token list from a file (Browse… or drag).
 - Auto-generate — derive a vocabulary from the corpus text.
 
-Token id 0 is always <unk>; encoding falls back to <unk> for unknown tokens.",
+Auto-generate options:
+
+- Per-character — one token per unique character. Smallest vocab, great for \
+  learning spelling and structure. Works on any language or code without config.
+- Per-word — one token per whitespace-delimited word. Larger vocab but the \
+  network learns word-level patterns faster.
+- Per-subword — fragments of 1–4 characters from each word. Balances vocab \
+  size against granularity; useful when the corpus mixes rare words and common roots.
+- Per-sentence — one token per sentence. Tiny vocab, very coarse; useful for \
+  high-level outline prediction.
+- Bulk (all, deduped) — combines char, word, and sentence tokens. Largest \
+  vocab; slowest to train but most expressive.
+- Custom (manual) — add tokens one by one for specialised domains.
+
+-------
+
+Workflow:
+
+1. Create a Next-Token-Gen network.
+2. Paste or upload corpus text (Corpus tab).
+3. Come back to Vocab, click an Auto-generate button (Per-character is safest).
+4. (Optional) Tweak the embedding type (One-Hot is fine; FastText is faster).
+5. Click 'Build training set' to slice the corpus into context windows.
+6. Go to Networks, click 'Build / Reset Model'. Dims are locked and auto-set.
+7. Train away.",
     },
     DocSection {
         id: "training",
         title: "Training",
+        last_updated: "2026-05-10",
         body: "\
 The Training tab runs the active network against its corpus.
 
-Controls:
+Main controls:
+
 - Loss function: MSE (regression), Cross-Entropy (classification / NTG).
 - Optimiser: SGD, Adam, AdamW, LAMB. See 'How the engine works' for details.
-- Learning rate — can be changed live while training is running.
-- Momentum (SGD) / β₁, β₂ (Adam family).
-- Weight decay (AdamW / LAMB) — regularisation strength; 0.01 is a good default.
-- Epochs, batch size, validation fraction.
+- Learning rate (α) — can be changed live while training is running. Typical \
+  values: 0.01–0.1 for SGD, 0.001–0.01 for Adam.
+- Momentum (SGD) — 0.9 is standard; accumulates velocity.
+- β₁, β₂ (Adam family) — first and second moment decay. Defaults (0.9, 0.999) \
+  work for most tasks.
+- Weight decay (AdamW / LAMB) — regularisation strength; 0.01 is a good default \
+  to prevent overfitting.
+- Epochs — number of passes through the full training set.
+- Batch size — samples processed before a gradient update. Larger batches = \
+  fewer updates per epoch but more stable gradients.
+- Validation fraction — hold out this fraction of data for validation (0–1). \
+  If > 0, loss plot shows both train (blue) and validation (orange) losses.
+
+-------
+
+What to watch during training:
+
+Loss curve:
+- Should generally decrease over time.
+- If loss increases, learning rate is too high; turn it down.
+- If loss plateaus, try a larger network or longer training.
+- If validation loss > train loss and diverging, you're overfitting.
+
+Validation loss:
+- If you set a validation fraction > 0, this shows on the plot.
+- If validation loss stops falling while train loss keeps dropping, reduce \
+  network size or increase weight decay.
+
+Accuracy (for classification):
+- Displayed alongside loss if applicable.
+- Should rise as loss falls.
+
+-------
+
+Controls:
 
 A live loss and accuracy plot updates after each epoch. Training runs on a \
-background thread; click Pause / Resume / Stop at any time.",
+background thread; click Pause / Resume / Stop at any time. You can adjust \
+learning rate while training is paused or running (changes take effect on the \
+next step).
+
+The pulsing dot in the top bar indicates active training.",
     },
     DocSection {
         id: "inference",
         title: "Inference",
+        last_updated: "2026-05-10",
         body: "\
 The Inference tab is shaped by the active network's kind.
 
-Simplex:
-- One drag-value per input dimension. 'Real-time' re-runs the network \
-every time an input changes — no button click needed.
+Simplex (general-purpose networks):
+
+- One drag-value slider per input dimension. Adjust them to try different inputs.
+- 'Real-time' toggle: when on, re-runs the network every time an input \
+changes — no button click needed. Useful for exploring the model's behaviour.
+- 'Predict' button: manually run inference once (only when Real-time is off).
 - 'Clear Input' resets all inputs to zero; 'Clear Output' hides the last result.
+- Output is shown as-is (numeric for regression) or as probabilities (for \
+classification; argmax class is highlighted).
 - When the corpus has a 2-D input (XOR, Spirals) a scatter plot is shown with \
 the current inference point highlighted as a crosshair. The crosshair colour \
-shows the predicted class.
+shows the predicted class (useful for visualising decision boundaries).
 
-Next-Token Generation:
-- Type a prompt in the text box, then click Generate.
-- Temperature (0.05 – 4.0) controls randomness of sampling.
-- Max tokens sets the generation length.
+Next-Token Generation (text models):
+
+- Type or paste a prompt in the text box.
+- Click 'Generate' to autoregressively produce the next N tokens.
+- Temperature (0.05 – 4.0) controls randomness of sampling:
+  - 0.1–0.5: deterministic, repeats common patterns (good for code).
+  - 0.7–0.9: creative but coherent (recommended starting point).
+  - 1.0: neutral (uniform sampling from logits).
+  - 1.2–2.0: very random, often nonsensical (for exploration).
+- Max tokens sets the maximum generation length.
 - 'Clear Input' wipes the prompt; 'Clear Output' clears the generated text.
-- The current embedding type and vocab size are shown in the header.
+- The current embedding type, vocab size, and context length are shown in \
+the header for reference.
+- Generated text is appended to the prompt, so you can see the full output \
+and continue generating.
 
-Plugin:
-- If `manages_inference = true`, the plugin controls this tab.
+Plugin (custom network types):
+
+- If the plugin's manifest has `manages_inference = true`, the plugin \
+controls this entire tab with custom UI.
 - Otherwise falls back to the Simplex numeric setup.",
     },
     DocSection {
         id: "plugins",
         title: "Plugins",
+        last_updated: "2026-05-10",
         body: "\
-Plugins extend NeuralCabin with new network types.
+Plugins extend NeuralCabin with new network types and custom UI for \
+experimental architectures.
 
 Installation:
-------------
+-----------
 
-Click Browse… (or drag a file / folder) in the Plugins tab. Three source \
-types are accepted:
+Click Browse… (or drag a file / folder) in the Plugins tab. Three source types \
+are accepted:
 
 - A folder containing a manifest.json.
 - A bare .json manifest file.
@@ -355,82 +625,195 @@ Manifest format:
 }
 ```
 
-`network_types` lists the kinds your plugin contributes. If `manages_vocab` \
-is true, the Vocab tab is enabled for plugin networks; if `manages_inference` \
-is true the Inference tab is plugin-managed. Otherwise plugin networks behave \
-like Simplex.
+`network_types` — list of kinds (strings) your plugin contributes. When a \
+network of one of these kinds is active, the plugin is loaded.
+
+`manages_vocab` — if true, the Vocab tab is enabled and plugin-controlled.
+
+`manages_inference` — if true, the Inference tab is plugin-managed. Otherwise \
+plugin networks behave like Simplex (numeric drag-values).
 
 Configuration:
--------------
+--------------
 
-Each plugin has a free-form JSON settings blob you can edit in the Plugins \
-tab. The blob is available to plugin-managed UIs so they can persist user \
+Each plugin has a free-form JSON settings blob you can edit in the Plugins tab. \
+The blob is persisted and available to plugin-managed UIs so they can read user \
 preferences without baking them into the manifest.
+
+The settings are not automatically used by the core engine — plugin UIs must \
+read the config and apply it themselves.
 
 Removal:
 -------
 
 Select a plugin in the list and click the ✕ button. NeuralCabin removes the \
-registry entry; the on-disk source archive is left untouched.",
+registry entry and cleans up its settings. The on-disk source archive is left \
+untouched.
+
+-------
+
+Plugin development:
+
+Plugins are currently a specification and UI affordance. A full plugin system \
+with WASM or dynamic loading is on the roadmap. For now, use plugins to \
+document experimental network types and configurations (e.g. a diffusion \
+architecture spec, a custom layer type, or research ideas).",
     },
     DocSection {
         id: "persistence",
         title: "Saving & loading",
+        last_updated: "2026-05-10",
         body: "\
-Saving a network ('Save' button on the Networks tab) serialises the full \
-network state to a JSON file in the platform appdata folder:
+Auto-loading:
+
+All saved networks are reloaded automatically at startup. NeuralCabin scans the \
+platform appdata folder and loads every valid network file. No manual file \
+picking required.
+
+Manual saves:
+
+Click the 'Save' button on the Networks tab to checkpoint the active network. \
+This serialises the full state to a JSON file:
 
 - Architecture (layer stack, input dim, seed).
-- Trained weights.
+- Trained weights and biases (full precision).
 - Loss function and optimiser settings.
 - Corpus text body and uploaded file paths.
-- Vocabulary tokens and tokenisation mode.
-- Embedding type and embed_dim.
+- Vocabulary tokens, tokenisation mode, and embedding config.
+- Embedding type, embed_dim, and context_size.
 - Network kind (Simplex, NextTokenGen, Plugin).
 
-All saved networks are reloaded automatically at startup. The on-disk format \
-is intentionally human-readable so you can diff weight checkpoints or \
-hand-edit metadata.
+The on-disk format is intentionally human-readable so you can:
 
-Format version 1 files from older builds are loaded cleanly; the new optional \
-fields default to sensible values.",
+- Diff weight checkpoints between training runs.
+- Hand-edit metadata without retraining.
+- Inspect gradients and parameter statistics.
+- Version-control networks in git.
+
+File locations:
+
+- Linux: ~/.local/share/neuralcabin/
+- macOS: ~/Library/Application Support/neuralcabin/
+- Windows: %APPDATA%\\neuralcabin\\
+
+Version compatibility:
+
+Format version 1 files from older builds are loaded cleanly; newer optional \
+fields default to sensible values. Networks are forward-compatible within a \
+major version.",
     },
     DocSection {
         id: "shortcuts",
         title: "Tips & tricks",
+        last_updated: "2026-05-10",
         body: "\
-General:
-- For tiny binary tasks like XOR, Linear → Tanh → Linear → Sigmoid + MSE works well.
-- For classification (Spirals, CSV), end with Linear → Identity and use \
-Cross-Entropy. Softmax is applied internally; the Inference tab reports \
-probabilities and highlights the argmax class.
-- The Real-time toggle in Simplex inference re-runs the model on every input \
-change and is especially useful with the 2-D scatter preview.
+Quick wins — get your network training in seconds:
 
-Next-Token Generation:
-- Start with Per-character tokenisation, context_size = 1, one hidden layer of \
-32–64 units. Even a bigram model will overfit a short corpus quickly so you can \
-verify the pipeline end-to-end in seconds.
-- For richer output, increase context_size to 4–8 and switch to Transformer \
-embedding with embed_dim 32–64.
-- Keep the loss plot open while training. If validation loss stops falling but \
-train loss keeps dropping, you're overfitting — try a smaller network or add \
-weight decay (AdamW/LAMB).
-- Lower temperature (0.6–0.8) for more predictable, 'Wikipedia-style' output; \
-raise it (1.0–1.5) for creative or exploratory generation.
+XOR task:
+  Arch: Linear(2) → Tanh → Linear(8) → Tanh → Linear(1) → Sigmoid
+  Loss: MSE
+  Opt: Adam, lr=0.01
+  Batch: 4 (all samples)
+  Should converge to ~0.01 loss in 500 epochs.
 
-Optimisers:
-- Adam or AdamW are the best defaults for nearly everything.
-- Use AdamW instead of Adam when you want implicit regularisation without \
-manually tuning the architecture size.
-- Try LAMB when using batch sizes above 128; it keeps training stable at \
-scales where Adam diverges.
-- SGD with momentum 0.9 is still the gold standard for convex problems and \
-very shallow networks.
+Spirals task:
+  Arch: Linear(2) → ReLU → Linear(64) → ReLU → Linear(3) → Identity
+  Loss: Cross-Entropy
+  Opt: Adam, lr=0.01
+  Batch: 16
+  Validation: 0.2
+  Should reach >95% accuracy in 1000 epochs.
 
-UI:
-- The pulsing dot in the top bar shows training is active.
-- The monochrome theme is intentional — all emphasis comes from typography and \
-motion rather than colour.",
+Sine regression:
+  Arch: Linear(1) → ReLU → Linear(32) → ReLU → Linear(1) → Identity
+  Loss: MSE
+  Opt: Adam, lr=0.01
+  Batch: 16
+  Should fit quickly, showing smooth sine curve in Inference.
+
+-------
+
+Next-Token Generation tips:
+
+Start minimal:
+- Tokenisation: Per-character
+- Context: 1 (bigram model)
+- Embedding: One-Hot
+- Arch: Linear(hidden) → Tanh → Linear(vocab) → Identity
+- Hidden size: 32–64 for a 10–50 char corpus
+- Even a tiny bigram model will overfit a short corpus in seconds, verifying \
+  the pipeline end-to-end.
+
+Scale up gradually:
+- Increase context_size to 4–8 for more coherent output.
+- Switch to Transformer embedding (embed_dim 32–64) for richer patterns.
+- Add a second hidden layer if loss plateaus.
+- Use AdamW with weight_decay=0.01 to prevent overfitting on small corpora.
+
+Interpreting quality:
+- If all outputs are repetitive, model is underfitting or learning spuriously.
+- If output starts coherent then degrades, temperature is too high or \
+  context is too short.
+- If validation loss stops falling, increase weight decay or reduce network size.
+
+Generation control:
+- Temperature 0.6–0.8: Wikipedia-style, predictable, good summaries.
+- Temperature 1.0: neutral, balanced randomness.
+- Temperature 1.2–1.5: creative but often coherent on larger models.
+- Temperature > 2.0: experimental, usually nonsensical.
+
+-------
+
+Optimiser selection:
+
+Quick rule of thumb:
+
+- For most tasks (especially if in doubt): Adam with lr=0.001–0.01.
+- For large batches (>128): LAMB with lr=0.01–0.1 and weight_decay=0.01.
+- For fine-tuning: AdamW with weight_decay=0.01–0.05.
+- For convex problems or shallow nets: SGD with momentum=0.9, lr=0.01–0.1.
+
+Momentum vs. adaptive:
+
+- SGD momentum accumulates velocity; good on smooth landscapes, essential \
+  for momentum-based methods.
+- Adam adapts per-parameter learning rate; handles sparse gradients and \
+  noisy data well.
+- AdamW decouples weight decay from adaptive scaling; slightly better generalisation.
+
+-------
+
+Debugging training:
+
+Loss is NaN:
+  → Learning rate is too high. Halve it and retry. Also check for bad data.
+
+Loss oscillates wildly:
+  → Batch size too small or learning rate too aggressive. Increase batch or \
+    reduce lr.
+
+Loss plateaus early:
+  → Network too small. Add more hidden units or layers. Try a different activation.
+
+Validation loss >> train loss:
+  → Overfitting. Reduce network size, increase weight decay (AdamW/LAMB), or \
+    get more data.
+
+Training is slow:
+  → Normal on CPU. Batch size affects convergence speed; larger batches = \
+    fewer gradient steps per epoch. Try training for more epochs with a larger \
+    batch size if wall time matters.
+
+-------
+
+UI notes:
+
+- The pulsing dot (◯) in the top bar indicates active training.
+- You can pause/resume/stop training at any time. Pausing lets you inspect \
+  weights or adjust hyperparameters.
+- The monochrome colour scheme is intentional — all emphasis comes from \
+  typography, layout, and motion rather than colour.
+- Drag-values in inference are keyboard-friendly: click then use arrow keys.
+- Copy, download, and export docs via the buttons on the Docs tab.",
     },
 ];

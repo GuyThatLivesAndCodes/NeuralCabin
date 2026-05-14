@@ -11,6 +11,14 @@ use neuralcabin_engine::tensor::Tensor;
 use std::fs;
 use std::sync::Arc;
 
+#[derive(Clone, Debug)]
+pub struct GptFile {
+    pub path: String,
+    pub name: String,
+    pub byte_size: usize,
+    pub token_count: usize,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CorpusTemplate {
     Xor,
@@ -65,6 +73,10 @@ pub struct Corpus {
     pub upload_path: String,
     pub context_size: usize,
 
+    // GPT pretraining: uploaded files with metadata.
+    pub gpt_files: Vec<GptFile>,
+    pub gpt_use_file_boundaries: bool,
+
     // Resolved dataset (numeric mode) and message.
     pub dataset: Option<Arc<Dataset>>,
     pub message: Option<String>,
@@ -92,6 +104,8 @@ impl Default for Corpus {
             text_paths: Vec::new(),
             upload_path: String::new(),
             context_size: 1,
+            gpt_files: Vec::new(),
+            gpt_use_file_boundaries: false,
             dataset: None,
             message: None,
             encoded_tokens: Vec::new(),
@@ -208,6 +222,29 @@ impl Corpus {
             "Appended {} bytes from {path} · total corpus = {} chars.",
             raw.len(), self.text_body.chars().count()
         ));
+        Ok(())
+    }
+
+    pub fn add_gpt_file(&mut self, path: &str, vocab: &Vocab) -> Result<(), String> {
+        let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let byte_size = raw.len();
+
+        let tokens = vocab.encode(&raw);
+        let token_count = tokens.len();
+
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        self.gpt_files.push(GptFile {
+            path: path.to_string(),
+            name: file_name.clone(),
+            byte_size,
+            token_count,
+        });
+
         Ok(())
     }
 

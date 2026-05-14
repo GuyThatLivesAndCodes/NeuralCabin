@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "ui", "."]
+members = ["engine", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,22 +8,6 @@ edition = "2021"
 license = "MIT"
 authors = ["NeuralCabin Contributors"]
 repository = "https://github.com/guythatlivesandcodes/neuralcabin"
-
-[package]
-name = "neuralcabin"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-description = "NeuralCabin — a single-binary neural-network workbench, written from scratch in pure Rust."
-
-[[bin]]
-name = "neuralcabin"
-path = "src/main.rs"
-
-[dependencies]
-neuralcabin-engine = { path = "engine" }
-neuralcabin-ui = { path = "ui" }
 
 [profile.release]
 opt-level = 3

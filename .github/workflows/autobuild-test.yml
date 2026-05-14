@@ -8,97 +8,136 @@ on:
     branches: [master]
 
 jobs:
-  test:
-    name: ${{ matrix.os }} / Rust stable
+  # ── Engine unit tests (fast, Linux only) ────────────────────────────────
+  engine-tests:
+    name: Engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --package neuralcabin-engine --no-fail-fast
+      - run: cargo clippy --package neuralcabin-engine -- -D warnings
+
+  # ── Tauri app build (all three platforms) ───────────────────────────────
+  build-app:
+    name: Build app (${{ matrix.os }})
+    needs: engine-tests
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: neuralcabin
-            asset_name: neuralcabin-linux-x86_64
-            archive_ext: tar.gz
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: neuralcabin.exe
-            asset_name: neuralcabin-windows-x86_64
-            archive_ext: zip
           - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: neuralcabin
-            asset_name: neuralcabin-macos-aarch64
-            archive_ext: tar.gz
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install Linux desktop deps
+      # Linux needs WebKit headers to compile Tauri
+      - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxcb-cursor-dev libx11-dev libxi-dev
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
 
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
-        run: cargo build --workspace --release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Test
-        run: cargo test --workspace --no-fail-fast
-
-      - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Headless XOR demo
-        run: cargo run --release -- --xor-demo
-
-      - name: Stage release artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: Install Node dependencies
         run: |
-          mkdir -p staging/${{ matrix.asset_name }}
-          cp target/release/${{ matrix.artifact_name }} staging/${{ matrix.asset_name }}/
-          cp README.md LICENSE.md staging/${{ matrix.asset_name }}/
-          tar -czf ${{ matrix.asset_name }}.tar.gz -C staging ${{ matrix.asset_name }}
-          shasum -a 256 ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
+          npm install
+          npm --prefix frontend install
 
-      - name: Stage release artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path staging\${{ matrix.asset_name }} | Out-Null
-          Copy-Item target\release\${{ matrix.artifact_name }} staging\${{ matrix.asset_name }}\
-          Copy-Item README.md, LICENSE.md staging\${{ matrix.asset_name }}\
-          Compress-Archive -Path staging\${{ matrix.asset_name }}\* -DestinationPath ${{ matrix.asset_name }}.zip -Force
-          (Get-FileHash ${{ matrix.asset_name }}.zip -Algorithm SHA256).Hash | Out-File -Encoding ASCII ${{ matrix.asset_name }}.zip.sha256
+      - name: Generate Tauri icons
+        run: npx tauri icon assets/icon.png
 
-      - name: Upload workflow artifact
+      - name: Build frontend
+        run: npm --prefix frontend run build
+
+      # Build the Tauri binary (no installer bundle needed for CI checks)
+      - name: Build Tauri app
+        run: cargo build --package neuralcabin --release
+
+      - name: Upload binary (Linux)
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: |
-            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
-            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}.sha256
-          if-no-files-found: error
+          name: neuralcabin-linux-x86_64
+          path: target/release/neuralcabin
           retention-days: 30
 
-      - name: Attach to GitHub Release (tag pushes only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Upload binary (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
-            ${{ matrix.asset_name }}.${{ matrix.archive_ext }}.sha256
-          generate_release_notes: true
+          name: neuralcabin-macos
+          path: target/release/neuralcabin
+          retention-days: 30
+
+      - name: Upload binary (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: neuralcabin-windows-x86_64
+          path: target/release/neuralcabin.exe
+          retention-days: 30
+
+  # ── Release bundles (installers) — only on version tags ─────────────────
+  release-bundles:
+    name: Release bundle (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-app
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node dependencies
+        run: |
+          npm install
+          npm --prefix frontend install
+
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'NeuralCabin ${{ github.ref_name }}'
+          releaseBody: 'Download the installer for your platform from the assets below.'
+          releaseDraft: false
+          prerelease: false
+          iconPath: 'assets/icon.png'

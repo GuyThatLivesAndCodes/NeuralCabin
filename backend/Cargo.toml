@@ -1,0 +1,29 @@
+[package]
+name = "neuralcabin-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "NeuralCabin REST/WebSocket backend server."
+
+[[bin]]
+name = "neuralcabin"
+path = "src/main.rs"
+
+[dependencies]
+neuralcabin-engine = { path = "../engine" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+rust-embed = { version = "8", features = ["axum"] }
+mime_guess = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"
+
+[dev-dependencies]

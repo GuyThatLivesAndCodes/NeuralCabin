@@ -12,14 +12,21 @@ matmul, activations, losses, autograd and optimisers are all hand-written in pur
 
 ## Quick Start
 
+### Download & run (pre-built binary)
+1. Download the binary for your OS from the [Actions tab](../../actions) or [Releases](../../releases)
+2. Extract the archive and run `neuralcabin` (Linux/macOS) or `neuralcabin.exe` (Windows)
+3. Your browser opens automatically at `http://localhost:3001`
+
+### Build from source
 ```bash
-# Terminal 1: Start the backend
-cargo run --package neuralcabin-backend --release
+# 1. Build the React UI
+cd frontend && npm install && npm run build && cd ..
 
-# Terminal 2: Start the frontend
-cd frontend && npm install && npm run dev
+# 2. Build the Rust server (frontend is embedded inside)
+cargo build --package neuralcabin-backend --release
 
-# Open browser to http://localhost:5173
+# 3. Run — opens browser automatically
+./target/release/neuralcabin
 ```
 
 Or use the convenience script:
@@ -73,37 +80,35 @@ neuralcabin/
 
 ## Building & Running
 
-### Development (Recommended)
+### How it works
 
-```bash
-# One command to start both backend and frontend:
-./start-dev.sh           # Linux/macOS
-start-dev.bat            # Windows
+The React frontend is compiled and **embedded directly inside the Rust binary** at build time using `rust-embed`. So you get a single self-contained executable — no separate web server, no Node.js needed at runtime.
+
+```
+neuralcabin (single binary)
+  ├── Serves the React web UI at http://localhost:3001/
+  ├── REST API at /api/...
+  └── WebSocket at /ws/...
 ```
 
-### Manual Startup
+### Development Workflow
 
 ```bash
-# Terminal 1: Build and start backend
-cargo build --package neuralcabin-backend
-cargo run --package neuralcabin-backend
+# Rebuild frontend + restart server in one command:
+./start-dev.sh           # Linux/macOS
+start-dev.bat            # Windows
 
-# Terminal 2: Start frontend
-cd frontend && npm install && npm run dev
-
-# Open http://localhost:5173 in your browser
+# Or manually:
+cd frontend && npm run build && cd ..
+cargo run --package neuralcabin-backend --release
 ```
 
 ### Release Build
 
 ```bash
-# Backend binary
+cd frontend && npm ci && npm run build && cd ..
 cargo build --package neuralcabin-backend --release
-# Output: target/release/neuralcabin-backend
-
-# Frontend build
-cd frontend && npm run build
-# Output: frontend/dist/
+# Output: target/release/neuralcabin  (self-contained, no dependencies)
 ```
 
 ### Headless Testing

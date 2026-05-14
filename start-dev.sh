@@ -1,104 +1,46 @@
 #!/bin/bash
 # NeuralCabin Development Startup Script
-# Starts both the Rust backend and React frontend
+#
+# Production use:  just run the binary — the frontend is embedded inside.
+# Dev use:         this script rebuilds the frontend then launches the server.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "🧠 NeuralCabin Development Environment"
-echo "======================================"
+echo "🧠 NeuralCabin"
+echo "=============="
 echo ""
 
-# Check if required tools are installed
-if ! command -v cargo &> /dev/null; then
-  echo "❌ Rust/Cargo not found. Please install from https://rustup.rs/"
-  exit 1
-fi
-
-if ! command -v node &> /dev/null; then
-  echo "❌ Node.js not found. Please install from https://nodejs.org/"
-  exit 1
-fi
-
-if ! command -v npm &> /dev/null; then
-  echo "❌ npm not found. Please install Node.js from https://nodejs.org/"
-  exit 1
-fi
-
-echo "✅ Rust/Cargo found"
-echo "✅ Node.js/npm found"
-echo ""
-
-# Backend setup
-echo "Setting up backend..."
-if [ ! -f "target/debug/neuralcabin-backend" ]; then
-  echo "Building backend (first time, this may take a minute)..."
-  cargo build --package neuralcabin-backend
-fi
-echo "✅ Backend ready"
-echo ""
-
-# Frontend setup
-echo "Setting up frontend..."
-if [ ! -d "frontend/node_modules" ]; then
-  echo "Installing frontend dependencies..."
-  cd frontend
-  npm install
-  cd ..
-fi
-echo "✅ Frontend ready"
-echo ""
-
-# Start backend
-echo "🚀 Starting backend on http://127.0.0.1:3001..."
-cargo run --package neuralcabin-backend &
-BACKEND_PID=$!
-
-# Wait for backend to be ready
-echo "Waiting for backend to start..."
-for i in {1..30}; do
-  if curl -s http://localhost:3001/api/networks &> /dev/null; then
-    echo "✅ Backend is ready!"
-    break
-  fi
-  if [ $i -eq 30 ]; then
-    echo "❌ Backend failed to start"
-    kill $BACKEND_PID
+# Check prerequisites
+for cmd in cargo node npm; do
+  if ! command -v "$cmd" &> /dev/null; then
+    case "$cmd" in
+      cargo) url="https://rustup.rs/" ;;
+      *)     url="https://nodejs.org/" ;;
+    esac
+    echo "❌ $cmd not found. Install from $url"
     exit 1
   fi
-  sleep 1
 done
-
+echo "✅ Rust + Node.js ready"
 echo ""
 
-# Start frontend
-echo "🎨 Starting frontend on http://localhost:5173..."
-cd frontend
-npm run dev &
-FRONTEND_PID=$!
+# Install frontend deps if needed
+if [ ! -d "frontend/node_modules" ]; then
+  echo "Installing frontend dependencies..."
+  (cd frontend && npm install)
+fi
 
-echo ""
-echo "======================================"
-echo "✅ NeuralCabin is running!"
-echo "======================================"
-echo ""
-echo "📱 Frontend: http://localhost:5173"
-echo "🔌 Backend:  http://127.0.0.1:3001"
-echo ""
-echo "Press Ctrl+C to stop both services"
+# Rebuild the frontend (so the embedded assets are current)
+echo "Building frontend..."
+(cd frontend && npm run build)
+echo "✅ Frontend built"
 echo ""
 
-# Cleanup function
-cleanup() {
-  echo ""
-  echo "Stopping services..."
-  kill $BACKEND_PID $FRONTEND_PID 2>/dev/null || true
-  echo "Goodbye! 👋"
-}
-
-trap cleanup EXIT
-
-# Wait for both processes
-wait
+# Build & run the backend (which now serves the frontend too)
+echo "Starting NeuralCabin on http://localhost:3001 ..."
+echo "Press Ctrl+C to stop."
+echo ""
+exec cargo run --package neuralcabin-backend --release

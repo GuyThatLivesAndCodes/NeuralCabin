@@ -1,6 +1,8 @@
 import axios from 'axios'
 
-const API_BASE = 'http://localhost:3001'
+// In production the frontend is served by the same Rust server,
+// so relative URLs work. In dev (npm run dev) Vite proxies /api and /ws.
+const API_BASE = ''
 
 export interface Network {
   id: string
@@ -118,6 +120,7 @@ export const training = {
     api.get<TrainingStatus>(`/api/train/${trainingId}`),
 
   connect: (trainingId: string): WebSocket => {
-    return new WebSocket(`ws://localhost:3001/ws/train/${trainingId}`)
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return new WebSocket(`${proto}//${window.location.host}/ws/train/${trainingId}`)
   },
 }

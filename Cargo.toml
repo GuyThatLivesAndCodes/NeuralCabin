@@ -15,7 +15,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "NeuralCabin — a single-binary neural-network workbench, written from scratch in pure Rust."
+description = "NeuralCabin — pure Rust neural network workbench with web-based frontend."
 
 [[bin]]
 name = "neuralcabin"
@@ -23,7 +23,6 @@ path = "src/main.rs"
 
 [dependencies]
 neuralcabin-engine = { path = "engine" }
-neuralcabin-ui = { path = "ui" }
 
 [profile.release]
 opt-level = 3

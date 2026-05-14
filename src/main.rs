@@ -1,37 +1,18 @@
-//! NeuralCabin entry point.
+//! NeuralCabin — Web-based interface only.
 //!
-//! Default behaviour launches the interactive workbench. Pass `--xor-demo`
-//! for a headless training-and-inference smoke test that exercises the engine
-//! without opening a window — useful for CI environments without a display.
-
-// On Windows release builds, suppress the auxiliary console window. We still
-// re-attach to a parent console below when the user runs us with `--xor-demo`
-// or `--help`, so command-line output keeps working from `cmd` / PowerShell.
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+//! The main application is now web-based (React frontend).
+//! This binary is kept for backward compatibility and headless testing.
+//!
+//! Usage:
+//!   neuralcabin              Show help (UI moved to web frontend)
+//!   neuralcabin --xor-demo   Run XOR training demo headlessly
+//!   neuralcabin --help       Show this help
 
 use std::process::ExitCode;
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
-fn attach_parent_console() {
-    // SAFETY: AttachConsole is documented as a no-op (returning 0) when no
-    // parent console is available; the call has no other side effects. We
-    // intentionally ignore the return value.
-    unsafe extern "system" {
-        fn AttachConsole(process_id: u32) -> i32;
-    }
-    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
-    unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
-}
-
-#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
-fn attach_parent_console() {}
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let needs_console = args.iter().any(|a| {
-        matches!(a.as_str(), "--xor-demo" | "--demo" | "--help" | "-h")
-    });
-    if needs_console { attach_parent_console(); }
+
     if args.iter().any(|a| a == "--xor-demo" || a == "--demo") {
         match xor_demo() {
             Ok(()) => ExitCode::SUCCESS,
@@ -40,27 +21,35 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-    } else if args.iter().any(|a| a == "--help" || a == "-h") {
+    } else {
         println!("{}", help_text());
         ExitCode::SUCCESS
-    } else {
-        match neuralcabin_ui::run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("UI failed to start: {e}\n\
-                          Run with `--xor-demo` for a headless smoke test.");
-                ExitCode::FAILURE
-            }
-        }
     }
 }
 
 fn help_text() -> &'static str {
-    "NeuralCabin — pure-Rust neural network workbench.\n\n\
-     Usage:\n\
-     \tneuralcabin              Launch the interactive workbench (default).\n\
-     \tneuralcabin --xor-demo   Train an MLP on XOR headlessly and print results.\n\
-     \tneuralcabin --help       Show this help."
+    "🧠 NeuralCabin — Pure Rust Neural Network Workbench\n\n\
+     The interactive UI is now web-based!\n\n\
+     Quick Start:\n\
+     \n\
+     1. Start the backend server:\n\
+     \t  cargo run --package neuralcabin-backend --release\n\
+     \n\
+     2. Start the frontend (in another terminal):\n\
+     \t  cd frontend && npm install && npm run dev\n\
+     \n\
+     3. Open your browser:\n\
+     \t  http://localhost:5173\n\
+     \n\
+     Or use the convenience script:\n\
+     \t  ./start-dev.sh        (Linux/macOS)\n\
+     \t  start-dev.bat         (Windows)\n\
+     \n\
+     Alternative:\n\
+     \t  neuralcabin --xor-demo   Run XOR training headlessly\n\
+     \t  neuralcabin --help       Show this help\n\
+     \n\
+     For more info, see QUICKSTART.md and REFACTOR_README.md"
 }
 
 fn xor_demo() -> Result<(), Box<dyn std::error::Error>> {

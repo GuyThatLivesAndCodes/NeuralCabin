@@ -59,6 +59,9 @@ jobs:
           npm install
           npm --prefix frontend install
 
+      - name: Generate Tauri icons
+        run: npx tauri icon assets/icon.png
+
       - name: Build frontend
         run: npm --prefix frontend run build
 

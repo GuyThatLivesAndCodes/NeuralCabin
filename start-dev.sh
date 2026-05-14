@@ -1,8 +1,8 @@
 #!/bin/bash
-# NeuralCabin Development Startup Script
+# NeuralCabin — launch the Tauri desktop app in development mode.
 #
-# Production use:  just run the binary — the frontend is embedded inside.
-# Dev use:         this script rebuilds the frontend then launches the server.
+# This starts both the Vite dev server (hot-reload) AND the Tauri window.
+# For a production build run: npm run tauri -- build
 
 set -e
 
@@ -13,9 +13,8 @@ echo "🧠 NeuralCabin"
 echo "=============="
 echo ""
 
-# Check prerequisites
 for cmd in cargo node npm; do
-  if ! command -v "$cmd" &> /dev/null; then
+  if ! command -v "$cmd" &>/dev/null; then
     case "$cmd" in
       cargo) url="https://rustup.rs/" ;;
       *)     url="https://nodejs.org/" ;;
@@ -27,20 +26,18 @@ done
 echo "✅ Rust + Node.js ready"
 echo ""
 
-# Install frontend deps if needed
-if [ ! -d "frontend/node_modules" ]; then
-  echo "Installing frontend dependencies..."
-  (cd frontend && npm install)
+if [ ! -d "node_modules" ]; then
+  echo "Installing root deps..."
+  npm install
 fi
 
-# Rebuild the frontend (so the embedded assets are current)
-echo "Building frontend..."
-(cd frontend && npm run build)
-echo "✅ Frontend built"
-echo ""
+if [ ! -d "frontend/node_modules" ]; then
+  echo "Installing frontend deps..."
+  npm --prefix frontend install
+fi
 
-# Build & run the backend (which now serves the frontend too)
-echo "Starting NeuralCabin on http://localhost:3001 ..."
+echo "Starting NeuralCabin in dev mode (Tauri + Vite hot-reload)..."
+echo "A desktop window will open automatically."
 echo "Press Ctrl+C to stop."
 echo ""
-exec cargo run --package neuralcabin-backend --release
+exec npm run dev

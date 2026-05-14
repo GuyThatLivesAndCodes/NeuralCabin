@@ -19,8 +19,7 @@ export default function NetworksTab() {
   const loadNetworks = async () => {
     setLoading(true)
     try {
-      const response = await networks.list()
-      setNetworksList(response.data.networks)
+      setNetworksList(await networks.list())
       setError(null)
     } catch (e) {
       setError(String(e))

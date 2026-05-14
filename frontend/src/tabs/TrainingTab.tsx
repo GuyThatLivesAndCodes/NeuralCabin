@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
-import { networks, datasets, training, Network, Dataset, WsMessage } from '../api'
+import { useState, useEffect } from 'react'
+import { type UnlistenFn } from '@tauri-apps/api/event'
+import { networks, datasets, training, Network, Dataset } from '../api'
 
 export default function TrainingTab() {
   const [networksList, setNetworksList] = useState<Network[]>([])
@@ -16,7 +17,6 @@ export default function TrainingTab() {
     elapsedSecs: 0,
   })
   const [error, setError] = useState<string | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
     loadNetworks()
@@ -26,55 +26,53 @@ export default function TrainingTab() {
   useEffect(() => {
     if (!trainingId) return
 
-    const ws = training.connect(trainingId)
-    wsRef.current = ws
+    let unlistenUpdate: UnlistenFn | null = null
+    let unlistenFinished: UnlistenFn | null = null
+    let unlistenError: UnlistenFn | null = null
 
-    ws.onmessage = (event) => {
-      try {
-        const msg: WsMessage = JSON.parse(event.data)
+    const setup = async () => {
+      unlistenUpdate = await training.onUpdate((update) => {
+        if (update.training_id !== trainingId) return
+        setTrainingStatus({
+          running: true,
+          epoch: update.epoch,
+          totalEpochs: update.total_epochs,
+          lastLoss: update.loss,
+          lossHistory: update.loss_history,
+          elapsedSecs: update.elapsed_secs,
+        })
+      })
 
-        if (msg.type === 'epoch_update') {
-          setTrainingStatus({
-            running: true,
-            epoch: msg.epoch || 0,
-            totalEpochs: msg.total_epochs || 0,
-            lastLoss: msg.last_loss || 0,
-            lossHistory: msg.loss_history || [],
-            elapsedSecs: msg.elapsed_secs || 0,
-          })
-        } else if (msg.type === 'training_finished') {
-          setTrainingStatus((prev) => ({
-            ...prev,
-            running: false,
-          }))
-        } else if (msg.type === 'error') {
-          setError(msg.message || 'Unknown error')
-          setTrainingStatus((prev) => ({
-            ...prev,
-            running: false,
-          }))
-        }
-      } catch (e) {
-        console.error('Failed to parse WS message:', e)
-      }
+      unlistenFinished = await training.onFinished((result) => {
+        if (result.training_id !== trainingId) return
+        setTrainingStatus((prev) => ({
+          ...prev,
+          running: false,
+          lastLoss: result.final_loss,
+        }))
+      })
+
+      unlistenError = await training.onError((err) => {
+        if (err.training_id !== trainingId) return
+        setError(err.message)
+        setTrainingStatus((prev) => ({ ...prev, running: false }))
+      })
     }
 
-    ws.onerror = () => {
-      setError('WebSocket connection error')
-    }
+    setup()
 
     return () => {
-      ws.close()
+      unlistenUpdate?.()
+      unlistenFinished?.()
+      unlistenError?.()
     }
   }, [trainingId])
 
   const loadNetworks = async () => {
     try {
-      const response = await networks.list()
-      setNetworksList(response.data.networks)
-      if (response.data.networks.length > 0) {
-        setSelectedNetworkId(response.data.networks[0].id)
-      }
+      const list = await networks.list()
+      setNetworksList(list)
+      if (list.length > 0) setSelectedNetworkId(list[0].id)
     } catch (e) {
       setError(String(e))
     }
@@ -82,11 +80,9 @@ export default function TrainingTab() {
 
   const loadDatasets = async () => {
     try {
-      const response = await datasets.list()
-      setDatasetsList(response.data.datasets)
-      if (response.data.datasets.length > 0) {
-        setSelectedDatasetId(response.data.datasets[0].id)
-      }
+      const list = await datasets.list()
+      setDatasetsList(list)
+      if (list.length > 0) setSelectedDatasetId(list[0].id)
     } catch (e) {
       setError(String(e))
     }
@@ -114,20 +110,14 @@ export default function TrainingTab() {
         config: {
           epochs: 2000,
           batch_size: 4,
-          optimizer: {
-            kind: 'adam',
-            lr: 0.05,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-          },
+          optimizer: { kind: 'adam', lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
           loss: 'mse',
           validation_frac: 0.2,
           seed: 42,
         },
       })
 
-      setTrainingId(response.data.training_id)
+      setTrainingId(response.training_id)
       setTrainingStatus({
         running: true,
         epoch: 0,
@@ -159,7 +149,9 @@ export default function TrainingTab() {
             <div style={{ marginBottom: '16px' }}>
               <label>Select Network:</label>
               {networksList.length === 0 ? (
-                <p style={{ color: '#9b8a7f', fontStyle: 'italic' }}>No networks found. Create one in the Networks tab.</p>
+                <p style={{ color: '#9b8a7f', fontStyle: 'italic' }}>
+                  No networks found. Create one in the Networks tab.
+                </p>
               ) : (
                 <select
                   value={selectedNetworkId}
@@ -178,8 +170,12 @@ export default function TrainingTab() {
               <label>Select Dataset:</label>
               {datasetsList.length === 0 ? (
                 <div>
-                  <p style={{ color: '#9b8a7f', fontStyle: 'italic', marginBottom: '8px' }}>No datasets available. Create one:</p>
-                  <button onClick={createDatasetXor} style={{ width: '100%' }}>+ Create XOR Dataset</button>
+                  <p style={{ color: '#9b8a7f', fontStyle: 'italic', marginBottom: '8px' }}>
+                    No datasets available. Create one:
+                  </p>
+                  <button onClick={createDatasetXor} style={{ width: '100%' }}>
+                    + Create XOR Dataset
+                  </button>
                 </div>
               ) : (
                 <select
@@ -207,29 +203,27 @@ export default function TrainingTab() {
           <div className="card">
             <h3>Training Configuration</h3>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-              <div>
-                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Epochs</p>
-                <p style={{ fontSize: '18px', fontWeight: 'bold' }}>2000</p>
-              </div>
-              <div>
-                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Batch Size</p>
-                <p style={{ fontSize: '18px', fontWeight: 'bold' }}>4</p>
-              </div>
-              <div>
-                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Optimizer</p>
-                <p style={{ fontSize: '14px' }}>Adam (lr=0.05)</p>
-              </div>
-              <div>
-                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Loss Function</p>
-                <p style={{ fontSize: '14px' }}>Mean Squared Error</p>
-              </div>
+              {[
+                ['Epochs', '2000'],
+                ['Batch Size', '4'],
+                ['Optimizer', 'Adam (lr=0.05)'],
+                ['Loss Function', 'Mean Squared Error'],
+              ].map(([label, value]) => (
+                <div key={label}>
+                  <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>{label}</p>
+                  <p style={{ fontSize: label === 'Epochs' || label === 'Batch Size' ? '18px' : '14px', fontWeight: 'bold' }}>
+                    {value}
+                  </p>
+                </div>
+              ))}
             </div>
           </div>
         </div>
       ) : (
         <div>
           <div className="status success">
-            ⚡ Training in Progress: Epoch {trainingStatus.epoch} / {trainingStatus.totalEpochs}
+            ⚡ Training{trainingStatus.running ? ' in Progress' : ' Complete'}: Epoch{' '}
+            {trainingStatus.epoch} / {trainingStatus.totalEpochs}
           </div>
 
           <div className="card">
@@ -263,7 +257,7 @@ export default function TrainingTab() {
               <div
                 style={{
                   height: '100%',
-                  width: `${(trainingStatus.epoch / trainingStatus.totalEpochs) * 100}%`,
+                  width: `${(trainingStatus.epoch / (trainingStatus.totalEpochs || 1)) * 100}%`,
                   background: 'linear-gradient(90deg, #d65a2a 0%, #e07640 100%)',
                   transition: 'width 0.3s ease',
                   display: 'flex',
@@ -274,7 +268,7 @@ export default function TrainingTab() {
                   fontWeight: 'bold',
                 }}
               >
-                {((trainingStatus.epoch / trainingStatus.totalEpochs) * 100).toFixed(1)}%
+                {((trainingStatus.epoch / (trainingStatus.totalEpochs || 1)) * 100).toFixed(1)}%
               </div>
             </div>
           </div>
@@ -289,12 +283,9 @@ export default function TrainingTab() {
                 viewBox="0 0 100 100"
                 preserveAspectRatio="none"
               >
-                {/* Grid lines */}
                 <line x1="0" y1="50" x2="100" y2="50" stroke="#e0b8a0" strokeWidth="0.2" />
                 <line x1="0" y1="25" x2="100" y2="25" stroke="#e0b8a0" strokeWidth="0.2" />
                 <line x1="0" y1="75" x2="100" y2="75" stroke="#e0b8a0" strokeWidth="0.2" />
-
-                {/* Loss curve */}
                 <polyline
                   points={trainingStatus.lossHistory
                     .map((loss, i) => {
@@ -321,14 +312,8 @@ export default function TrainingTab() {
             <button
               onClick={() => {
                 setTrainingId(null)
-                setTrainingStatus({
-                  running: false,
-                  epoch: 0,
-                  totalEpochs: 0,
-                  lastLoss: 0,
-                  lossHistory: [],
-                  elapsedSecs: 0,
-                })
+                setTrainingStatus({ running: false, epoch: 0, totalEpochs: 0, lastLoss: 0, lossHistory: [], elapsedSecs: 0 })
+                setError(null)
               }}
               style={{ width: '100%', padding: '12px', fontSize: '16px', marginTop: '12px' }}
             >

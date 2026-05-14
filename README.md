@@ -1,32 +1,31 @@
 # 🧠 NeuralCabin
 
-A **pure Rust neural network workbench** with a **modern web-based UI**.
+A **pure Rust neural network workbench** built as a **proper desktop app** — no browser window, no localhost URL. NeuralCabin opens in its own native application window, just like Discord or VS Code.
 
-The workbench consists of two parts:
-
-- **Backend:** Pure Rust REST/WebSocket API server (no Python, PyTorch, TensorFlow, NumPy, etc.)
-- **Frontend:** React + TypeScript web application
-
-The neural-network engine has **zero external math dependencies**: tensors,
-matmul, activations, losses, autograd and optimisers are all hand-written in pure Rust.
+Powered by [Tauri](https://tauri.app): the Rust backend handles all ML computation and communicates with the React frontend via Tauri IPC. No Python, no PyTorch, no NumPy.
 
 ## Quick Start
 
-### Download & run (pre-built binary)
-1. Download the binary for your OS from the [Actions tab](../../actions) or [Releases](../../releases)
-2. Extract the archive and run `neuralcabin` (Linux/macOS) or `neuralcabin.exe` (Windows)
-3. Your browser opens automatically at `http://localhost:3001`
+### Download & install (pre-built)
+1. Download the installer for your OS from [Releases](../../releases)
+   - Windows: `.msi` installer
+   - macOS: `.dmg`
+   - Linux: `.AppImage` or `.deb`
+2. Install and launch — a native app window opens immediately
 
 ### Build from source
 ```bash
-# 1. Build the React UI
-cd frontend && npm install && npm run build && cd ..
+# Prerequisites: Rust (rustup.rs) and Node.js (nodejs.org)
 
-# 2. Build the Rust server (frontend is embedded inside)
-cargo build --package neuralcabin-backend --release
+# Install dependencies
+npm install
+npm --prefix frontend install
 
-# 3. Run — opens browser automatically
-./target/release/neuralcabin
+# Development mode — opens Tauri window with Vite hot-reload
+npm run dev
+
+# Production build — creates installer in src-tauri/target/release/bundle/
+npm run tauri -- build
 ```
 
 Or use the convenience script:
@@ -39,8 +38,8 @@ start-dev.bat         # Windows
 
 ```
 neuralcabin/
-├── Cargo.toml              — workspace manifest
-├── src/main.rs             — entry point (headless mode only; UI moved to web)
+├── Cargo.toml              — workspace (engine + src-tauri)
+├── package.json            — @tauri-apps/cli, dev/build scripts
 │
 ├── engine/                 — Pure Rust ML engine (zero math deps)
 │   └── src/
@@ -52,145 +51,69 @@ neuralcabin/
 │       ├── nn.rs           — Linear/Activation layers, Model
 │       └── persistence.rs  — Model checkpoints (JSON)
 │
-├── backend/                — Rust REST/WebSocket API (Axum)
-│   └── src/
-│       ├── main.rs         — Server entry point (port 3001)
-│       ├── handlers.rs     — REST endpoint handlers
-│       ├── models.rs       — Request/response types
-│       └── ws.rs           — WebSocket real-time updates
+├── src-tauri/              — Tauri desktop app shell (Rust)
+│   ├── src/
+│   │   ├── main.rs         — entry point
+│   │   ├── lib.rs          — Tauri commands + async training loop
+│   │   └── models.rs       — shared types (serde)
+│   ├── tauri.conf.json     — window config, bundle targets
+│   ├── capabilities/       — Tauri permission declarations
+│   └── icons/              — app icons for all platforms
 │
-├── frontend/               — React + TypeScript web UI
+├── frontend/               — React + TypeScript UI
 │   ├── src/
 │   │   ├── App.tsx         — Main 7-tab application
-│   │   ├── api.ts          — Axios API client
+│   │   ├── api.ts          — Tauri invoke/listen wrappers
 │   │   ├── index.css       — Styling (Times New Roman, orange theme)
 │   │   └── tabs/           — Tab components
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── index.html
 │
-├── ui/                     — DEPRECATED: Old egui desktop UI (kept for reference)
-│
-├── API_CONTRACT.md         — REST/WebSocket API specification
-├── REFACTOR_README.md      — Architecture documentation
-├── QUICKSTART.md           — Quick start guide
-├── DELIVERY_SUMMARY.md     — Project completion summary
 └── start-dev.sh/bat        — Convenience startup scripts
 ```
 
-## Building & Running
+## How It Works
 
-### How it works
-
-The React frontend is compiled and **embedded directly inside the Rust binary** at build time using `rust-embed`. So you get a single self-contained executable — no separate web server, no Node.js needed at runtime.
+NeuralCabin is a [Tauri](https://tauri.app) desktop app:
 
 ```
-neuralcabin (single binary)
-  ├── Serves the React web UI at http://localhost:3001/
-  ├── REST API at /api/...
-  └── WebSocket at /ws/...
+NeuralCabin (native desktop window — no browser needed)
+  ├── Rust backend (src-tauri/)
+  │     ├── Tauri commands  ←  invoke('create_network', {...})
+  │     ├── Tauri events    →  emit('training_update', {...})
+  │     └── ML engine       — pure Rust, zero external deps
+  └── React frontend (frontend/)
+        ├── Calls backend via @tauri-apps/api  invoke()
+        └── Receives real-time updates via  listen()
 ```
 
-### Development Workflow
-
-```bash
-# Rebuild frontend + restart server in one command:
-./start-dev.sh           # Linux/macOS
-start-dev.bat            # Windows
-
-# Or manually:
-cd frontend && npm run build && cd ..
-cargo run --package neuralcabin-backend --release
-```
-
-### Release Build
-
-```bash
-cd frontend && npm ci && npm run build && cd ..
-cargo build --package neuralcabin-backend --release
-# Output: target/release/neuralcabin  (self-contained, no dependencies)
-```
-
-### Headless Testing
-
-```bash
-# Run XOR training demo (no UI)
-cargo run --release -- --xor-demo
-
-# Show help
-cargo run -- --help
-```
+No HTTP server, no WebSocket, no localhost URL. The React frontend talks directly to Rust through Tauri's native IPC bridge.
 
 ## Features
 
-### ✨ Web-Based UI (React + TypeScript)
+### 🖥 Native Desktop App
+- **Real application window** — not a browser tab, no localhost URL
+- **Lightweight** — uses the OS built-in WebView (~10 MB vs ~150 MB for Electron)
+- **Cross-platform** — Windows, macOS, Linux installers from CI
 
+### 🎨 React + TypeScript UI
 - **7 Tabs:** Docs, Networks, Corpus, Vocab, Training, Inference, Plugins
-- **Orange Theme:** Warm, inviting design with Times New Roman typography
-- **Real-time Training:** Live loss plotting via WebSocket
-- **Responsive:** Works on desktop, tablet, and mobile
-- **Modern Stack:** React, TypeScript, Vite, Axios
+- **Orange Theme:** Warm design with Times New Roman typography
+- **Real-time Training:** Live loss curve updated every epoch via Tauri events
 
-### 🚀 REST/WebSocket API
-
-- **REST Endpoints:** Create/list/delete networks and datasets, start training
-- **WebSocket:** Real-time training metrics (loss, epoch, time, etc.)
-- **Type-Safe:** Serde serialization, TypeScript types on frontend
-
-### 🧠 Pure Rust Engine
-
-- **Zero Math Dependencies:** Tensors, matmul, autograd, optimizers all hand-written
-- **Fast:** Optimized Rust with no Python overhead
-- **Flexible:** Supports multiple optimizers (SGD, Adam) and loss functions
-
-## Documentation
-
-- **[QUICKSTART.md](QUICKSTART.md)** — Get running in 5 minutes
-- **[API_CONTRACT.md](API_CONTRACT.md)** — Complete API specification
-- **[REFACTOR_README.md](REFACTOR_README.md)** — Architecture deep dive
-- **[DELIVERY_SUMMARY.md](DELIVERY_SUMMARY.md)** — Project overview
+### 🧠 Pure Rust ML Engine
+- **Zero external math dependencies** — tensors, matmul, autograd, optimizers hand-written
+- **Optimizers:** Adam, SGD with momentum
+- **Loss functions:** MSE, CrossEntropy
 
 ## Tests
 
 ```bash
-cargo test --workspace
+cargo test --package neuralcabin-engine
 ```
 
-The engine ships with 13 tests including:
-
-- analytic-vs-numerical gradient check on `MatMul + MSE`,
-- standalone `Sigmoid` backward correctness,
-- SGD and Adam convergence on a quadratic,
-- CSV parser (with and without one-hot encoding),
-- model save/load round-trip,
-- end-to-end MLP convergence on XOR.
-
-`cargo clippy --workspace --all-targets -- -D warnings` is also clean.
-
-## Using NeuralCabin
-
-### Networks Tab
-Create and manage neural network architectures. Specify layer counts, types, and initialization seeds.
-
-### Training Tab
-Configure and run training sessions:
-- Select a network and dataset
-- Choose optimizer (Adam, SGD) and loss function (MSE, CrossEntropy)
-- Monitor real-time loss plot as the network trains
-- Training metrics update every epoch via WebSocket
-
-### Documentation Tab
-In-app guide with:
-- Step-by-step getting started instructions
-- Feature overview for each tab
-- Technology stack information
-- Current features and roadmap
-
-### Coming Soon
-- Corpus/dataset management
-- Vocabulary editor
-- Inference/generation features
-- Plugin system
+The engine ships with 13 tests including gradient checks, optimizer convergence, CSV parsing, model save/load, and end-to-end XOR MLP convergence.
 
 ## Engine quick reference
 

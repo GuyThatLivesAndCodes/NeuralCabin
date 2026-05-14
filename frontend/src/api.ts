@@ -1,8 +1,5 @@
-import axios from 'axios'
-
-// In production the frontend is served by the same Rust server,
-// so relative URLs work. In dev (npm run dev) Vite proxies /api and /ws.
-const API_BASE = ''
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export interface Network {
   id: string
@@ -61,66 +58,63 @@ export interface TrainingStatus {
   epoch: number
   total_epochs: number
   last_loss: number
-  last_val_loss?: number
-  last_accuracy?: number
   loss_history: number[]
-  val_loss_history: number[]
-  accuracy_history: number[]
   elapsed_secs: number
 }
 
-export interface WsMessage {
-  type: 'epoch_update' | 'training_finished' | 'error'
-  epoch?: number
-  total_epochs?: number
-  last_loss?: number
-  last_val_loss?: number
-  last_accuracy?: number
-  loss_history?: number[]
-  val_loss_history?: number[]
-  accuracy_history?: number[]
-  elapsed_secs?: number
-  status?: string
-  final_loss?: number
-  message?: string
+export interface TrainingUpdate {
+  training_id: string
+  epoch: number
+  total_epochs: number
+  loss: number
+  loss_history: number[]
+  elapsed_secs: number
 }
 
-const api = axios.create({ baseURL: API_BASE })
+export interface TrainingFinished {
+  training_id: string
+  status: string
+  final_loss: number
+  total_epochs: number
+  elapsed_secs: number
+}
 
-// Networks
+export interface TrainingError {
+  training_id: string
+  message: string
+}
+
 export const networks = {
-  create: (data: {
-    name: string
-    kind: string
-    seed: number
-    layers: Layer[]
-  }) => api.post<Network>('/api/networks', data),
+  create: (req: { name: string; kind: string; seed: number; layers: Layer[] }) =>
+    invoke<Network>('create_network', { req }),
 
-  list: () => api.get<{ networks: Network[] }>('/api/networks'),
+  list: () => invoke<Network[]>('list_networks'),
 
-  get: (id: string) => api.get<Network>(`/api/networks/${id}`),
+  get: (id: string) => invoke<Network>('get_network', { id }),
 
-  delete: (id: string) => api.delete(`/api/networks/${id}`),
+  delete: (id: string) => invoke<boolean>('delete_network', { id }),
 }
 
-// Datasets
 export const datasets = {
-  create: (data: { name: string; kind: string; seed: number }) =>
-    api.post<Dataset>('/api/datasets', data),
+  create: (req: { name: string; kind: string; seed: number }) =>
+    invoke<Dataset>('create_dataset', { req }),
 
-  list: () => api.get<{ datasets: Dataset[] }>('/api/datasets'),
+  list: () => invoke<Dataset[]>('list_datasets'),
 }
 
-// Training
 export const training = {
-  start: (data: TrainingRequest) =>
-    api.post<{ training_id: string; status: string }>('/api/train', data),
+  start: (req: TrainingRequest) =>
+    invoke<{ training_id: string; status: string }>('start_training', { req }),
 
   status: (trainingId: string) =>
-    api.get<TrainingStatus>(`/api/train/${trainingId}`),
+    invoke<TrainingStatus>('get_training_status', { training_id: trainingId }),
 
-  connect: (trainingId: string): WebSocket => {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    return new WebSocket(`${proto}//${window.location.host}/ws/train/${trainingId}`)
-  },
+  onUpdate: (handler: (u: TrainingUpdate) => void): Promise<UnlistenFn> =>
+    listen<TrainingUpdate>('training_update', (e) => handler(e.payload)),
+
+  onFinished: (handler: (r: TrainingFinished) => void): Promise<UnlistenFn> =>
+    listen<TrainingFinished>('training_finished', (e) => handler(e.payload)),
+
+  onError: (handler: (err: TrainingError) => void): Promise<UnlistenFn> =>
+    listen<TrainingError>('training_error', (e) => handler(e.payload)),
 }

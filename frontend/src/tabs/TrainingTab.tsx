@@ -144,19 +144,22 @@ export default function TrainingTab() {
 
   return (
     <div className="tab-content">
-      <h2>Training</h2>
+      <h2>⚡ Training</h2>
 
       {error && <div className="status error">{error}</div>}
 
       {!trainingId ? (
         <div>
           <div className="card">
-            <h3>Setup Training</h3>
+            <h3>Configure Training Session</h3>
+            <p style={{ color: '#7d6b5f', marginBottom: '16px' }}>
+              Select a network and dataset, then start training to monitor real-time loss.
+            </p>
 
-            <div style={{ marginBottom: '12px' }}>
-              <label>Network:</label>
+            <div style={{ marginBottom: '16px' }}>
+              <label>Select Network:</label>
               {networksList.length === 0 ? (
-                <p style={{ color: '#a0a0a0' }}>No networks found. Create one in the Networks tab.</p>
+                <p style={{ color: '#9b8a7f', fontStyle: 'italic' }}>No networks found. Create one in the Networks tab.</p>
               ) : (
                 <select
                   value={selectedNetworkId}
@@ -164,17 +167,20 @@ export default function TrainingTab() {
                 >
                   {networksList.map((net) => (
                     <option key={net.id} value={net.id}>
-                      {net.name}
+                      {net.name} ({net.kind})
                     </option>
                   ))}
                 </select>
               )}
             </div>
 
-            <div style={{ marginBottom: '12px' }}>
-              <label>Dataset:</label>
+            <div style={{ marginBottom: '20px' }}>
+              <label>Select Dataset:</label>
               {datasetsList.length === 0 ? (
-                <button onClick={createDatasetXor}>Create XOR Dataset</button>
+                <div>
+                  <p style={{ color: '#9b8a7f', fontStyle: 'italic', marginBottom: '8px' }}>No datasets available. Create one:</p>
+                  <button onClick={createDatasetXor} style={{ width: '100%' }}>+ Create XOR Dataset</button>
+                </div>
               ) : (
                 <select
                   value={selectedDatasetId}
@@ -182,73 +188,132 @@ export default function TrainingTab() {
                 >
                   {datasetsList.map((ds) => (
                     <option key={ds.id} value={ds.id}>
-                      {ds.name}
+                      {ds.name} ({ds.samples} samples)
                     </option>
                   ))}
                 </select>
               )}
             </div>
 
-            <button onClick={startTraining} disabled={!selectedNetworkId || !selectedDatasetId}>
-              Start Training
+            <button
+              onClick={startTraining}
+              disabled={!selectedNetworkId || !selectedDatasetId}
+              style={{ width: '100%', padding: '12px', fontSize: '16px' }}
+            >
+              🚀 Start Training
             </button>
+          </div>
+
+          <div className="card">
+            <h3>Training Configuration</h3>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <div>
+                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Epochs</p>
+                <p style={{ fontSize: '18px', fontWeight: 'bold' }}>2000</p>
+              </div>
+              <div>
+                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Batch Size</p>
+                <p style={{ fontSize: '18px', fontWeight: 'bold' }}>4</p>
+              </div>
+              <div>
+                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Optimizer</p>
+                <p style={{ fontSize: '14px' }}>Adam (lr=0.05)</p>
+              </div>
+              <div>
+                <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>Loss Function</p>
+                <p style={{ fontSize: '14px' }}>Mean Squared Error</p>
+              </div>
+            </div>
           </div>
         </div>
       ) : (
         <div>
           <div className="status success">
-            Training: Epoch {trainingStatus.epoch} / {trainingStatus.totalEpochs}
+            ⚡ Training in Progress: Epoch {trainingStatus.epoch} / {trainingStatus.totalEpochs}
           </div>
 
           <div className="card">
-            <h3>Training Progress</h3>
-            <p>Loss: <strong>{trainingStatus.lastLoss.toFixed(6)}</strong></p>
-            <p>Elapsed: {trainingStatus.elapsedSecs.toFixed(2)}s</p>
+            <h3>Training Metrics</h3>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px' }}>
+              <div>
+                <p style={{ color: '#9b8a7f', marginBottom: '4px' }}>Current Loss</p>
+                <p style={{ fontSize: '28px', color: '#d65a2a', fontWeight: 'bold' }}>
+                  {trainingStatus.lastLoss.toFixed(6)}
+                </p>
+              </div>
+              <div>
+                <p style={{ color: '#9b8a7f', marginBottom: '4px' }}>Elapsed Time</p>
+                <p style={{ fontSize: '28px', color: '#d65a2a', fontWeight: 'bold' }}>
+                  {trainingStatus.elapsedSecs.toFixed(1)}s
+                </p>
+              </div>
+            </div>
+
+            <p style={{ color: '#9b8a7f', marginBottom: '8px', fontSize: '14px' }}>Progress</p>
             <div
               style={{
                 width: '100%',
-                height: '24px',
-                background: '#1a1a1a',
-                borderRadius: '4px',
+                height: '32px',
+                background: '#f0e6dc',
+                borderRadius: '8px',
                 overflow: 'hidden',
-                marginTop: '8px',
+                border: '2px solid #e0b8a0',
               }}
             >
               <div
                 style={{
                   height: '100%',
                   width: `${(trainingStatus.epoch / trainingStatus.totalEpochs) * 100}%`,
-                  background: '#0066cc',
-                  transition: 'width 0.2s',
+                  background: 'linear-gradient(90deg, #d65a2a 0%, #e07640 100%)',
+                  transition: 'width 0.3s ease',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'white',
+                  fontSize: '12px',
+                  fontWeight: 'bold',
                 }}
-              />
+              >
+                {((trainingStatus.epoch / trainingStatus.totalEpochs) * 100).toFixed(1)}%
+              </div>
             </div>
           </div>
 
           <div className="plot">
-            <h3>Loss History</h3>
+            <h3>Loss Over Time</h3>
             {trainingStatus.lossHistory.length > 0 ? (
               <svg
                 width="100%"
-                height="200"
-                style={{ background: '#1a1a1a', marginTop: '8px', borderRadius: '4px' }}
+                height="250"
+                style={{ background: '#f9f5f0', marginTop: '12px', borderRadius: '6px', border: '1px solid #e0b8a0' }}
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
               >
+                {/* Grid lines */}
+                <line x1="0" y1="50" x2="100" y2="50" stroke="#e0b8a0" strokeWidth="0.2" />
+                <line x1="0" y1="25" x2="100" y2="25" stroke="#e0b8a0" strokeWidth="0.2" />
+                <line x1="0" y1="75" x2="100" y2="75" stroke="#e0b8a0" strokeWidth="0.2" />
+
+                {/* Loss curve */}
                 <polyline
                   points={trainingStatus.lossHistory
                     .map((loss, i) => {
-                      const x = (i / trainingStatus.lossHistory.length) * 100 + '%'
+                      const x = (i / (trainingStatus.lossHistory.length - 1 || 1)) * 100
                       const maxLoss = Math.max(...trainingStatus.lossHistory)
-                      const y = (1 - loss / maxLoss) * 180 + 10
+                      const y = (1 - loss / (maxLoss || 1)) * 90 + 5
                       return `${x} ${y}`
                     })
                     .join(' ')}
                   fill="none"
-                  stroke="#0066cc"
-                  strokeWidth="2"
+                  stroke="#d65a2a"
+                  strokeWidth="0.8"
+                  vectorEffect="non-scaling-stroke"
                 />
               </svg>
             ) : (
-              <p style={{ color: '#a0a0a0' }}>Waiting for training data...</p>
+              <p style={{ color: '#9b8a7f', fontStyle: 'italic', marginTop: '20px', textAlign: 'center' }}>
+                Waiting for training data...
+              </p>
             )}
           </div>
 
@@ -265,8 +330,9 @@ export default function TrainingTab() {
                   elapsedSecs: 0,
                 })
               }}
+              style={{ width: '100%', padding: '12px', fontSize: '16px', marginTop: '12px' }}
             >
-              Start New Training
+              🚀 Start New Training
             </button>
           )}
         </div>

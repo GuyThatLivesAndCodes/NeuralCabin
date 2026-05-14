@@ -68,67 +68,92 @@ export default function NetworksTab() {
 
   return (
     <div className="tab-content">
-      <h2>Networks</h2>
+      <h2>🧠 Neural Networks</h2>
+      <p style={{ color: '#7d6b5f', marginBottom: '20px' }}>
+        Create and manage neural network architectures. Each network can be trained with different datasets.
+      </p>
 
       {error && <div className="status error">{error}</div>}
 
-      <button onClick={() => setShowForm(!showForm)} style={{ marginBottom: '16px' }}>
-        {showForm ? 'Cancel' : 'Create Network'}
+      <button
+        onClick={() => setShowForm(!showForm)}
+        style={{ marginBottom: '20px', width: '100%', padding: '12px', fontSize: '16px' }}
+      >
+        {showForm ? '✕ Cancel' : '+ Create New Network'}
       </button>
 
       {showForm && (
         <div className="card">
           <h3>Create New Network</h3>
-          <div style={{ display: 'grid', gap: '8px' }}>
+          <p style={{ color: '#7d6b5f', marginBottom: '16px' }}>
+            Configure the architecture of your neural network.
+          </p>
+          <div style={{ display: 'grid', gap: '16px' }}>
             <div>
-              <label>Name:</label>
+              <label>Network Name:</label>
               <input
                 type="text"
+                placeholder="e.g., my-xor-network"
                 value={formData.name}
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               />
             </div>
             <div>
-              <label>Kind:</label>
+              <label>Network Type:</label>
               <select
                 value={formData.kind}
                 onChange={(e) => setFormData({ ...formData, kind: e.target.value })}
               >
-                <option>simplex</option>
-                <option>gpt</option>
-                <option>next_token_gen</option>
+                <option value="simplex">Simplex (Feed-forward)</option>
+                <option value="gpt">GPT-style</option>
+                <option value="next_token_gen">Next Token Generator</option>
               </select>
             </div>
             <div>
-              <label>Seed:</label>
+              <label>Random Seed:</label>
               <input
                 type="number"
                 value={formData.seed}
                 onChange={(e) => setFormData({ ...formData, seed: parseInt(e.target.value) })}
               />
+              <p style={{ fontSize: '12px', color: '#9b8a7f', marginTop: '4px' }}>
+                For reproducibility of weight initialization
+              </p>
             </div>
-            <button onClick={createNetwork} disabled={loading}>
-              {loading ? 'Creating...' : 'Create'}
+            <button onClick={createNetwork} disabled={loading} style={{ width: '100%', padding: '12px' }}>
+              {loading ? '⏳ Creating...' : '✓ Create Network'}
             </button>
           </div>
         </div>
       )}
 
-      <h3>Existing Networks ({networksList.length})</h3>
+      <h3>
+        {networksList.length === 0 ? 'No Networks Yet' : `Your Networks (${networksList.length})`}
+      </h3>
       {networksList.length === 0 ? (
-        <p style={{ color: '#a0a0a0' }}>No networks yet. Create one to get started!</p>
+        <div className="card">
+          <p style={{ color: '#9b8a7f', textAlign: 'center', padding: '20px 0' }}>
+            No networks created yet. Click the button above to create your first network!
+          </p>
+        </div>
       ) : (
-        networksList.map((network) => (
-          <div key={network.id} className="list-item">
-            <div>
-              <strong>{network.name}</strong>
-              <p style={{ fontSize: '12px', color: '#808080', margin: '4px 0 0 0' }}>
-                {network.kind} • {network.layers.length} layers • Seed: {network.seed}
-              </p>
+        <div>
+          {networksList.map((network) => (
+            <div key={network.id} className="list-item">
+              <div style={{ flex: 1 }}>
+                <strong>🧠 {network.name}</strong>
+                <p style={{ fontSize: '13px', color: '#9b8a7f', margin: '6px 0 0 0' }}>
+                  <span style={{ color: '#d65a2a', fontWeight: '600' }}>Type:</span> {network.kind} •
+                  <span style={{ color: '#d65a2a', fontWeight: '600' }}> Layers:</span> {network.layers.length} •
+                  <span style={{ color: '#d65a2a', fontWeight: '600' }}> Seed:</span> {network.seed}
+                </p>
+              </div>
+              <button onClick={() => deleteNetwork(network.id)} style={{ fontSize: '13px' }}>
+                🗑 Delete
+              </button>
             </div>
-            <button onClick={() => deleteNetwork(network.id)}>Delete</button>
-          </div>
-        ))
+          ))}
+        </div>
       )}
     </div>
   )

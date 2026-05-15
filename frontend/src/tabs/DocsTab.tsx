@@ -1,13 +1,6 @@
-import { useEffect, useState } from 'react'
-import { networks, Network } from '../api'
+import { Network } from '../api'
 
-export default function DocsTab() {
-  const [list, setList] = useState<Network[]>([])
-
-  useEffect(() => {
-    networks.list().then(setList).catch(() => setList([]))
-  }, [])
-
+export default function DocsTab({ networks: list }: { networks: Network[] }) {
   const ff = list.filter(n => n.kind === 'feedforward')
   const nt = list.filter(n => n.kind === 'next_token')
   const trained = list.filter(n => n.trained).length

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { networks, Activation, Layer, Network, NetworkKind } from '../api'
+import type { TabProps } from '../App'
 
 const ACTIVATIONS: Activation[] = ['identity', 'relu', 'sigmoid', 'tanh', 'softmax']
 
@@ -103,7 +104,7 @@ function buildLayers(form: FormState): { layers: Layer[]; inputDim: number; outp
   return { layers, inputDim, outputDim: vocab }
 }
 
-export default function NetworksTab() {
+export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { onSelect: (id: string) => void }) {
   const [list, setList] = useState<Network[]>([])
   const [error, setError] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
@@ -123,7 +124,7 @@ export default function NetworksTab() {
     if (preview.error) { setError(preview.error); return }
     setBusy(true); setError(null)
     try {
-      await networks.create({
+      const created = await networks.create({
         name: form.name.trim() || 'untitled',
         kind: form.kind,
         seed: form.seed,
@@ -134,6 +135,8 @@ export default function NetworksTab() {
       setShowForm(false)
       setForm(defaultForm(form.kind))
       await load()
+      await refreshNetworks()
+      onSelect(created.id)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -142,7 +145,7 @@ export default function NetworksTab() {
   }
 
   const onDelete = async (id: string) => {
-    try { await networks.delete(id); await load() }
+    try { await networks.delete(id); await load(); await refreshNetworks() }
     catch (e) { setError(String(e)) }
   }
 

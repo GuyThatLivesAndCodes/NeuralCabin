@@ -1,21 +1,10 @@
-import { useEffect, useState } from 'react'
-import { networks, inference, Network, GenerationStep } from '../api'
+import { useEffect, useRef, useState } from 'react'
+import { type UnlistenFn } from '@tauri-apps/api/event'
+import { inference, Network, InferenceToken } from '../api'
+import type { TabProps } from '../App'
 
-export default function InferenceTab() {
-  const [list, setList] = useState<Network[]>([])
-  const [selectedId, setSelectedId] = useState<string>('')
+export default function InferenceTab({ network }: TabProps) {
   const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => { void load() }, [])
-  const load = async () => {
-    try {
-      const items = await networks.list()
-      setList(items)
-      if (!selectedId && items.length) setSelectedId(items[0].id)
-    } catch (e) { setError(String(e)) }
-  }
-
-  const selected = list.find(n => n.id === selectedId) ?? null
 
   return (
     <div className="tab-content">
@@ -24,30 +13,18 @@ export default function InferenceTab() {
 
       {error && <div className="status error">{error}</div>}
 
-      <div className="card">
-        <label>Network</label>
-        <select value={selectedId} onChange={e => setSelectedId(e.target.value)}>
-          <option value="">— Select a network —</option>
-          {list.map(n => (
-            <option key={n.id} value={n.id}>
-              {n.name} · {n.kind === 'next_token' ? 'next-token' : 'feed-forward'}
-              {n.trained ? ' · trained' : ' · UNTRAINED'}
-            </option>
-          ))}
-        </select>
-        {selected && !selected.trained && (
-          <div className="status mt-1">
-            This network hasn’t been trained yet — predictions will be random.
-          </div>
-        )}
-      </div>
+      {network && !network.trained && (
+        <div className="status mt-1">
+          This network hasn’t been trained yet — predictions will be random.
+        </div>
+      )}
 
-      {!selected ? (
+      {!network ? (
         <div className="card"><p className="muted">Select a network to run inference.</p></div>
-      ) : selected.kind === 'feedforward' ? (
-        <FeedforwardInference network={selected} onError={setError} />
+      ) : network.kind === 'feedforward' ? (
+        <FeedforwardInference network={network} onError={setError} />
       ) : (
-        <NextTokenInference network={selected} onError={setError} />
+        <NextTokenInference network={network} onError={setError} />
       )}
     </div>
   )
@@ -120,7 +97,7 @@ function FeedforwardInference({ network, onError }: {
   )
 }
 
-// ─── Next-token inference ───────────────────────────────────────────────────
+// ─── Next-token inference (streaming) ───────────────────────────────────────
 
 function NextTokenInference({ network, onError }: {
   network: Network; onError: (e: string | null) => void
@@ -128,14 +105,39 @@ function NextTokenInference({ network, onError }: {
   const [prompt, setPrompt] = useState<string>('')
   const [maxNewTokens, setMaxNewTokens] = useState(64)
   const [temperature, setTemperature] = useState(0.0)
-  const [generated, setGenerated] = useState<string | null>(null)
-  const [steps, setSteps] = useState<GenerationStep[]>([])
+  const [generated, setGenerated] = useState<string>('')
+  const [tokens, setTokens] = useState<InferenceToken[]>([])
   const [busy, setBusy] = useState(false)
+  const [inferenceId, setInferenceId] = useState<string | null>(null)
+  const cleanupRef = useRef<UnlistenFn[]>([])
 
-  useEffect(() => { setGenerated(null); setSteps([]) }, [network.id])
+  useEffect(() => { setGenerated(''); setTokens([]); setInferenceId(null) }, [network.id])
+
+  useEffect(() => {
+    if (!inferenceId) return
+    let cancelled = false
+    const setup = async () => {
+      const u1 = await inference.onToken(t => {
+        if (cancelled || t.inference_id !== inferenceId) return
+        setTokens(prev => [...prev, t])
+        setGenerated(prev => prev + t.token)
+      })
+      const u2 = await inference.onFinished(r => {
+        if (cancelled || r.inference_id !== inferenceId) return
+        setBusy(false)
+      })
+      const u3 = await inference.onError(err => {
+        if (cancelled || err.inference_id !== inferenceId) return
+        onError(err.message); setBusy(false)
+      })
+      cleanupRef.current = [u1, u2, u3]
+    }
+    void setup()
+    return () => { cancelled = true; cleanupRef.current.forEach(c => c()) }
+  }, [inferenceId])
 
   const run = async () => {
-    onError(null); setBusy(true)
+    onError(null); setBusy(true); setGenerated(''); setTokens([])
     try {
       const r = await inference.run({
         network_id: network.id,
@@ -143,10 +145,8 @@ function NextTokenInference({ network, onError }: {
         max_new_tokens: maxNewTokens,
         temperature,
       })
-      setGenerated(r.generated ?? '')
-      setSteps(r.steps ?? [])
-    } catch (e) { onError(String(e)) }
-    finally { setBusy(false) }
+      setInferenceId(r.inference_id ?? null)
+    } catch (e) { onError(String(e)); setBusy(false) }
   }
 
   return (
@@ -177,7 +177,7 @@ function NextTokenInference({ network, onError }: {
         </div>
       </div>
 
-      {generated !== null && (
+      {generated && (
         <div className="card">
           <h3>Output</h3>
           <div style={{
@@ -191,14 +191,14 @@ function NextTokenInference({ network, onError }: {
         </div>
       )}
 
-      {steps.length > 0 && (
+      {tokens.length > 0 && (
         <div className="card">
           <h3>Per-token probabilities</h3>
           <div style={{ maxHeight: 260, overflow: 'auto' }}>
             <table>
               <thead><tr><th style={{ width: 40 }}>#</th><th>Token</th><th style={{ width: 120 }}>Probability</th></tr></thead>
               <tbody>
-                {steps.map((s, i) => (
+                {tokens.map((s, i) => (
                   <tr key={i}>
                     <td><code>{i + 1}</code></td>
                     <td><code>{visualize(s.token)}</code></td>

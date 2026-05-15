@@ -1,36 +1,24 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  corpus, networks, Network, FineTunePair, FeedforwardCorpus,
-  CorpusStats, GptStage,
+  corpus, FineTunePair, FeedforwardCorpus,
+  CorpusStats, Stage, Network,
 } from '../api'
+import type { TabProps } from '../App'
 
-export default function CorpusTab() {
-  const [list, setList] = useState<Network[]>([])
-  const [selectedId, setSelectedId] = useState<string>('')
+export default function CorpusTab({ network }: TabProps) {
   const [stats, setStats] = useState<CorpusStats | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
 
-  useEffect(() => { void loadNetworks() }, [])
   useEffect(() => {
-    if (selectedId) void loadStats(selectedId)
+    if (network) void loadStats(network.id)
     else setStats(null)
-  }, [selectedId])
-
-  const loadNetworks = async () => {
-    try {
-      const items = await networks.list()
-      setList(items)
-      if (!selectedId && items.length) setSelectedId(items[0].id)
-    } catch (e) { setError(String(e)) }
-  }
+  }, [network])
 
   const loadStats = async (id: string) => {
     try { setStats(await corpus.stats(id)) }
     catch (e) { setStats(null); setError(String(e)) }
   }
-
-  const selected = useMemo(() => list.find(n => n.id === selectedId) ?? null, [list, selectedId])
 
   return (
     <div className="tab-content">
@@ -43,34 +31,22 @@ export default function CorpusTab() {
       {error && <div className="status error">{error}</div>}
       {info  && <div className="status success">{info}</div>}
 
-      <div className="card">
-        <label>Network</label>
-        <select value={selectedId} onChange={e => setSelectedId(e.target.value)}>
-          <option value="">— Select a network —</option>
-          {list.map(n => (
-            <option key={n.id} value={n.id}>
-              {n.name} · {n.kind === 'next_token' ? 'next-token' : 'feed-forward'}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {!selected ? (
+      {!network ? (
         <div className="card">
           <p className="muted">Create or select a network to manage its corpus.</p>
         </div>
-      ) : selected.kind === 'feedforward' ? (
+      ) : network.kind === 'feedforward' ? (
         <FeedforwardCorpusEditor
-          network={selected}
+          network={network}
           stats={stats}
-          onSaved={async () => { await loadStats(selected.id); setInfo('Corpus saved.'); setError(null) }}
+          onSaved={async () => { await loadStats(network.id); setInfo('Corpus saved.'); setError(null) }}
           onError={(e) => { setError(e); setInfo(null) }}
         />
       ) : (
         <NextTokenCorpusEditor
-          network={selected}
+          network={network}
           stats={stats}
-          onSaved={async () => { await loadStats(selected.id); setInfo('Corpus saved.'); setError(null) }}
+          onSaved={async () => { await loadStats(network.id); setInfo('Corpus saved.'); setError(null) }}
           onError={(e) => { setError(e); setInfo(null) }}
         />
       )}
@@ -227,7 +203,7 @@ function NextTokenCorpusEditor({ network, stats, onSaved, onError }: {
   network: Network; stats: CorpusStats | null;
   onSaved: () => Promise<void> | void; onError: (e: string) => void;
 }) {
-  const [stage, setStage] = useState<GptStage>(stats?.stage ?? 'pretrain')
+  const [stage, setStage] = useState<Stage>(stats?.stage ?? 'pretrain')
   const [vocabMode, setVocabMode] = useState<'char' | 'word'>(
     (stats?.vocab_mode === 'word' ? 'word' : 'char')
   )
@@ -291,13 +267,11 @@ function NextTokenCorpusEditor({ network, stats, onSaved, onError }: {
           ? {
               network_id: network.id,
               stage: 'pretrain' as const,
-              vocab_mode: vocabMode,
               text: text.trim().length > 0 ? text : undefined,
             }
           : {
               network_id: network.id,
               stage: 'finetune' as const,
-              vocab_mode: vocabMode,
               pairs: pairs.filter(p => p.input.length > 0 || p.output.length > 0),
             }
       if (stage === 'pretrain' && !payload.text) { onError('Pretraining requires non-empty text.'); return }

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { type UnlistenFn } from '@tauri-apps/api/event'
 import {
-  networks, training, corpus, Network, OptimizerConfig, CorpusStats,
+  training, corpus, OptimizerConfig, CorpusStats,
 } from '../api'
+import type { TabProps } from '../App'
 
 interface RunState {
   running: boolean
@@ -15,9 +16,7 @@ interface RunState {
 
 const EMPTY_RUN: RunState = { running: false, epoch: 0, totalEpochs: 0, lastLoss: 0, lossHistory: [], elapsedSecs: 0 }
 
-export default function TrainingTab() {
-  const [list, setList] = useState<Network[]>([])
-  const [selectedId, setSelectedId] = useState<string>('')
+export default function TrainingTab({ network, refreshNetworks }: TabProps) {
   const [stats, setStats] = useState<CorpusStats | null>(null)
 
   const [epochs, setEpochs] = useState(500)
@@ -33,16 +32,12 @@ export default function TrainingTab() {
   const [error, setError] = useState<string | null>(null)
   const finishedListenersRef = useRef<UnlistenFn[]>([])
 
-  useEffect(() => { void loadNetworks() }, [])
   useEffect(() => {
-    if (selectedId) void loadStats(selectedId)
+    if (network) void loadStats(network.id)
     else setStats(null)
-  }, [selectedId])
+  }, [network])
 
-  // Auto-pick reasonable loss based on network kind (informational; backend
-  // forces cross-entropy for next_token regardless).
-  const selected = list.find(n => n.id === selectedId) ?? null
-  const isNextToken = selected?.kind === 'next_token'
+  const isNextToken = network?.kind === 'next_token'
   const lossLabel = isNextToken ? 'crossentropy (forced for next-token)' : 'mse'
 
   // Subscribe to training events whenever a job is active
@@ -63,7 +58,7 @@ export default function TrainingTab() {
         if (cancelled || r.training_id !== trainingId) return
         setRun(prev => ({ ...prev, running: false, lastLoss: r.final_loss, elapsedSecs: r.elapsed_secs }))
         // Reload network list so "trained" badge updates
-        void loadNetworks()
+        void refreshNetworks()
       })
       const e = await training.onError(err => {
         if (cancelled || err.training_id !== trainingId) return
@@ -77,27 +72,19 @@ export default function TrainingTab() {
     return () => { cancelled = true; cleanups.forEach(c => c()) }
   }, [trainingId])
 
-  const loadNetworks = async () => {
-    try {
-      const items = await networks.list()
-      setList(items)
-      if (!selectedId && items.length) setSelectedId(items[0].id)
-    } catch (e) { setError(String(e)) }
-  }
-
   const loadStats = async (id: string) => {
     try { setStats(await corpus.stats(id)) }
     catch (e) { setStats(null) /* not having a corpus is OK */ }
   }
 
   const start = async () => {
-    if (!selected) return
+    if (!network) return
     setError(null); setRun({ ...EMPTY_RUN, running: true, totalEpochs: epochs })
     const optimizer: OptimizerConfig = { kind: optKind, lr }
     if (optKind === 'sgd') optimizer.momentum = momentum
     try {
       const r = await training.start({
-        network_id: selected.id,
+        network_id: network.id,
         config: {
           epochs, batch_size: batchSize, optimizer,
           loss: isNextToken ? 'crossentropy' : 'mse',
@@ -124,28 +111,19 @@ export default function TrainingTab() {
 
       {error && <div className="status error">{error}</div>}
 
-      <div className="card">
-        <label>Network</label>
-        <select value={selectedId} onChange={e => setSelectedId(e.target.value)}>
-          <option value="">— Select a network —</option>
-          {list.map(n => (
-            <option key={n.id} value={n.id}>
-              {n.name} · {n.kind === 'next_token' ? 'next-token' : 'feed-forward'}
-              {n.trained ? ' · trained' : ''}
-            </option>
-          ))}
-        </select>
-        {selected && (
-          <p className="muted mt-1">
-            <span className="chip">{selected.input_dim} → {selected.output_dim}</span>{' '}
-            <span className="chip">{selected.parameter_count.toLocaleString()} params</span>{' '}
+      {network && (
+        <div className="card">
+          <p className="muted">
+            <span className="chip">{network.name}</span>{' '}
+            <span className="chip">{network.input_dim} → {network.output_dim}</span>{' '}
+            <span className="chip">{network.parameter_count.toLocaleString()} params</span>{' '}
             <span className="chip">{examples.toLocaleString()} training examples</span>
             {!corpusReady && <span className="status error" style={{ display: 'inline-block', marginLeft: 8 }}>
               No corpus attached. Add data on the Corpus tab.
             </span>}
           </p>
-        )}
-      </div>
+        </div>
+      )}
 
       {!trainingId ? (
         <div className="card">
@@ -201,7 +179,7 @@ export default function TrainingTab() {
             )}
           </div>
           <div className="flex mt-2">
-            <button onClick={start} disabled={!selected || !corpusReady}>
+            <button onClick={start} disabled={!network || !corpusReady}>
               Start training
             </button>
           </div>

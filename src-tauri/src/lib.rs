@@ -382,15 +382,15 @@ async fn build_vocabulary(
 ) -> Result<VocabularyInfo, String> {
     let mode = parse_tokenizer_mode(&req.mode)?;
     if matches!(mode, TokenizerMode::Advanced) {
-        return Err("use set_advanced_vocabulary for advanced mode".into());
+        return Err("use set_advanced_vocabulary for advanced mode".to_string());
     }
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
     if net.kind != kinds::NEXT_TOKEN {
-        return Err("vocabularies apply only to next-token networks".into());
+        return Err("vocabularies apply only to next-token networks".to_string());
     }
     let corpus = state.corpora.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".into())?;
+        .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".to_string())?;
 
     let mut owned: Vec<String> = Vec::new();
     if let Some(t) = &corpus.text { owned.push(t.clone()); }
@@ -398,7 +398,7 @@ async fn build_vocabulary(
         for p in ps { owned.push(p.input.clone()); owned.push(p.output.clone()); }
     }
     if owned.is_empty() {
-        return Err("corpus is empty — add text or pairs before building a vocabulary".into());
+        return Err("corpus is empty — add text or pairs before building a vocabulary".to_string());
     }
     let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
 
@@ -418,14 +418,14 @@ async fn set_advanced_vocabulary(
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
     if net.kind != kinds::NEXT_TOKEN {
-        return Err("vocabularies apply only to next-token networks".into());
+        return Err("vocabularies apply only to next-token networks".to_string());
     }
     let trimmed: Vec<String> = req.tokens.into_iter()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect();
     if trimmed.is_empty() {
-        return Err("advanced vocabulary requires at least one user token".into());
+        return Err("advanced vocabulary requires at least one user token".to_string());
     }
     let vocab = Vocabulary::build_advanced(&trimmed);
     finalize_vocab(state, net, vocab, "advanced".into(), VocabularyOptions::default()).await

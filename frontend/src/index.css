@@ -75,10 +75,10 @@ code, .mono {
 header.app-header {
   background: var(--bg-elev-1);
   border-bottom: 1px solid var(--border);
-  padding: 14px 20px;
+  padding: 12px 20px;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 14px;
 }
 header.app-header h1 { font-size: 16px; font-weight: 600; }
 header.app-header .subtitle {
@@ -86,6 +86,20 @@ header.app-header .subtitle {
   font-size: 12px;
   margin-left: 4px;
 }
+.network-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 320px;
+}
+.network-picker .picker-label {
+  margin: 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.network-picker select { width: auto; min-width: 260px; }
 
 nav.tabs {
   background: var(--bg-elev-1);

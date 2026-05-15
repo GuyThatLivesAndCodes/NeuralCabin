@@ -3,6 +3,7 @@ mod models;
 use models::*;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter, State};
@@ -11,7 +12,10 @@ use chrono::Utc;
 use neuralcabin_engine::nn::{LayerSpec, Model};
 use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
 use neuralcabin_engine::tensor::{SplitMix64, Tensor};
-use neuralcabin_engine::tokenizer::{TokenizerMode, Vocabulary};
+use neuralcabin_engine::tokenizer::{
+    TokenizerMode, Vocabulary, VocabularyOptions as EngineVocabularyOptions,
+    EOS_ID,
+};
 use neuralcabin_engine::corpus::{
     build_finetuning_tensors, build_pretraining_tensors, encode_context, Pair,
 };
@@ -21,30 +25,45 @@ use neuralcabin_engine::{Activation, Loss};
 // ─── State ──────────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    networks: Arc<RwLock<HashMap<String, Network>>>,
-    /// Trained model weights, keyed by network_id.
-    models:   Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
-    /// Vocabularies for next-token networks, keyed by network_id.
-    vocabs:   Arc<RwLock<HashMap<String, Arc<RwLock<Vocabulary>>>>>,
-    /// Corpus per network.
-    corpora:  Arc<RwLock<HashMap<String, Corpus>>>,
-    /// Active training sessions.
-    trainers: Arc<RwLock<HashMap<String, Arc<RwLock<TrainingState>>>>>,
+    networks:  Arc<RwLock<HashMap<String, Network>>>,
+    models:    Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
+    vocabs:    Arc<RwLock<HashMap<String, VocabEntry>>>,
+    corpora:   Arc<RwLock<HashMap<String, Corpus>>>,
+    trainers:  Arc<RwLock<HashMap<String, TrainerHandle>>>,
+    inferrers: Arc<RwLock<HashMap<String, InferenceHandle>>>,
+}
+
+#[derive(Clone)]
+struct VocabEntry {
+    vocab: Arc<RwLock<Vocabulary>>,
+    info:  VocabularyInfo,
+}
+
+#[derive(Clone)]
+struct TrainerHandle {
+    state:  Arc<RwLock<TrainingState>>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct InferenceHandle {
+    cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
-            networks: Arc::new(RwLock::new(HashMap::new())),
-            models:   Arc::new(RwLock::new(HashMap::new())),
-            vocabs:   Arc::new(RwLock::new(HashMap::new())),
-            corpora:  Arc::new(RwLock::new(HashMap::new())),
-            trainers: Arc::new(RwLock::new(HashMap::new())),
+            networks:  Arc::new(RwLock::new(HashMap::new())),
+            models:    Arc::new(RwLock::new(HashMap::new())),
+            vocabs:    Arc::new(RwLock::new(HashMap::new())),
+            corpora:   Arc::new(RwLock::new(HashMap::new())),
+            trainers:  Arc::new(RwLock::new(HashMap::new())),
+            inferrers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Parsing helpers ────────────────────────────────────────────────────────
 
 fn parse_activation(name: &str) -> Result<Activation, String> {
     match name.to_ascii_lowercase().as_str() {
@@ -67,25 +86,43 @@ fn parse_loss(name: &str) -> Result<Loss, String> {
 
 fn parse_tokenizer_mode(name: &str) -> Result<TokenizerMode, String> {
     match name.to_ascii_lowercase().as_str() {
-        "char" => Ok(TokenizerMode::Char),
-        "word" => Ok(TokenizerMode::Word),
-        other  => Err(format!("unknown vocab mode '{other}' (expected 'char' or 'word')")),
+        "char"     => Ok(TokenizerMode::Char),
+        "subword"  => Ok(TokenizerMode::Subword),
+        "word"     => Ok(TokenizerMode::Word),
+        "advanced" => Ok(TokenizerMode::Advanced),
+        other => Err(format!(
+            "unknown vocab mode '{other}' (expected char|subword|word|advanced)"
+        )),
     }
 }
 
 fn build_optimizer(cfg: &OptimizerConfig, shapes: &[Vec<usize>]) -> Result<Optimizer, String> {
     let kind = match cfg.kind.to_ascii_lowercase().as_str() {
         "adam" => OptimizerKind::Adam {
-            lr:    cfg.lr,
+            lr: cfg.lr,
             beta1: cfg.beta1.unwrap_or(0.9),
             beta2: cfg.beta2.unwrap_or(0.999),
             eps:   cfg.eps.unwrap_or(1e-8),
         },
+        "adamw" => OptimizerKind::AdamW {
+            lr: cfg.lr,
+            beta1: cfg.beta1.unwrap_or(0.9),
+            beta2: cfg.beta2.unwrap_or(0.999),
+            eps:   cfg.eps.unwrap_or(1e-8),
+            weight_decay: cfg.weight_decay.unwrap_or(0.01),
+        },
+        "lamb" => OptimizerKind::Lamb {
+            lr: cfg.lr,
+            beta1: cfg.beta1.unwrap_or(0.9),
+            beta2: cfg.beta2.unwrap_or(0.999),
+            eps:   cfg.eps.unwrap_or(1e-8),
+            weight_decay: cfg.weight_decay.unwrap_or(0.0),
+        },
         "sgd" => OptimizerKind::Sgd {
-            lr:       cfg.lr,
+            lr: cfg.lr,
             momentum: cfg.momentum.unwrap_or(0.0),
         },
-        other => return Err(format!("unknown optimizer '{other}' (expected 'adam' or 'sgd')")),
+        other => return Err(format!("unknown optimizer '{other}' (expected adam|adamw|lamb|sgd)")),
     };
     Ok(Optimizer::new(kind, shapes))
 }
@@ -127,34 +164,49 @@ async fn create_network(
             "unknown network kind '{}' (expected one of: {:?})", req.kind, kinds::all()
         ));
     }
-    if req.layers.is_empty() {
-        return Err("network must have at least one layer".to_string());
+    if req.layers.is_empty() && req.kind == kinds::FEEDFORWARD {
+        return Err("feedforward network must have at least one layer".into());
     }
-    if req.input_dim == 0 {
-        return Err("input_dim must be > 0".to_string());
-    }
-
-    let (specs, output_dim) = build_layer_specs(&req.layers, req.input_dim)?;
-    let model = Model::from_specs(req.input_dim, &specs, req.seed);
-    let parameter_count = model.parameter_count();
+    let name = req.name.trim().to_string();
+    if name.is_empty() { return Err("network name cannot be empty".into()); }
 
     let id = Uuid::new_v4().to_string();
-    let network = Network {
-        id: id.clone(),
-        name: req.name,
-        kind: req.kind,
-        layers: req.layers,
-        seed: req.seed,
-        input_dim: req.input_dim,
-        output_dim,
-        created_at: Utc::now(),
-        parameter_count,
-        trained: false,
-        context_size: req.context_size,
+    let now = Utc::now();
+
+    let network = if req.kind == kinds::FEEDFORWARD {
+        let input_dim = req.input_dim.unwrap_or(0);
+        if input_dim == 0 {
+            return Err("feedforward network requires input_dim > 0".into());
+        }
+        let (specs, output_dim) = build_layer_specs(&req.layers, input_dim)?;
+        let model = Model::from_specs(input_dim, &specs, req.seed);
+        let parameter_count = model.parameter_count();
+        state.models.write().await.insert(id.clone(), Arc::new(RwLock::new(model)));
+
+        Network {
+            id: id.clone(),
+            name, kind: req.kind, seed: req.seed, created_at: now, trained: false,
+            input_dim, output_dim,
+            layers: req.layers, parameter_count,
+            hidden_layers: None, context_size: None,
+        }
+    } else {
+        // Next-token: only the hidden chain is meaningful at this point.
+        let context_size = req.context_size.unwrap_or(0);
+        if context_size == 0 {
+            return Err("next-token network requires context_size > 0".into());
+        }
+        Network {
+            id: id.clone(),
+            name, kind: req.kind, seed: req.seed, created_at: now, trained: false,
+            input_dim: 0, output_dim: 0,
+            layers: Vec::new(), parameter_count: 0,
+            hidden_layers: Some(req.layers),
+            context_size: Some(context_size),
+        }
     };
 
-    state.networks.write().await.insert(id.clone(), network.clone());
-    state.models.write().await.insert(id, Arc::new(RwLock::new(model)));
+    state.networks.write().await.insert(id, network.clone());
     Ok(network)
 }
 
@@ -193,77 +245,66 @@ async fn set_corpus(
         feedforward: None,
         text: None,
         pairs: None,
-        vocab_mode: None,
-        vocab: None,
         stage: None,
     };
 
     if net.kind == kinds::FEEDFORWARD {
         let ff = req.feedforward.ok_or_else(|| "feedforward corpus required".to_string())?;
-        if ff.in_dim != net.input_dim {
-            return Err(format!(
-                "feedforward in_dim {} doesn't match network input_dim {}",
-                ff.in_dim, net.input_dim
-            ));
-        }
-        if ff.out_dim != net.output_dim {
-            return Err(format!(
-                "feedforward out_dim {} doesn't match network output_dim {}",
-                ff.out_dim, net.output_dim
-            ));
-        }
-        if ff.features.len() != ff.rows * ff.in_dim {
-            return Err("feedforward features length doesn't match rows × in_dim".to_string());
-        }
-        if ff.targets.len() != ff.rows * ff.out_dim {
-            return Err("feedforward targets length doesn't match rows × out_dim".to_string());
-        }
-        if ff.rows == 0 {
-            return Err("feedforward corpus must have at least one row".to_string());
-        }
+        validate_feedforward(&ff, &net)?;
         corpus.feedforward = Some(ff);
     } else if net.kind == kinds::NEXT_TOKEN {
-        let mode = parse_tokenizer_mode(req.vocab_mode.as_deref().unwrap_or("char"))?;
-        corpus.vocab_mode = Some(mode.name().to_ascii_lowercase());
-        corpus.text  = req.text.clone();
-        corpus.pairs = req.pairs.clone();
-        corpus.stage = req.stage.clone();
-
-        let mut owned_strings: Vec<String> = Vec::new();
-        if let Some(t) = req.text.as_ref() { owned_strings.push(t.clone()); }
-        if let Some(ps) = req.pairs.as_ref() {
-            for p in ps {
-                owned_strings.push(p.input.clone());
-                owned_strings.push(p.output.clone());
-            }
-        }
-        let refs: Vec<&str> = owned_strings.iter().map(|s| s.as_str()).collect();
-        let vocab = Vocabulary::from_corpus(mode, &refs);
-        corpus.vocab = Some(vocab.tokens.clone());
-        state.vocabs.write().await.insert(net.id.clone(), Arc::new(RwLock::new(vocab)));
+        corpus.text  = req.text;
+        corpus.pairs = req.pairs;
+        corpus.stage = req.stage;
     } else {
         return Err(format!("unsupported network kind '{}'", net.kind));
     }
 
-    let vocabs_guard = state.vocabs.read().await;
-    let stats = compute_stats(&net, &corpus, &vocabs_guard).await;
-    drop(vocabs_guard);
+    let stats = compute_stats(&net, &corpus, &*state.vocabs.read().await, &*state.models.read().await).await;
     state.corpora.write().await.insert(net.id, corpus);
     Ok(stats)
+}
+
+fn validate_feedforward(ff: &FeedforwardCorpus, net: &Network) -> Result<(), String> {
+    if ff.in_dim != net.input_dim {
+        return Err(format!(
+            "feedforward in_dim {} doesn't match network input_dim {}",
+            ff.in_dim, net.input_dim
+        ));
+    }
+    if ff.out_dim != net.output_dim {
+        return Err(format!(
+            "feedforward out_dim {} doesn't match network output_dim {}",
+            ff.out_dim, net.output_dim
+        ));
+    }
+    if ff.features.len() != ff.rows * ff.in_dim {
+        return Err("feedforward features length doesn't match rows × in_dim".into());
+    }
+    if ff.targets.len() != ff.rows * ff.out_dim {
+        return Err("feedforward targets length doesn't match rows × out_dim".into());
+    }
+    if ff.rows == 0 {
+        return Err("feedforward corpus must have at least one row".into());
+    }
+    Ok(())
 }
 
 async fn compute_stats(
     net: &Network,
     corpus: &Corpus,
-    vocabs: &HashMap<String, Arc<RwLock<Vocabulary>>>,
+    vocabs: &HashMap<String, VocabEntry>,
+    models: &HashMap<String, Arc<RwLock<Model>>>,
 ) -> CorpusStats {
     let mut stats = CorpusStats {
         kind: net.kind.clone(),
         stage: corpus.stage.clone(),
         rows: None, in_dim: None, out_dim: None,
         text_chars: None, text_tokens: None, pair_count: None,
-        vocab_size: None, vocab_mode: corpus.vocab_mode.clone(),
+        vocab_size: None, vocab_mode: None,
         training_examples: None,
+        vocab_ready: false,
+        model_ready: models.contains_key(&net.id),
     };
 
     if let Some(ff) = &corpus.feedforward {
@@ -278,8 +319,11 @@ async fn compute_stats(
             stats.text_chars = Some(text.chars().count());
         }
         stats.pair_count = corpus.pairs.as_ref().map(|p| p.len());
-        if let Some(vocab) = vocabs.get(&net.id) {
-            let v = vocab.read().await;
+
+        if let Some(entry) = vocabs.get(&net.id) {
+            stats.vocab_ready = true;
+            stats.vocab_mode = Some(entry.info.mode.clone());
+            let v = entry.vocab.read().await;
             stats.vocab_size = Some(v.size());
             if let Some(text) = &corpus.text {
                 stats.text_tokens = Some(v.encode(text).len());
@@ -319,15 +363,191 @@ async fn corpus_stats(
     state: State<'_, AppState>,
     network_id: String,
 ) -> Result<Option<CorpusStats>, String> {
-    let net = match state.networks.read().await.get(&network_id).cloned() {
-        Some(n) => n,
-        None => return Err("Network not found".into()),
-    };
+    let net = state.networks.read().await.get(&network_id).cloned()
+        .ok_or_else(|| "Network not found".to_string())?;
     let corpora = state.corpora.read().await;
     let Some(corpus) = corpora.get(&network_id) else { return Ok(None); };
     let vocabs = state.vocabs.read().await;
-    let stats = compute_stats(&net, corpus, &vocabs).await;
+    let models = state.models.read().await;
+    let stats = compute_stats(&net, corpus, &vocabs, &models).await;
     Ok(Some(stats))
+}
+
+// ─── Vocabulary commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn build_vocabulary(
+    state: State<'_, AppState>,
+    req: BuildVocabularyRequest,
+) -> Result<VocabularyInfo, String> {
+    let mode = parse_tokenizer_mode(&req.mode)?;
+    if matches!(mode, TokenizerMode::Advanced) {
+        return Err("use set_advanced_vocabulary for advanced mode".into());
+    }
+    let net = state.networks.read().await.get(&req.network_id).cloned()
+        .ok_or_else(|| "Network not found".to_string())?;
+    if net.kind != kinds::NEXT_TOKEN {
+        return Err("vocabularies apply only to next-token networks".into());
+    }
+    let corpus = state.corpora.read().await.get(&req.network_id).cloned()
+        .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".into())?;
+
+    let mut owned: Vec<String> = Vec::new();
+    if let Some(t) = &corpus.text { owned.push(t.clone()); }
+    if let Some(ps) = &corpus.pairs {
+        for p in ps { owned.push(p.input.clone()); owned.push(p.output.clone()); }
+    }
+    if owned.is_empty() {
+        return Err("corpus is empty — add text or pairs before building a vocabulary".into());
+    }
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+
+    let engine_opts = EngineVocabularyOptions {
+        subword_merges: req.options.subword_merges,
+        word_top_n:     req.options.word_top_n,
+    };
+    let vocab = Vocabulary::build(mode, &refs, &engine_opts);
+    finalize_vocab(state, net, vocab, mode_str(mode), req.options).await
+}
+
+#[tauri::command]
+async fn set_advanced_vocabulary(
+    state: State<'_, AppState>,
+    req: SetAdvancedVocabularyRequest,
+) -> Result<VocabularyInfo, String> {
+    let net = state.networks.read().await.get(&req.network_id).cloned()
+        .ok_or_else(|| "Network not found".to_string())?;
+    if net.kind != kinds::NEXT_TOKEN {
+        return Err("vocabularies apply only to next-token networks".into());
+    }
+    let trimmed: Vec<String> = req.tokens.into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if trimmed.is_empty() {
+        return Err("advanced vocabulary requires at least one user token".into());
+    }
+    let vocab = Vocabulary::build_advanced(&trimmed);
+    finalize_vocab(state, net, vocab, "advanced".into(), VocabularyOptions::default()).await
+}
+
+async fn finalize_vocab(
+    state: State<'_, AppState>,
+    net: Network,
+    vocab: Vocabulary,
+    mode_label: String,
+    options: VocabularyOptions,
+) -> Result<VocabularyInfo, String> {
+    let tokens = vocab.tokens.clone();
+    let info = VocabularyInfo {
+        mode: mode_label,
+        tokens: tokens.clone(),
+        options,
+        updated_at: Utc::now(),
+    };
+    let entry = VocabEntry {
+        vocab: Arc::new(RwLock::new(vocab.clone())),
+        info: info.clone(),
+    };
+    state.vocabs.write().await.insert(net.id.clone(), entry);
+
+    // Materialize the model: input = vocab × context, hidden chain, output = vocab.
+    rebuild_next_token_model(&state, &net, vocab.size()).await?;
+    Ok(info)
+}
+
+fn mode_str(m: TokenizerMode) -> String {
+    match m {
+        TokenizerMode::Char     => "char",
+        TokenizerMode::Subword  => "subword",
+        TokenizerMode::Word     => "word",
+        TokenizerMode::Advanced => "advanced",
+    }.into()
+}
+
+async fn rebuild_next_token_model(
+    state: &State<'_, AppState>,
+    net: &Network,
+    vocab_size: usize,
+) -> Result<(), String> {
+    let context_size = net.context_size
+        .ok_or_else(|| "next-token network missing context_size".to_string())?;
+    let hidden = net.hidden_layers.clone().unwrap_or_default();
+    let input_dim = vocab_size * context_size;
+
+    // Compose the full layer chain.
+    let mut full: Vec<LayerDef> = Vec::with_capacity(hidden.len() + 2);
+    // First linear projects input one-hot window into the first hidden width.
+    let first_hidden_width = first_linear_in_dim_target(&hidden).unwrap_or(vocab_size);
+    full.push(LayerDef::Linear { in_dim: input_dim, out_dim: first_hidden_width });
+
+    // The user's hidden chain starts AT first_hidden_width. The first user
+    // Linear (if any) must already have in_dim == first_hidden_width.
+    full.extend(hidden.iter().cloned());
+
+    // Output projection to vocab logits.
+    let pre_output_dim = running_output_dim(&full, input_dim)?;
+    full.push(LayerDef::Linear { in_dim: pre_output_dim, out_dim: vocab_size });
+
+    let (specs, output_dim) = build_layer_specs(&full, input_dim)?;
+    let model = Model::from_specs(input_dim, &specs, net.seed);
+    let parameter_count = model.parameter_count();
+
+    // Persist the rebuilt model + updated network metadata.
+    state.models.write().await.insert(net.id.clone(), Arc::new(RwLock::new(model)));
+    if let Some(n) = state.networks.write().await.get_mut(&net.id) {
+        n.layers = full;
+        n.input_dim = input_dim;
+        n.output_dim = output_dim;
+        n.parameter_count = parameter_count;
+        n.trained = false; // dimensions changed; weights are fresh
+    }
+    Ok(())
+}
+
+/// First Linear's in_dim in the chain, if any.
+fn first_linear_in_dim_target(layers: &[LayerDef]) -> Option<usize> {
+    for l in layers {
+        if let LayerDef::Linear { in_dim, .. } = l { return Some(*in_dim); }
+    }
+    None
+}
+
+/// Output dim of the chain so far, starting from the given input dim.
+fn running_output_dim(layers: &[LayerDef], input_dim: usize) -> Result<usize, String> {
+    let mut cur = input_dim;
+    for (i, l) in layers.iter().enumerate() {
+        if let LayerDef::Linear { in_dim, out_dim } = l {
+            if *in_dim != cur {
+                return Err(format!(
+                    "layer {i}: in_dim {in_dim} doesn't match running dim {cur}"
+                ));
+            }
+            cur = *out_dim;
+        }
+    }
+    Ok(cur)
+}
+
+#[tauri::command]
+async fn get_vocabulary(
+    state: State<'_, AppState>,
+    network_id: String,
+) -> Result<Option<VocabularyInfo>, String> {
+    Ok(state.vocabs.read().await.get(&network_id).map(|e| e.info.clone()))
+}
+
+#[tauri::command]
+async fn tokenize_preview(
+    state: State<'_, AppState>,
+    network_id: String,
+    text: String,
+) -> Result<Vec<(u32, String)>, String> {
+    let entry = state.vocabs.read().await.get(&network_id).cloned()
+        .ok_or_else(|| "no vocabulary on this network".to_string())?;
+    let v = entry.vocab.read().await;
+    let ids = v.encode(&text);
+    Ok(ids.into_iter().map(|id| (id, v.token_of(id).to_string())).collect())
 }
 
 // ─── Training ───────────────────────────────────────────────────────────────
@@ -343,7 +563,11 @@ async fn start_training(
     let corpus = state.corpora.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".to_string())?;
     let model_arc = state.models.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| "Model state missing".to_string())?;
+        .ok_or_else(|| if net.kind == kinds::NEXT_TOKEN {
+            "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
+        } else {
+            "Model state missing".to_string()
+        })?;
 
     let (x, y, loss_kind, total_examples) = if net.kind == kinds::FEEDFORWARD {
         let ff = corpus.feedforward.as_ref()
@@ -355,9 +579,9 @@ async fn start_training(
     } else if net.kind == kinds::NEXT_TOKEN {
         let context_size = net.context_size
             .ok_or_else(|| "Next-token network missing context_size".to_string())?;
-        let vocab_arc = state.vocabs.read().await.get(&req.network_id).cloned()
-            .ok_or_else(|| "Vocabulary missing — set the corpus first".to_string())?;
-        let vocab = vocab_arc.read().await.clone();
+        let entry = state.vocabs.read().await.get(&req.network_id).cloned()
+            .ok_or_else(|| "Vocabulary missing — build one on the Vocabulary tab first".to_string())?;
+        let vocab = entry.vocab.read().await.clone();
         let stage = corpus.stage.as_deref().unwrap_or("pretrain");
 
         let (x, y) = match stage {
@@ -399,12 +623,16 @@ async fn start_training(
     let batch_size = req.config.batch_size.max(1);
 
     let training_id = Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
     let training_state = Arc::new(RwLock::new(TrainingState {
         running: true,
         total_epochs: req.config.epochs,
         ..Default::default()
     }));
-    state.trainers.write().await.insert(training_id.clone(), training_state.clone());
+    state.trainers.write().await.insert(training_id.clone(), TrainerHandle {
+        state: training_state.clone(),
+        cancel: cancel.clone(),
+    });
 
     let networks_handle = state.networks.clone();
     let id_clone = training_id.clone();
@@ -414,11 +642,24 @@ async fn start_training(
     tokio::spawn(async move {
         run_training_loop(
             app, id_clone, net_id, cfg, model_arc, networks_handle,
-            x, y, loss_kind, batch_size, training_state,
+            x, y, loss_kind, batch_size, training_state, cancel,
         ).await;
+        // The TrainerHandle stays in `state.trainers` so callers can still
+        // query its final status. Map cleanup happens at app shutdown.
     });
 
     Ok(StartTrainingResponse { training_id, status: "running".into() })
+}
+
+#[tauri::command]
+async fn stop_training(
+    state: State<'_, AppState>,
+    training_id: String,
+) -> Result<bool, String> {
+    let trainers = state.trainers.read().await;
+    let Some(handle) = trainers.get(&training_id).cloned() else { return Ok(false); };
+    handle.cancel.store(true, Ordering::Relaxed);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -427,14 +668,15 @@ async fn get_training_status(
     training_id: String,
 ) -> Result<TrainingStatusResponse, String> {
     let trainers = state.trainers.read().await;
-    let ts = trainers.get(&training_id)
+    let h = trainers.get(&training_id)
         .ok_or_else(|| "Training session not found".to_string())?
         .clone();
     drop(trainers);
-    let s = ts.read().await;
+    let s = h.state.read().await;
     let status = if s.error.is_some() { "error" }
-                 else if s.stopped     { "completed" }
-                 else                  { "running" };
+                 else if s.cancelled  { "cancelled" }
+                 else if s.stopped    { "completed" }
+                 else                 { "running" };
     Ok(TrainingStatusResponse {
         training_id,
         status: status.into(),
@@ -459,6 +701,7 @@ async fn run_training_loop(
     loss_kind: Loss,
     batch_size: usize,
     training_state: Arc<RwLock<TrainingState>>,
+    cancel: Arc<AtomicBool>,
 ) {
     let n = x.rows();
     let in_dim = x.cols();
@@ -479,6 +722,23 @@ async fn run_training_loop(
     let mut indices: Vec<usize> = (0..n).collect();
 
     for epoch in 1..=cfg.epochs {
+        if cancel.load(Ordering::Relaxed) {
+            let elapsed = start.elapsed().as_secs_f32();
+            let final_loss = loss_history.last().copied().unwrap_or(0.0);
+            {
+                let mut s = training_state.write().await;
+                s.running = false; s.stopped = true; s.cancelled = true;
+                s.elapsed_secs = elapsed;
+            }
+            let _ = app.emit("training_finished", TrainingFinished {
+                training_id: training_id.clone(),
+                status: "cancelled".into(),
+                final_loss, total_epochs: cfg.epochs, elapsed_secs: elapsed,
+            });
+            return;
+        }
+
+        // Shuffle each epoch (deterministic from seed).
         for i in (1..indices.len()).rev() {
             let j = (rng.next_u64() as usize) % (i + 1);
             indices.swap(i, j);
@@ -487,6 +747,7 @@ async fn run_training_loop(
         let mut epoch_loss = 0.0_f32;
         let mut batches = 0usize;
         for chunk in indices.chunks(batch_size) {
+            if cancel.load(Ordering::Relaxed) { break; }
             let mut bx = Vec::with_capacity(chunk.len() * in_dim);
             let mut by = Vec::with_capacity(chunk.len() * out_dim);
             for &i in chunk {
@@ -529,11 +790,9 @@ async fn run_training_loop(
 
     let elapsed = start.elapsed().as_secs_f32();
     let final_loss = loss_history.last().copied().unwrap_or(0.0);
-
     {
         let mut s = training_state.write().await;
-        s.running = false;
-        s.stopped = true;
+        s.running = false; s.stopped = true;
         s.elapsed_secs = elapsed;
     }
     if let Some(net) = networks_handle.write().await.get_mut(&network_id) {
@@ -557,8 +816,7 @@ async fn mark_error(
     {
         let mut s = state.write().await;
         s.error = Some(msg.clone());
-        s.running = false;
-        s.stopped = true;
+        s.running = false; s.stopped = true;
     }
     let _ = app.emit("training_error", TrainingError {
         training_id: training_id.to_string(),
@@ -570,16 +828,21 @@ async fn mark_error(
 
 #[tauri::command]
 async fn infer(
+    app: AppHandle,
     state: State<'_, AppState>,
     req: InferRequest,
 ) -> Result<InferResponse, String> {
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
     let model_arc = state.models.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| "Model state missing".to_string())?;
-    let model = model_arc.read().await;
+        .ok_or_else(|| if net.kind == kinds::NEXT_TOKEN {
+            "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
+        } else {
+            "Model state missing".to_string()
+        })?;
 
     if net.kind == kinds::FEEDFORWARD {
+        let model = model_arc.read().await;
         let features = req.features
             .ok_or_else(|| "features array required for feedforward inference".to_string())?;
         if features.len() != net.input_dim {
@@ -590,47 +853,120 @@ async fn infer(
         }
         let x = Tensor::new(vec![1, net.input_dim], features);
         let y = model.predict(&x);
-        Ok(InferResponse { output: Some(y.data), generated: None, steps: None })
+        Ok(InferResponse { output: Some(y.data), inference_id: None })
     } else if net.kind == kinds::NEXT_TOKEN {
         let prompt = req.prompt.unwrap_or_default();
-        let max_new = req.max_new_tokens.unwrap_or(64).min(2048);
+        let max_new = req.max_new_tokens.unwrap_or(64).min(4096).max(1);
         let temperature = req.temperature.unwrap_or(0.0).max(0.0);
         let context_size = net.context_size
             .ok_or_else(|| "Next-token network missing context_size".to_string())?;
-        let vocab_arc = state.vocabs.read().await.get(&req.network_id).cloned()
-            .ok_or_else(|| "Vocabulary missing — set the corpus first".to_string())?;
-        let vocab = vocab_arc.read().await.clone();
+        let entry = state.vocabs.read().await.get(&req.network_id).cloned()
+            .ok_or_else(|| "Vocabulary missing — build one on the Vocabulary tab first".to_string())?;
 
-        let mut ids: Vec<u32> = vocab.encode(&prompt);
-        let initial_len = ids.len();
-        let mut steps = Vec::with_capacity(max_new);
-        let mut rng = SplitMix64::new(0xDEAD_BEEFu64.wrapping_add(max_new as u64));
+        let inference_id = Uuid::new_v4().to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.inferrers.write().await.insert(inference_id.clone(), InferenceHandle {
+            cancel: cancel.clone(),
+        });
 
-        for _ in 0..max_new {
-            let ctx = encode_context(&ids, &vocab, context_size);
-            let logits = model.predict(&ctx);
-            let probs = softmax_rows(&logits);
-            let row = &probs.data[..probs.cols()];
+        let inferrers_handle = state.inferrers.clone();
+        let id_clone = inference_id.clone();
+        tokio::spawn(async move {
+            run_generation(
+                app, id_clone.clone(), model_arc, entry.vocab,
+                prompt, context_size, max_new, temperature, cancel,
+            ).await;
+            inferrers_handle.write().await.remove(&id_clone);
+        });
 
-            let chosen = if temperature <= f32::EPSILON {
-                argmax(row)
-            } else {
-                sample_with_temperature(row, temperature, &mut rng)
-            };
-            let prob = row[chosen];
-            let token = vocab.token_of(chosen as u32).to_string();
-            steps.push(GenerationStep { token: token.clone(), probability: prob });
-
-            if (chosen as u32) == neuralcabin_engine::tokenizer::EOS_ID { break; }
-            ids.push(chosen as u32);
-        }
-
-        let generated_ids: Vec<u32> = ids.iter().skip(initial_len).copied().collect();
-        let generated = vocab.decode(&generated_ids);
-        Ok(InferResponse { output: None, generated: Some(generated), steps: Some(steps) })
+        Ok(InferResponse { output: None, inference_id: Some(inference_id) })
     } else {
         Err(format!("unsupported network kind '{}'", net.kind))
     }
+}
+
+#[tauri::command]
+async fn stop_inference(
+    state: State<'_, AppState>,
+    inference_id: String,
+) -> Result<bool, String> {
+    let h = state.inferrers.read().await.get(&inference_id).cloned();
+    if let Some(h) = h {
+        h.cancel.store(true, Ordering::Relaxed);
+        Ok(true)
+    } else { Ok(false) }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_generation(
+    app: AppHandle,
+    inference_id: String,
+    model_arc: Arc<RwLock<Model>>,
+    vocab_arc: Arc<RwLock<Vocabulary>>,
+    prompt: String,
+    context_size: usize,
+    max_new_tokens: usize,
+    temperature: f32,
+    cancel: Arc<AtomicBool>,
+) {
+    let model  = model_arc.read().await;
+    let vocab  = vocab_arc.read().await;
+    let mut ids: Vec<u32> = vocab.encode(&prompt);
+    let initial_len = ids.len();
+    let mut generated = String::new();
+    let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new_tokens as u64).wrapping_mul(0x9E3779B1));
+
+    for index in 0..max_new_tokens {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = app.emit("inference_finished", InferenceFinished {
+                inference_id: inference_id.clone(),
+                status: "cancelled".into(),
+                generated: generated.clone(),
+                token_count: ids.len() - initial_len,
+            });
+            return;
+        }
+
+        let ctx = encode_context(&ids, &vocab, context_size);
+        let logits = model.predict(&ctx);
+        let probs = softmax_rows(&logits);
+        let row = &probs.data[..probs.cols()];
+
+        let chosen = if temperature <= f32::EPSILON {
+            argmax(row)
+        } else {
+            sample_with_temperature(row, temperature, &mut rng)
+        };
+        let prob = row[chosen];
+        let token = vocab.token_of(chosen as u32).to_string();
+
+        // Emit one token at a time for streaming UI.
+        let visible_token = if (chosen as u32) < neuralcabin_engine::tokenizer::RESERVED as u32 {
+            // Don't append reserved tokens to generated text, but still report them.
+            String::new()
+        } else {
+            token.clone()
+        };
+        generated.push_str(&visible_token);
+
+        let _ = app.emit("inference_token", InferenceToken {
+            inference_id: inference_id.clone(),
+            index, token: token.clone(), probability: prob,
+        });
+
+        if (chosen as u32) == EOS_ID { break; }
+        ids.push(chosen as u32);
+
+        // Cooperative yield so the cancel flag can be observed promptly.
+        tokio::task::yield_now().await;
+    }
+
+    let _ = app.emit("inference_finished", InferenceFinished {
+        inference_id: inference_id.clone(),
+        status: "completed".into(),
+        generated,
+        token_count: ids.len() - initial_len,
+    });
 }
 
 fn argmax(row: &[f32]) -> usize {
@@ -658,22 +994,6 @@ fn sample_with_temperature(probs: &[f32], temperature: f32, rng: &mut SplitMix64
     logits.len() - 1
 }
 
-// ─── Vocabulary commands ────────────────────────────────────────────────────
-
-#[tauri::command]
-async fn get_vocabulary(
-    state: State<'_, AppState>,
-    network_id: String,
-) -> Result<Option<Vec<String>>, String> {
-    let vocabs = state.vocabs.read().await;
-    if let Some(v) = vocabs.get(&network_id) {
-        let g = v.read().await;
-        Ok(Some(g.tokens.clone()))
-    } else {
-        Ok(None)
-    }
-}
-
 // ─── Tauri entry point ──────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -683,10 +1003,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_network, list_networks, get_network, delete_network,
             set_corpus, get_corpus, corpus_stats,
-            get_vocabulary,
-            start_training, get_training_status,
-            infer,
+            build_vocabulary, set_advanced_vocabulary, get_vocabulary, tokenize_preview,
+            start_training, stop_training, get_training_status,
+            infer, stop_inference,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

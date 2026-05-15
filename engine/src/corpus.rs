@@ -145,24 +145,27 @@ pub fn encode_context(ids: &[u32], vocab: &Vocabulary, context_size: usize) -> T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokenizer::TokenizerMode;
+    use crate::tokenizer::{TokenizerMode, VocabularyOptions};
+
+    fn char_vocab(text: &str) -> Vocabulary {
+        Vocabulary::build(TokenizerMode::Char, &[text], &VocabularyOptions::default())
+    }
 
     #[test]
     fn pretraining_tensors_have_correct_shape() {
-        let vocab = Vocabulary::from_corpus(TokenizerMode::Char, &["abcabc"]);
+        let vocab = char_vocab("abcabc");
         let v = vocab.size();
         let (x, y) = build_pretraining_tensors("abcabc", &vocab, 2).unwrap();
         // 6 tokens, context 2 → 4 examples
         assert_eq!(x.shape, vec![4, 2 * v]);
         assert_eq!(y.shape, vec![4, v]);
-        // First example targets 'c' (third character)
         let target_id = vocab.id_of("c") as usize;
         assert_eq!(y.data[target_id], 1.0);
     }
 
     #[test]
     fn finetuning_emits_examples() {
-        let vocab = Vocabulary::from_corpus(TokenizerMode::Char, &["hi there"]);
+        let vocab = char_vocab("hi there");
         let v = vocab.size();
         let pairs = vec![Pair { input: "hi".into(), output: "there".into() }];
         let (x, _y) = build_finetuning_tensors(&pairs, &vocab, 4, false).unwrap();
@@ -173,14 +176,13 @@ mod tests {
 
     #[test]
     fn encode_context_left_pads() {
-        let vocab = Vocabulary::from_corpus(TokenizerMode::Char, &["ab"]);
+        let vocab = char_vocab("ab");
         let v = vocab.size();
         let ids = vocab.encode("a");
         let ctx = encode_context(&ids, &vocab, 3);
         assert_eq!(ctx.shape, vec![1, 3 * v]);
-        // First two positions should be PAD, third should be 'a'
-        assert_eq!(ctx.data[0 * v + PAD_ID as usize], 1.0);
-        assert_eq!(ctx.data[1 * v + PAD_ID as usize], 1.0);
+        assert_eq!(ctx.data[PAD_ID as usize], 1.0);
+        assert_eq!(ctx.data[v + PAD_ID as usize], 1.0);
         assert_eq!(ctx.data[2 * v + vocab.id_of("a") as usize], 1.0);
     }
 }

@@ -4,7 +4,6 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 // ─── Network ────────────────────────────────────────────────────────────────
 
 export type NetworkKind = 'feedforward' | 'next_token'
-
 export type Activation = 'identity' | 'relu' | 'sigmoid' | 'tanh' | 'softmax'
 
 export type Layer =
@@ -15,13 +14,14 @@ export interface Network {
   id: string
   name: string
   kind: NetworkKind
-  layers: Layer[]
   seed: number
+  created_at: string
+  trained: boolean
   input_dim: number
   output_dim: number
-  created_at: string
+  layers: Layer[]
   parameter_count: number
-  trained: boolean
+  hidden_layers?: Layer[] | null
   context_size?: number | null
 }
 
@@ -30,7 +30,7 @@ export interface CreateNetworkRequest {
   kind: NetworkKind
   seed: number
   layers: Layer[]
-  input_dim: number
+  input_dim?: number | null
   context_size?: number | null
 }
 
@@ -51,20 +51,15 @@ export interface FeedforwardCorpus {
   out_dim: number
 }
 
-export interface FineTunePair {
-  input: string
-  output: string
-}
-
-export type GptStage = 'pretrain' | 'finetune'
+export interface FineTunePair { input: string; output: string }
+export type Stage = 'pretrain' | 'finetune'
 
 export interface SetCorpusRequest {
   network_id: string
   feedforward?: FeedforwardCorpus
   text?: string
   pairs?: FineTunePair[]
-  vocab_mode?: 'char' | 'word'
-  stage?: GptStage
+  stage?: Stage
 }
 
 export interface Corpus {
@@ -74,14 +69,12 @@ export interface Corpus {
   feedforward?: FeedforwardCorpus
   text?: string
   pairs?: FineTunePair[]
-  vocab_mode?: string
-  vocab?: string[]
-  stage?: GptStage
+  stage?: Stage
 }
 
 export interface CorpusStats {
   kind: NetworkKind
-  stage?: GptStage
+  stage?: Stage
   rows?: number
   in_dim?: number
   out_dim?: number
@@ -91,6 +84,8 @@ export interface CorpusStats {
   vocab_size?: number
   vocab_mode?: string
   training_examples?: number
+  vocab_ready: boolean
+  model_ready: boolean
 }
 
 export const corpus = {
@@ -101,20 +96,47 @@ export const corpus = {
 
 // ─── Vocabulary ─────────────────────────────────────────────────────────────
 
+export type VocabMode = 'char' | 'subword' | 'word' | 'advanced'
+
+export interface VocabularyOptions {
+  subword_merges: number
+  word_top_n: number
+}
+
+export interface VocabularyInfo {
+  mode: VocabMode
+  tokens: string[]
+  options: VocabularyOptions
+  updated_at: string
+}
+
 export const vocabulary = {
+  build: (network_id: string, mode: Exclude<VocabMode, 'advanced'>, options: VocabularyOptions) =>
+    invoke<VocabularyInfo>('build_vocabulary', {
+      req: { network_id, mode, options },
+    }),
+  setAdvanced: (network_id: string, tokens: string[]) =>
+    invoke<VocabularyInfo>('set_advanced_vocabulary', {
+      req: { network_id, tokens },
+    }),
   get: (network_id: string) =>
-    invoke<string[] | null>('get_vocabulary', { networkId: network_id }),
+    invoke<VocabularyInfo | null>('get_vocabulary', { networkId: network_id }),
+  tokenize: (network_id: string, text: string) =>
+    invoke<[number, string][]>('tokenize_preview', { networkId: network_id, text }),
 }
 
 // ─── Training ───────────────────────────────────────────────────────────────
 
+export type OptimizerKind = 'adam' | 'adamw' | 'lamb' | 'sgd'
+
 export interface OptimizerConfig {
-  kind: 'adam' | 'sgd'
+  kind: OptimizerKind
   lr: number
   beta1?: number
   beta2?: number
   eps?: number
   momentum?: number
+  weight_decay?: number
 }
 
 export interface TrainingConfig {
@@ -126,14 +148,11 @@ export interface TrainingConfig {
   mask_user_tokens?: boolean
 }
 
-export interface TrainingRequest {
-  network_id: string
-  config: TrainingConfig
-}
+export interface TrainingRequest { network_id: string; config: TrainingConfig }
 
 export interface TrainingStatus {
   training_id: string
-  status: 'running' | 'completed' | 'error'
+  status: 'running' | 'completed' | 'cancelled' | 'error'
   epoch: number
   total_epochs: number
   last_loss: number
@@ -152,30 +171,26 @@ export interface TrainingUpdate {
 
 export interface TrainingFinished {
   training_id: string
-  status: string
+  status: 'completed' | 'cancelled'
   final_loss: number
   total_epochs: number
   elapsed_secs: number
 }
 
-export interface TrainingError {
-  training_id: string
-  message: string
-}
+export interface TrainingError { training_id: string; message: string }
 
 export const training = {
   start:  (req: TrainingRequest) =>
     invoke<{ training_id: string; status: string }>('start_training', { req }),
-
+  stop:   (trainingId: string) =>
+    invoke<boolean>('stop_training', { trainingId }),
   status: (trainingId: string) =>
     invoke<TrainingStatus>('get_training_status', { trainingId }),
 
   onUpdate: (handler: (u: TrainingUpdate) => void): Promise<UnlistenFn> =>
     listen<TrainingUpdate>('training_update', (e) => handler(e.payload)),
-
   onFinished: (handler: (r: TrainingFinished) => void): Promise<UnlistenFn> =>
     listen<TrainingFinished>('training_finished', (e) => handler(e.payload)),
-
   onError: (handler: (err: TrainingError) => void): Promise<UnlistenFn> =>
     listen<TrainingError>('training_error', (e) => handler(e.payload)),
 }
@@ -190,17 +205,37 @@ export interface InferRequest {
   temperature?: number
 }
 
-export interface GenerationStep {
+export interface InferResponse {
+  /** Feed-forward synchronous result. */
+  output?: number[]
+  /** Next-token streaming job id; subscribe to inference events. */
+  inference_id?: string
+}
+
+export interface InferenceToken {
+  inference_id: string
+  index: number
   token: string
   probability: number
 }
 
-export interface InferResponse {
-  output?: number[]
-  generated?: string
-  steps?: GenerationStep[]
+export interface InferenceFinished {
+  inference_id: string
+  status: 'completed' | 'cancelled'
+  generated: string
+  token_count: number
 }
 
+export interface InferenceError { inference_id: string; message: string }
+
 export const inference = {
-  run: (req: InferRequest) => invoke<InferResponse>('infer', { req }),
+  run:    (req: InferRequest) => invoke<InferResponse>('infer', { req }),
+  stop:   (inferenceId: string) => invoke<boolean>('stop_inference', { inferenceId }),
+
+  onToken:    (handler: (t: InferenceToken) => void): Promise<UnlistenFn> =>
+    listen<InferenceToken>('inference_token', (e) => handler(e.payload)),
+  onFinished: (handler: (r: InferenceFinished) => void): Promise<UnlistenFn> =>
+    listen<InferenceFinished>('inference_finished', (e) => handler(e.payload)),
+  onError:    (handler: (e: InferenceError) => void): Promise<UnlistenFn> =>
+    listen<InferenceError>('inference_error', (e) => handler(e.payload)),
 }

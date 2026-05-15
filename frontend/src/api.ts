@@ -172,7 +172,8 @@ export interface TrainingUpdate {
 
 export interface TrainingFinished {
   training_id: string
-  status: 'completed' | 'cancelled'
+  /** 'aborted' = cancelled with rollback (Abort button) */
+  status: 'completed' | 'cancelled' | 'aborted'
   final_loss: number
   total_epochs: number
   elapsed_secs: number
@@ -183,8 +184,12 @@ export interface TrainingError { training_id: string; message: string }
 export const training = {
   start:  (req: TrainingRequest) =>
     invoke<{ training_id: string; status: string }>('start_training', { req }),
+  /** Graceful stop: keeps whatever weights the model has at this moment. */
   stop:   (trainingId: string) =>
     invoke<boolean>('stop_training', { trainingId }),
+  /** Cancel and roll back to the pre-training weights. */
+  abort:  (trainingId: string) =>
+    invoke<boolean>('abort_training', { trainingId }),
   status: (trainingId: string) =>
     invoke<TrainingStatus>('get_training_status', { trainingId }),
 

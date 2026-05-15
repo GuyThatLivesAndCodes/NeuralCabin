@@ -48,6 +48,9 @@ pub(crate) struct VocabEntry {
 struct TrainerHandle {
     state:  Arc<RwLock<TrainingState>>,
     cancel: Arc<AtomicBool>,
+    /// Set together with `cancel` by `abort_training` — tells the training
+    /// loop to restore the pre-training model snapshot on the way out.
+    rollback: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -74,7 +77,17 @@ impl AppState {
 /// silent persistence failures are how data gets lost.
 async fn persist(state: &AppState) -> Result<(), String> {
     let Some(dir) = state.data_dir.read().await.clone() else { return Ok(()); };
-    persistence::save_to_dir(state, &dir).await
+    // Timing diagnostics: if "save takes forever" is reported, this log line
+    // pins down whether the cost is in snapshotting, JSON encoding, or the
+    // disk write itself.
+    let started = std::time::Instant::now();
+    let result = persistence::save_to_dir(state, &dir).await;
+    let elapsed = started.elapsed();
+    if elapsed.as_millis() > 500 {
+        eprintln!("[neuralcabin] persist took {}ms — investigating slow save",
+                  elapsed.as_millis());
+    }
+    result
 }
 
 // ─── Parsing helpers ────────────────────────────────────────────────────────
@@ -682,10 +695,22 @@ async fn start_training(
     if req.config.epochs == 0 {
         return Err("epochs must be > 0".into());
     }
+    // Refuse to "train" a network with no parameters — that's how next-token
+    // networks end up stuck on "epoch 0 / 500" forever when the vocabulary
+    // wasn't built. The model has nothing to learn, but the loop runs anyway.
+    if net.parameter_count == 0 {
+        return Err(
+            "Network has no parameters yet. For next-token networks, set a \
+             corpus (which builds the vocabulary and materialises the model) \
+             before training."
+                .into(),
+        );
+    }
     let batch_size = req.config.batch_size.max(1);
 
     let training_id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
+    let rollback = Arc::new(AtomicBool::new(false));
     let training_state = Arc::new(RwLock::new(TrainingState {
         running: true,
         total_epochs: req.config.epochs,
@@ -694,6 +719,7 @@ async fn start_training(
     state.trainers.write().await.insert(training_id.clone(), TrainerHandle {
         state: training_state.clone(),
         cancel: cancel.clone(),
+        rollback: rollback.clone(),
     });
 
     let networks_handle = state.networks.clone();
@@ -704,7 +730,7 @@ async fn start_training(
     tokio::spawn(async move {
         run_training_loop(
             app, id_clone, net_id, cfg, model_arc, networks_handle,
-            x, y, loss_kind, batch_size, training_state, cancel,
+            x, y, loss_kind, batch_size, training_state, cancel, rollback,
         ).await;
         // The TrainerHandle stays in `state.trainers` so callers can still
         // query its final status. Map cleanup happens at app shutdown.
@@ -720,6 +746,21 @@ async fn stop_training(
 ) -> Result<bool, String> {
     let trainers = state.trainers.read().await;
     let Some(handle) = trainers.get(&training_id).cloned() else { return Ok(false); };
+    handle.cancel.store(true, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Cancel training AND roll back to the pre-training weights. Used by the
+/// "Abort" button — `stop_training` keeps whatever weights training has
+/// produced so far, `abort_training` discards them.
+#[tauri::command]
+async fn abort_training(
+    state: State<'_, AppState>,
+    training_id: String,
+) -> Result<bool, String> {
+    let trainers = state.trainers.read().await;
+    let Some(handle) = trainers.get(&training_id).cloned() else { return Ok(false); };
+    handle.rollback.store(true, Ordering::Relaxed);
     handle.cancel.store(true, Ordering::Relaxed);
     Ok(true)
 }
@@ -764,12 +805,26 @@ async fn run_training_loop(
     batch_size: usize,
     training_state: Arc<RwLock<TrainingState>>,
     cancel: Arc<AtomicBool>,
+    rollback: Arc<AtomicBool>,
 ) {
     let n = x.rows();
     let in_dim = x.cols();
     let out_dim = y.cols();
-    let mut model = model_arc.write().await;
-    let shapes = model.parameter_shapes();
+
+    // Snapshot the pre-training weights so that "Abort" can restore them. This
+    // is the only point at which we keep a long-lived clone of the model.
+    let initial_snapshot: Model = {
+        let m = model_arc.read().await;
+        m.clone()
+    };
+
+    // Build the optimizer from the model's parameter shapes. We acquire the
+    // lock briefly here (not held across the training loop) so that other
+    // commands — persistence, inference — can still access the model.
+    let shapes = {
+        let m = model_arc.read().await;
+        m.parameter_shapes()
+    };
     let mut optimizer = match build_optimizer(&cfg.optimizer, &shapes) {
         Ok(o) => o,
         Err(e) => {
@@ -783,20 +838,52 @@ async fn run_training_loop(
     let mut rng = SplitMix64::new(cfg.seed.wrapping_add(0xA5A5_5A5A_5A5A_A5A5));
     let mut indices: Vec<usize> = (0..n).collect();
 
+    /// Run the cleanup path for a cancelled training run. Honours `rollback`
+    /// to decide whether to keep or revert the in-progress weights, persists
+    /// the result, and emits the `training_finished` event.
+    async fn finish_cancelled(
+        app: &AppHandle,
+        training_id: &str,
+        cfg_epochs: usize,
+        loss_history: &[f32],
+        start: std::time::Instant,
+        training_state: &Arc<RwLock<TrainingState>>,
+        model_arc: &Arc<RwLock<Model>>,
+        rollback: &Arc<AtomicBool>,
+        initial_snapshot: &Model,
+    ) {
+        if rollback.load(Ordering::Relaxed) {
+            // Restore the model to its pre-training state. Any progress made
+            // during this run is discarded — that's the whole point of Abort.
+            let mut m = model_arc.write().await;
+            *m = initial_snapshot.clone();
+        }
+        let elapsed = start.elapsed().as_secs_f32();
+        let final_loss = loss_history.last().copied().unwrap_or(0.0);
+        {
+            let mut s = training_state.write().await;
+            s.running = false; s.stopped = true; s.cancelled = true;
+            s.elapsed_secs = elapsed;
+        }
+        if let Some(app_state) = app.try_state::<AppState>() {
+            persistence::save_best_effort(app_state.inner()).await;
+        }
+        let _ = app.emit("training_finished", TrainingFinished {
+            training_id: training_id.to_string(),
+            status: if rollback.load(Ordering::Relaxed) { "aborted".into() }
+                    else { "cancelled".into() },
+            final_loss,
+            total_epochs: cfg_epochs,
+            elapsed_secs: elapsed,
+        });
+    }
+
     for epoch in 1..=cfg.epochs {
         if cancel.load(Ordering::Relaxed) {
-            let elapsed = start.elapsed().as_secs_f32();
-            let final_loss = loss_history.last().copied().unwrap_or(0.0);
-            {
-                let mut s = training_state.write().await;
-                s.running = false; s.stopped = true; s.cancelled = true;
-                s.elapsed_secs = elapsed;
-            }
-            let _ = app.emit("training_finished", TrainingFinished {
-                training_id: training_id.clone(),
-                status: "cancelled".into(),
-                final_loss, total_epochs: cfg.epochs, elapsed_secs: elapsed,
-            });
+            finish_cancelled(
+                &app, &training_id, cfg.epochs, &loss_history, start,
+                &training_state, &model_arc, &rollback, &initial_snapshot,
+            ).await;
             return;
         }
 
@@ -818,7 +905,13 @@ async fn run_training_loop(
             }
             let bx = Tensor::new(vec![chunk.len(), in_dim], bx);
             let by = Tensor::new(vec![chunk.len(), out_dim], by);
-            let loss = model.train_step(&mut optimizer, loss_kind, &bx, &by);
+            // Acquire the model lock for just one optimisation step, then
+            // release it. This is what lets `persist()` and `infer()` proceed
+            // between batches instead of waiting for the whole run to finish.
+            let loss = {
+                let mut model = model_arc.write().await;
+                model.train_step(&mut optimizer, loss_kind, &bx, &by)
+            };
             if !loss.is_finite() {
                 mark_error(&training_state, &training_id, &app,
                     format!("Loss diverged to {loss} at epoch {epoch}")).await;
@@ -1101,7 +1194,7 @@ pub fn run() {
             create_network, list_networks, get_network, delete_network,
             set_corpus, get_corpus, corpus_stats,
             build_vocabulary, set_advanced_vocabulary, get_vocabulary, tokenize_preview,
-            start_training, stop_training, get_training_status,
+            start_training, stop_training, abort_training, get_training_status,
             infer, stop_inference,
         ])
         .run(tauri::generate_context!())

@@ -12,6 +12,7 @@ interface RunState {
   lastLoss: number
   lossHistory: number[]
   elapsedSecs: number
+  finalStatus?: 'completed' | 'cancelled' | 'aborted'
 }
 
 const EMPTY_RUN: RunState = { running: false, epoch: 0, totalEpochs: 0, lastLoss: 0, lossHistory: [], elapsedSecs: 0 }
@@ -56,7 +57,13 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
       })
       const f = await training.onFinished(r => {
         if (cancelled || r.training_id !== trainingId) return
-        setRun(prev => ({ ...prev, running: false, lastLoss: r.final_loss, elapsedSecs: r.elapsed_secs }))
+        setRun(prev => ({
+          ...prev,
+          running: false,
+          lastLoss: r.final_loss,
+          elapsedSecs: r.elapsed_secs,
+          finalStatus: r.status,
+        }))
         // Reload network list so "trained" badge updates
         void refreshNetworks()
       })
@@ -185,19 +192,43 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
           </div>
         </div>
       ) : (
-        <RunView run={run} onReset={reset} />
+        <RunView run={run} trainingId={trainingId} onReset={reset} onError={setError} />
       )}
     </div>
   )
 }
 
-function RunView({ run, onReset }: { run: RunState; onReset: () => void }) {
+function RunView({ run, trainingId, onReset, onError }: {
+  run: RunState
+  trainingId: string | null
+  onReset: () => void
+  onError: (e: string | null) => void
+}) {
+  const [stopping, setStopping] = useState<'stop' | 'abort' | null>(null)
+
+  const onStopHere = async () => {
+    if (!trainingId) return
+    setStopping('stop'); onError(null)
+    try { await training.stop(trainingId) }
+    catch (e) { onError(String(e)) }
+  }
+  const onAbort = async () => {
+    if (!trainingId) return
+    setStopping('abort'); onError(null)
+    try { await training.abort(trainingId) }
+    catch (e) { onError(String(e)) }
+  }
+
   return (
     <>
-      <div className={`status ${run.running ? '' : 'success'}`}>
+      <div className={`status ${run.running ? '' : (run.finalStatus === 'aborted' ? 'error' : 'success')}`}>
         {run.running
           ? `Training… epoch ${run.epoch} / ${run.totalEpochs}`
-          : `Done — ${run.totalEpochs} epochs in ${run.elapsedSecs.toFixed(1)}s`}
+          : run.finalStatus === 'aborted'
+            ? `Aborted — model rolled back to pre-training weights (${run.elapsedSecs.toFixed(1)}s)`
+            : run.finalStatus === 'cancelled'
+              ? `Stopped at epoch ${run.epoch} — kept current weights (${run.elapsedSecs.toFixed(1)}s)`
+              : `Done — ${run.totalEpochs} epochs in ${run.elapsedSecs.toFixed(1)}s`}
       </div>
 
       <div className="card">
@@ -207,6 +238,27 @@ function RunView({ run, onReset }: { run: RunState; onReset: () => void }) {
           <Metric label="Time"  value={`${run.elapsedSecs.toFixed(1)}s`} />
         </div>
         <ProgressBar epoch={run.epoch} total={run.totalEpochs} />
+
+        {run.running && (
+          <div className="flex mt-2">
+            <button
+              className="secondary"
+              onClick={onStopHere}
+              disabled={stopping !== null}
+              title="Halt training and keep whatever the model has learned so far."
+            >
+              {stopping === 'stop' ? 'Stopping…' : 'Stop here'}
+            </button>
+            <button
+              className="danger"
+              onClick={onAbort}
+              disabled={stopping !== null}
+              title="Halt training AND revert the model to its pre-training weights."
+            >
+              {stopping === 'abort' ? 'Aborting…' : 'Abort'}
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="plot">

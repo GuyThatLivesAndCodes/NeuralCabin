@@ -99,6 +99,11 @@ function FeedforwardInference({ network, onError }: {
 
 // ─── Next-token inference (streaming) ───────────────────────────────────────
 
+// UNK_ID — matches `tokenizer::UNK_ID` in the engine. The backend silently
+// emits this for any character/word that isn't in the trained vocabulary, so
+// we have to detect it explicitly in the frontend to fail fast.
+const UNK_ID = 1
+
 function NextTokenInference({ network, onError }: {
   network: Network; onError: (e: string | null) => void
 }) {
@@ -109,47 +114,78 @@ function NextTokenInference({ network, onError }: {
   const [tokens, setTokens] = useState<InferenceToken[]>([])
   const [busy, setBusy] = useState(false)
   const [inferenceId, setInferenceId] = useState<string | null>(null)
-  const cleanupRef = useRef<UnlistenFn[]>([])
-
-  useEffect(() => { setGenerated(''); setTokens([]); setInferenceId(null) }, [network.id])
+  // Refs let the event listeners read the latest values without forcing a
+  // re-subscribe on every state change. Critical for the race fix: listeners
+  // are attached ONCE on mount, before the user can click Generate.
+  const activeIdRef = useRef<string | null>(null)
+  const busyRef = useRef(false)
 
   useEffect(() => {
-    if (!inferenceId) return
+    setGenerated(''); setTokens([]); setInferenceId(null)
+    activeIdRef.current = null
+    busyRef.current = false
+    setBusy(false)
+  }, [network.id])
+
+  // Attach listeners ONCE per network. Previously these were keyed on
+  // `inferenceId`, so they only got registered AFTER `inference.run()`
+  // returned — by which point the backend had already emitted events
+  // (sometimes including `inference_finished`), and we missed them. Missing
+  // `inference_finished` is exactly what made the Generate button stay
+  // grayed out forever.
+  useEffect(() => {
     let cancelled = false
+    const cleanups: UnlistenFn[] = []
     const setup = async () => {
       const u1 = await inference.onToken(t => {
-        if (cancelled || t.inference_id !== inferenceId) return
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && t.inference_id !== activeIdRef.current) return
         setTokens(prev => [...prev, t])
         setGenerated(prev => prev + t.token)
       })
       const u2 = await inference.onFinished(r => {
-        if (cancelled || r.inference_id !== inferenceId) return
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && r.inference_id !== activeIdRef.current) return
+        busyRef.current = false
+        activeIdRef.current = null
         setBusy(false)
         setInferenceId(null)
       })
       const u3 = await inference.onError(err => {
-        if (cancelled || err.inference_id !== inferenceId) return
-        onError(err.message); setBusy(false)
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && err.inference_id !== activeIdRef.current) return
+        onError(err.message)
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
         setInferenceId(null)
       })
-      cleanupRef.current = [u1, u2, u3]
+      if (cancelled) { u1(); u2(); u3(); return }
+      cleanups.push(u1, u2, u3)
     }
     void setup()
-    return () => { cancelled = true; cleanupRef.current.forEach(c => c()) }
-  }, [inferenceId])
+    return () => { cancelled = true; cleanups.forEach(c => c()) }
+  }, [network.id])
 
   const run = async () => {
-    onError(null); setBusy(true); setGenerated(''); setTokens([])
+    onError(null)
+    setGenerated(''); setTokens([])
+    // Mark busy BEFORE awaiting anything so the always-on listeners will
+    // accept the events that follow.
+    busyRef.current = true
+    activeIdRef.current = null
+    setBusy(true)
     try {
       if (prompt) {
-        try {
-          await vocabulary.tokenize(network.id, prompt)
-        } catch (e) {
-          const msg = String(e)
-          if (msg.includes('not in vocabulary') || msg.includes('out of vocabulary')) {
-            throw new Error(`Prompt contains tokens not in the trained vocabulary: ${msg}`)
-          }
-          throw e
+        const toks = await vocabulary.tokenize(network.id, prompt)
+        const unknown = toks.filter(([id]) => id === UNK_ID)
+        if (unknown.length > 0) {
+          const sample = unknown.slice(0, 5).map(([, s]) => JSON.stringify(s)).join(', ')
+          throw new Error(
+            `Prompt contains ${unknown.length} token(s) not in the trained vocabulary` +
+            ` (e.g. ${sample}). Train on text that includes these characters first,` +
+            ` or remove them from the prompt.`
+          )
         }
       }
       const r = await inference.run({
@@ -158,17 +194,48 @@ function NextTokenInference({ network, onError }: {
         max_new_tokens: maxNewTokens,
         temperature,
       })
-      setInferenceId(r.inference_id ?? null)
-    } catch (e) { onError(String(e)); setBusy(false) }
+      const id = r.inference_id ?? null
+      activeIdRef.current = id
+      setInferenceId(id)
+      if (!id) {
+        // Synchronous result (shouldn't happen for next-token, but bail safely
+        // rather than leaving the button stuck on "Generating…").
+        busyRef.current = false
+        setBusy(false)
+      }
+    } catch (e) {
+      busyRef.current = false
+      activeIdRef.current = null
+      setBusy(false)
+      onError(String(e))
+    }
   }
 
   const stop = async () => {
-    if (!inferenceId) return
+    const id = activeIdRef.current ?? inferenceId
+    if (!id) {
+      // No active inference but the UI is stuck — unstick it locally.
+      busyRef.current = false
+      setBusy(false)
+      setInferenceId(null)
+      return
+    }
     try {
-      await inference.stop(inferenceId)
+      await inference.stop(id)
     } catch (e) {
       onError(String(e))
     }
+    // Belt-and-braces: if the backend never emits `inference_finished` within
+    // 2 seconds of a stop, force the UI back to an idle state so the Generate
+    // button is usable again.
+    setTimeout(() => {
+      if (busyRef.current && activeIdRef.current === id) {
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      }
+    }, 2000)
   }
 
   return (

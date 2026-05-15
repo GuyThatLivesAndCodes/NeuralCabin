@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::Utc;
-use neuralcabin_engine::nn::{LayerSpec, Model};
+use neuralcabin_engine::nn::{Layer, LayerSpec, Model};
 use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
 use neuralcabin_engine::tensor::{SplitMix64, Tensor};
 use neuralcabin_engine::tokenizer::{
@@ -565,6 +565,18 @@ async fn rebuild_next_token_model(
     full.push(LayerDef::Linear { in_dim: pre_output_dim, out_dim: vocab_size });
 
     let (specs, output_dim) = build_layer_specs(&full, input_dim)?;
+
+    // CRITICAL: if a model already exists with matching architecture, keep its
+    // weights. Re-building unconditionally on every set_corpus call wipes out
+    // trained weights — the user's report ("training disappears after I save
+    // the corpus / reopen the app") was exactly this bug.
+    if let Some(existing) = state.models.read().await.get(&net.id).cloned() {
+        let m = existing.read().await;
+        if m.input_dim == input_dim && layers_match_specs(&m.layers, &specs) {
+            return Ok(());
+        }
+    }
+
     let model = Model::from_specs(input_dim, &specs, net.seed);
     let parameter_count = model.parameter_count();
 
@@ -578,6 +590,25 @@ async fn rebuild_next_token_model(
         n.trained = false; // dimensions changed; weights are fresh
     }
     Ok(())
+}
+
+/// Return true iff every existing layer matches the corresponding spec in shape
+/// and activation kind. Used by `rebuild_next_token_model` to avoid clobbering
+/// trained weights when nothing about the architecture has changed.
+fn layers_match_specs(layers: &[Layer], specs: &[LayerSpec]) -> bool {
+    if layers.len() != specs.len() { return false; }
+    for (l, s) in layers.iter().zip(specs.iter()) {
+        match (l, s) {
+            (Layer::Linear(ll), LayerSpec::Linear { in_dim, out_dim }) => {
+                if ll.in_dim != *in_dim || ll.out_dim != *out_dim { return false; }
+            }
+            (Layer::Activation(a1), LayerSpec::Activation(a2)) => {
+                if a1 != a2 { return false; }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// First Linear's in_dim in the chain, if any.
@@ -1199,5 +1230,77 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neuralcabin_engine::tensor::SplitMix64;
+
+    #[test]
+    fn layers_match_specs_accepts_identical_architectures() {
+        let mut rng = SplitMix64::new(1);
+        let layers = vec![
+            Layer::Linear(neuralcabin_engine::nn::LinearLayer::new(4, 8, &mut rng)),
+            Layer::Activation(Activation::ReLU),
+            Layer::Linear(neuralcabin_engine::nn::LinearLayer::new(8, 2, &mut rng)),
+        ];
+        let specs = vec![
+            LayerSpec::Linear { in_dim: 4, out_dim: 8 },
+            LayerSpec::Activation(Activation::ReLU),
+            LayerSpec::Linear { in_dim: 8, out_dim: 2 },
+        ];
+        assert!(layers_match_specs(&layers, &specs));
+    }
+
+    #[test]
+    fn layers_match_specs_rejects_dim_change() {
+        let mut rng = SplitMix64::new(1);
+        let layers = vec![
+            Layer::Linear(neuralcabin_engine::nn::LinearLayer::new(4, 8, &mut rng)),
+        ];
+        // Different in_dim — must rebuild (e.g. vocab size grew).
+        let specs = vec![LayerSpec::Linear { in_dim: 5, out_dim: 8 }];
+        assert!(!layers_match_specs(&layers, &specs));
+    }
+
+    #[test]
+    fn layers_match_specs_rejects_activation_change() {
+        let layers = vec![Layer::Activation(Activation::ReLU)];
+        let specs = vec![LayerSpec::Activation(Activation::Sigmoid)];
+        assert!(!layers_match_specs(&layers, &specs));
+    }
+
+    #[test]
+    fn layers_match_specs_rejects_length_change() {
+        let mut rng = SplitMix64::new(1);
+        let layers = vec![
+            Layer::Linear(neuralcabin_engine::nn::LinearLayer::new(4, 8, &mut rng)),
+        ];
+        let specs = vec![
+            LayerSpec::Linear { in_dim: 4, out_dim: 8 },
+            LayerSpec::Activation(Activation::ReLU),
+        ];
+        assert!(!layers_match_specs(&layers, &specs));
+    }
+
+    /// Regression test for the "training disappears after saving the corpus"
+    /// bug. The key invariant: when the architecture is unchanged, the helper
+    /// must report a match so the caller skips rebuilding (and thus preserves
+    /// trained weights).
+    #[test]
+    fn matching_architectures_preserve_existing_model() {
+        // Build a model the way `rebuild_next_token_model` would.
+        let specs = vec![
+            LayerSpec::Linear { in_dim: 16, out_dim: 8 },
+            LayerSpec::Activation(Activation::ReLU),
+            LayerSpec::Linear { in_dim: 8, out_dim: 4 },
+        ];
+        let model = Model::from_specs(16, &specs, 42);
+
+        // Pretend the user re-saves the corpus — same vocab size, same hidden
+        // chain. The helper must say "matches" so the model is kept.
+        assert!(layers_match_specs(&model.layers, &specs));
+    }
 }
 

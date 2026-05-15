@@ -62,6 +62,14 @@ jobs:
       - name: Generate Tauri icons
         run: npx tauri icon assets/icon.png
 
+      # Run the Tauri-crate unit tests (persistence roundtrip, etc.). Skipped
+      # on platforms where the engine-tests job already covers the same code
+      # path is NOT what we want — these tests live in the neuralcabin crate
+      # and depend on tauri's runtime, so they only compile after the system
+      # dependencies above are installed.
+      - name: Test Tauri crate
+        run: cargo test --package neuralcabin --lib --no-fail-fast
+
       - name: Build frontend
         run: npm --prefix frontend run build
 

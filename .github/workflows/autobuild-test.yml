@@ -65,9 +65,11 @@ jobs:
       - name: Build frontend
         run: npm --prefix frontend run build
 
-      # Build the Tauri binary (no installer bundle needed for CI checks)
+      # Build the Tauri app via the Tauri CLI so the frontend assets are
+      # bundled into the binary. Plain `cargo build` produces a binary that
+      # falls back to devUrl (localhost) at runtime — broken for end users.
       - name: Build Tauri app
-        run: cargo build --package neuralcabin --release
+        run: npm run tauri -- build --no-bundle
 
       - name: Upload binary (Linux)
         if: runner.os == 'Linux'

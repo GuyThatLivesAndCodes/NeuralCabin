@@ -1,12 +1,14 @@
 mod models;
+mod persistence;
 
 use models::*;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::Utc;
 use neuralcabin_engine::nn::{LayerSpec, Model};
@@ -25,18 +27,21 @@ use neuralcabin_engine::{Activation, Loss};
 // ─── State ──────────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    networks:  Arc<RwLock<HashMap<String, Network>>>,
-    models:    Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
-    vocabs:    Arc<RwLock<HashMap<String, VocabEntry>>>,
-    corpora:   Arc<RwLock<HashMap<String, Corpus>>>,
-    trainers:  Arc<RwLock<HashMap<String, TrainerHandle>>>,
-    inferrers: Arc<RwLock<HashMap<String, InferenceHandle>>>,
+    pub(crate) networks:  Arc<RwLock<HashMap<String, Network>>>,
+    pub(crate) models:    Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
+    pub(crate) vocabs:    Arc<RwLock<HashMap<String, VocabEntry>>>,
+    pub(crate) corpora:   Arc<RwLock<HashMap<String, Corpus>>>,
+    pub(crate) trainers:  Arc<RwLock<HashMap<String, TrainerHandle>>>,
+    pub(crate) inferrers: Arc<RwLock<HashMap<String, InferenceHandle>>>,
+    /// Where to write `state.json`. None disables persistence — used by unit
+    /// tests that don't go through the Tauri setup hook.
+    pub(crate) data_dir:  Arc<RwLock<Option<PathBuf>>>,
 }
 
 #[derive(Clone)]
-struct VocabEntry {
-    vocab: Arc<RwLock<Vocabulary>>,
-    info:  VocabularyInfo,
+pub(crate) struct VocabEntry {
+    pub(crate) vocab: Arc<RwLock<Vocabulary>>,
+    pub(crate) info: VocabularyInfo,
 }
 
 #[derive(Clone)]
@@ -51,7 +56,7 @@ struct InferenceHandle {
 }
 
 impl AppState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             networks:  Arc::new(RwLock::new(HashMap::new())),
             models:    Arc::new(RwLock::new(HashMap::new())),
@@ -59,8 +64,17 @@ impl AppState {
             corpora:   Arc::new(RwLock::new(HashMap::new())),
             trainers:  Arc::new(RwLock::new(HashMap::new())),
             inferrers: Arc::new(RwLock::new(HashMap::new())),
+            data_dir:  Arc::new(RwLock::new(None)),
         }
     }
+}
+
+/// Save the current state to disk. Most command handlers call this after a
+/// mutation. Errors are returned to the caller so the UI can surface them —
+/// silent persistence failures are how data gets lost.
+async fn persist(state: &AppState) -> Result<(), String> {
+    let Some(dir) = state.data_dir.read().await.clone() else { return Ok(()); };
+    persistence::save_to_dir(state, &dir).await
 }
 
 // ─── Parsing helpers ────────────────────────────────────────────────────────
@@ -207,6 +221,7 @@ async fn create_network(
     };
 
     state.networks.write().await.insert(id, network.clone());
+    persist(&state).await?;
     Ok(network)
 }
 
@@ -225,7 +240,9 @@ async fn delete_network(state: State<'_, AppState>, id: String) -> Result<bool, 
     state.models.write().await.remove(&id);
     state.vocabs.write().await.remove(&id);
     state.corpora.write().await.remove(&id);
-    Ok(state.networks.write().await.remove(&id).is_some())
+    let removed = state.networks.write().await.remove(&id).is_some();
+    persist(&state).await?;
+    Ok(removed)
 }
 
 // ─── Corpus commands ────────────────────────────────────────────────────────
@@ -305,6 +322,7 @@ async fn set_corpus(
         &*state.vocabs.read().await,
         &*state.models.read().await,
     ).await;
+    persist(&state).await?;
     Ok(stats)
 }
 
@@ -496,6 +514,7 @@ async fn finalize_vocab(
 
     // Materialize the model: input = vocab × context, hidden chain, output = vocab.
     rebuild_next_token_model(&state, &net, vocab.size()).await?;
+    persist(&state).await?;
     Ok(info)
 }
 
@@ -841,6 +860,12 @@ async fn run_training_loop(
     if let Some(net) = networks_handle.write().await.get_mut(&network_id) {
         net.trained = true;
     }
+    // Persist the freshly-trained weights and the `trained = true` flag. We
+    // pull AppState off the AppHandle since the training loop runs on a
+    // detached task and doesn't carry the State<'_, AppState> guard.
+    if let Some(app_state) = app.try_state::<AppState>() {
+        persistence::save_best_effort(app_state.inner()).await;
+    }
     let _ = app.emit("training_finished", TrainingFinished {
         training_id,
         status: "completed".into(),
@@ -1041,8 +1066,37 @@ fn sample_with_temperature(probs: &[f32], temperature: f32, rng: &mut SplitMix64
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let state = AppState::new();
     tauri::Builder::default()
-        .manage(AppState::new())
+        .manage(state)
+        .setup(|app| {
+            // Resolve the per-user data directory and load any saved workspace
+            // synchronously before the frontend can issue its first command —
+            // otherwise `list_networks` would briefly return an empty list and
+            // a fast user could overwrite an existing save.
+            let data_dir = app.path().app_data_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("neuralcabin"));
+            let state: State<'_, AppState> = app.state();
+            let app_state: &AppState = state.inner();
+            tauri::async_runtime::block_on(async {
+                *app_state.data_dir.write().await = Some(data_dir.clone());
+                match persistence::load_from_dir(&data_dir).await {
+                    Ok(Some(persisted)) => {
+                        persistence::apply(app_state, persisted).await;
+                        eprintln!("[neuralcabin] loaded state from {}", data_dir.display());
+                    }
+                    Ok(None) => {
+                        eprintln!("[neuralcabin] no saved state at {} — starting fresh", data_dir.display());
+                    }
+                    Err(e) => {
+                        // Corrupt file: surface loudly. We don't delete it so
+                        // the user can recover by editing or removing it.
+                        eprintln!("[neuralcabin] ERROR loading state from {}: {e}", data_dir.display());
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             create_network, list_networks, get_network, delete_network,
             set_corpus, get_corpus, corpus_stats,

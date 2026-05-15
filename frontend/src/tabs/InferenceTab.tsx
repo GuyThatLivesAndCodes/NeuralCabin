@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { type UnlistenFn } from '@tauri-apps/api/event'
-import { inference, Network, InferenceToken } from '../api'
+import { inference, vocabulary, Network, InferenceToken } from '../api'
 import type { TabProps } from '../App'
 
 export default function InferenceTab({ network }: TabProps) {
@@ -125,10 +125,12 @@ function NextTokenInference({ network, onError }: {
       const u2 = await inference.onFinished(r => {
         if (cancelled || r.inference_id !== inferenceId) return
         setBusy(false)
+        setInferenceId(null)
       })
       const u3 = await inference.onError(err => {
         if (cancelled || err.inference_id !== inferenceId) return
         onError(err.message); setBusy(false)
+        setInferenceId(null)
       })
       cleanupRef.current = [u1, u2, u3]
     }
@@ -139,6 +141,17 @@ function NextTokenInference({ network, onError }: {
   const run = async () => {
     onError(null); setBusy(true); setGenerated(''); setTokens([])
     try {
+      if (prompt) {
+        try {
+          await vocabulary.tokenize(network.id, prompt)
+        } catch (e) {
+          const msg = String(e)
+          if (msg.includes('not in vocabulary') || msg.includes('out of vocabulary')) {
+            throw new Error(`Prompt contains tokens not in the trained vocabulary: ${msg}`)
+          }
+          throw e
+        }
+      }
       const r = await inference.run({
         network_id: network.id,
         prompt,
@@ -147,6 +160,15 @@ function NextTokenInference({ network, onError }: {
       })
       setInferenceId(r.inference_id ?? null)
     } catch (e) { onError(String(e)); setBusy(false) }
+  }
+
+  const stop = async () => {
+    if (!inferenceId) return
+    try {
+      await inference.stop(inferenceId)
+    } catch (e) {
+      onError(String(e))
+    }
   }
 
   return (
@@ -174,6 +196,11 @@ function NextTokenInference({ network, onError }: {
         </div>
         <div className="flex mt-2">
           <button onClick={run} disabled={busy}>{busy ? 'Generating…' : 'Generate'}</button>
+          {busy && (
+            <button className="secondary" onClick={stop}>
+              Stop
+            </button>
+          )}
         </div>
       </div>
 

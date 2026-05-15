@@ -260,8 +260,51 @@ async fn set_corpus(
         return Err(format!("unsupported network kind '{}'", net.kind));
     }
 
-    let stats = compute_stats(&net, &corpus, &*state.vocabs.read().await, &*state.models.read().await).await;
-    state.corpora.write().await.insert(net.id, corpus);
+    // Persist the corpus first so subsequent operations see it.
+    state.corpora.write().await.insert(net.id.clone(), corpus.clone());
+
+    // For next-token networks, auto-build the vocabulary from the new corpus so
+    // the user doesn't have to do it manually. Without this, training would
+    // immediately fail with "no vocabulary" after saving a corpus.
+    if net.kind == kinds::NEXT_TOKEN {
+        let mode_name = req.vocab_mode.as_deref().unwrap_or("char");
+        if let Ok(mode) = parse_tokenizer_mode(mode_name) {
+            if !matches!(mode, TokenizerMode::Advanced) {
+                let mut texts: Vec<String> = Vec::new();
+                if let Some(t) = &corpus.text { texts.push(t.clone()); }
+                if let Some(ps) = &corpus.pairs {
+                    for p in ps { texts.push(p.input.clone()); texts.push(p.output.clone()); }
+                }
+                if !texts.is_empty() {
+                    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                    let opts = EngineVocabularyOptions::default();
+                    let vocab = Vocabulary::build(mode, &refs, &opts);
+                    let vocab_size = vocab.size();
+                    let info = VocabularyInfo {
+                        mode: mode_str(mode),
+                        tokens: vocab.tokens.clone(),
+                        options: VocabularyOptions::default(),
+                        updated_at: Utc::now(),
+                    };
+                    let entry = VocabEntry {
+                        vocab: Arc::new(RwLock::new(vocab)),
+                        info,
+                    };
+                    state.vocabs.write().await.insert(net.id.clone(), entry);
+                    rebuild_next_token_model(&state, &net, vocab_size).await?;
+                }
+            }
+        }
+    }
+
+    // Recompute stats AFTER any vocab/model rebuild so the response reflects them.
+    let net_after = state.networks.read().await.get(&req.network_id).cloned().unwrap_or(net);
+    let stats = compute_stats(
+        &net_after,
+        &corpus,
+        &*state.vocabs.read().await,
+        &*state.models.read().await,
+    ).await;
     Ok(stats)
 }
 

@@ -60,6 +60,7 @@ export interface SetCorpusRequest {
   text?: string
   pairs?: FineTunePair[]
   stage?: Stage
+  vocab_mode?: 'char' | 'word'
 }
 
 export interface Corpus {

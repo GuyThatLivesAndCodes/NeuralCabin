@@ -132,6 +132,7 @@ pub struct SetCorpusRequest {
     #[serde(default)] pub text: Option<String>,
     #[serde(default)] pub pairs: Option<Vec<FineTunePair>>,
     #[serde(default)] pub stage: Option<String>,
+    #[serde(default)] pub vocab_mode: Option<String>, // "char" | "word"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

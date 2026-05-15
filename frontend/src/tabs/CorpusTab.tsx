@@ -99,6 +99,20 @@ function FeedforwardCorpusEditor({ network, onSaved, onError }: {
   const [csv, setCsv] = useState<string>('')
   const [busy, setBusy] = useState(false)
 
+  // Hydrate from saved corpus when the network changes.
+  useEffect(() => {
+    let cancelled = false
+    void corpus.get(network.id).then(c => {
+      if (cancelled) return
+      if (c?.feedforward) {
+        setCsv(serializeFeedforward(c.feedforward))
+      } else {
+        setCsv('')
+      }
+    }).catch(() => { if (!cancelled) setCsv('') })
+    return () => { cancelled = true }
+  }, [network.id])
+
   const parsed = useMemo(() => parseCsvFeedforward(csv, network.input_dim, network.output_dim), [csv, network])
 
   const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -171,6 +185,17 @@ function FeedforwardCorpusEditor({ network, onSaved, onError }: {
   )
 }
 
+function serializeFeedforward(ff: FeedforwardCorpus): string {
+  const lines: string[] = []
+  for (let r = 0; r < ff.rows; r++) {
+    const row: number[] = []
+    for (let i = 0; i < ff.in_dim; i++) row.push(ff.features[r * ff.in_dim + i])
+    for (let o = 0; o < ff.out_dim; o++) row.push(ff.targets[r * ff.out_dim + o])
+    lines.push(row.join(','))
+  }
+  return lines.join('\n')
+}
+
 function parseCsvFeedforward(csv: string, inDim: number, outDim: number): {
   corpus: FeedforwardCorpus | null; error?: string
 } {
@@ -211,11 +236,26 @@ function NextTokenCorpusEditor({ network, stats, onSaved, onError }: {
   const [pairs, setPairs] = useState<FineTunePair[]>([{ input: '', output: '' }])
   const [busy, setBusy] = useState(false)
 
-  // Reload defaults from existing stats when network changes
+  // Hydrate from saved corpus when the network changes. Without this, switching
+  // tabs and coming back clears the editor even though the backend still has
+  // the data — looks like "save lost everything".
   useEffect(() => {
-    setStage(stats?.stage ?? 'pretrain')
-    setVocabMode((stats?.vocab_mode === 'word' ? 'word' : 'char'))
-  }, [network.id, stats?.stage, stats?.vocab_mode])
+    let cancelled = false
+    void corpus.get(network.id).then(c => {
+      if (cancelled) return
+      setText(c?.text ?? '')
+      setPairs(c?.pairs && c.pairs.length > 0 ? c.pairs : [{ input: '', output: '' }])
+      if (c?.stage) setStage(c.stage)
+    }).catch(() => {/* leave defaults */})
+    return () => { cancelled = true }
+  }, [network.id])
+
+  // Pick up vocab_mode from stats when it becomes known.
+  useEffect(() => {
+    if (stats?.vocab_mode === 'word' || stats?.vocab_mode === 'char') {
+      setVocabMode(stats.vocab_mode)
+    }
+  }, [stats?.vocab_mode])
 
   // ─── Pretrain: bulk file upload ───
   const onUploadText = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -267,11 +307,13 @@ function NextTokenCorpusEditor({ network, stats, onSaved, onError }: {
           ? {
               network_id: network.id,
               stage: 'pretrain' as const,
+              vocab_mode: vocabMode,
               text: text.trim().length > 0 ? text : undefined,
             }
           : {
               network_id: network.id,
               stage: 'finetune' as const,
+              vocab_mode: vocabMode,
               pairs: pairs.filter(p => p.input.length > 0 || p.output.length > 0),
             }
       if (stage === 'pretrain' && !payload.text) { onError('Pretraining requires non-empty text.'); return }

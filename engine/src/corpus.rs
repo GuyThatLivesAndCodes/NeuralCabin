@@ -93,7 +93,7 @@ pub fn build_finetuning_tensors(
             // Build context: last `context_size` tokens up to and including `i`,
             // left-padded with PAD if shorter.
             let mut window = vec![0.0_f32; context_size * v];
-            let start = if i + 1 > context_size { i + 1 - context_size } else { 0 };
+            let start = (i + 1).saturating_sub(context_size);
             let prefix_len = (i + 1) - start;
             let pad_len = context_size - prefix_len;
             for p in 0..pad_len {
@@ -129,7 +129,7 @@ pub fn build_finetuning_tensors(
 pub fn encode_context(ids: &[u32], vocab: &Vocabulary, context_size: usize) -> Tensor {
     let v = vocab.size();
     let mut window = vec![0.0_f32; context_size * v];
-    let start = if ids.len() > context_size { ids.len() - context_size } else { 0 };
+    let start = ids.len().saturating_sub(context_size);
     let prefix_len = ids.len() - start;
     let pad_len = context_size - prefix_len;
     for p in 0..pad_len {

@@ -10,6 +10,8 @@ pub mod optimizer;
 pub mod nn;
 pub mod data;
 pub mod persistence;
+pub mod tokenizer;
+pub mod corpus;
 
 pub use activations::Activation;
 pub use autograd::{Tape, Value};
@@ -17,3 +19,4 @@ pub use loss::Loss;
 pub use nn::{Layer, LayerSpec, Model};
 pub use optimizer::{Optimizer, OptimizerKind};
 pub use tensor::Tensor;
+pub use tokenizer::{TokenizerMode, Vocabulary};

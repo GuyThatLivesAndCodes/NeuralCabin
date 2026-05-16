@@ -67,7 +67,7 @@ pub struct TransformerModel {
 
 impl TransformerModel {
     pub fn new(config: TransformerConfig, seed: u64) -> Self {
-        assert!(config.n_embd % config.n_heads == 0,
+        assert!(config.n_embd.is_multiple_of(config.n_heads),
             "n_embd must be divisible by n_heads (got {} / {})", config.n_embd, config.n_heads);
         let mut rng = SplitMix64::new(seed);
         let n_embd = config.n_embd;

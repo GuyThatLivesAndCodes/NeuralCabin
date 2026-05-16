@@ -116,6 +116,7 @@ fn downsample_history(history: &[f32], max_points: usize) -> Vec<f32> {
     }).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_training_run_record(
     id: &str,
     network_id: &str,
@@ -291,14 +292,14 @@ fn validate_transformer_hparams(hp: &TransformerHParams) -> Result<(), String> {
     if hp.n_layers == 0 { return Err("transformer n_layers must be > 0".into()); }
     if hp.n_heads == 0  { return Err("transformer n_heads must be > 0".into()); }
     if hp.n_ff == 0     { return Err("transformer n_ff must be > 0".into()); }
-    if hp.n_embd % hp.n_heads != 0 {
+    if !hp.n_embd.is_multiple_of(hp.n_heads) {
         return Err(format!(
             "transformer n_embd ({}) must be divisible by n_heads ({})",
             hp.n_embd, hp.n_heads
         ));
     }
     let head_dim = hp.n_embd / hp.n_heads;
-    if head_dim % 2 != 0 {
+    if !head_dim.is_multiple_of(2) {
         return Err(format!(
             "transformer head_dim (n_embd/n_heads = {head_dim}) must be even for RoPE"
         ));
@@ -575,7 +576,7 @@ pub(crate) async fn infer_sync(
         let vocab = entry.vocab.read().await.clone();
         let model = model_arc.read().await;
         let prompt = req.prompt.unwrap_or_default();
-        let max_new = req.max_new_tokens.unwrap_or(64).min(4096).max(1);
+        let max_new = req.max_new_tokens.unwrap_or(64).clamp(1, 4096);
         let temperature = req.temperature.unwrap_or(0.0).max(0.0);
 
         let mut ids: Vec<u32> = vocab.encode(&prompt);
@@ -1136,11 +1137,12 @@ async fn start_transformer_training(
 /// Turn the corpus into a flat list of `(input[n_ctx], target[n_ctx])`
 /// sequences. We use the same vocab/tokenization the MLP next-token path
 /// uses, so users can switch architectures without rebuilding the corpus.
+type TokenSequence = (Vec<u32>, Vec<u32>);
 fn build_transformer_sequences(
     corpus: &Corpus,
     vocab: &Vocabulary,
     n_ctx: usize,
-) -> Result<Vec<(Vec<u32>, Vec<u32>)>, String> {
+) -> Result<Vec<TokenSequence>, String> {
     use neuralcabin_engine::tokenizer::{ASSISTANT_ID, EOS_ID, USER_ID};
     let stage = corpus.stage.as_deref().unwrap_or("pretrain");
     let mut sequences = Vec::new();
@@ -1205,7 +1207,7 @@ async fn run_transformer_training_loop(
     started_at: DateTime<Utc>,
     model_arc: Arc<RwLock<TransformerModel>>,
     networks_handle: Arc<RwLock<HashMap<String, Network>>>,
-    sequences: Vec<(Vec<u32>, Vec<u32>)>,
+    sequences: Vec<TokenSequence>,
     n_ctx: usize,
     _n_embd: usize,
     opt_kind: neuralcabin_engine::optimizer::OptimizerKind,
@@ -1802,7 +1804,7 @@ async fn infer_transformer(
     let model_arc = get_or_load_transformer(state, &net).await?;
 
     let prompt = req.prompt.unwrap_or_default();
-    let max_new = req.max_new_tokens.unwrap_or(64).min(4096).max(1);
+    let max_new = req.max_new_tokens.unwrap_or(64).clamp(1, 4096);
     let temperature = req.temperature.unwrap_or(0.0).max(0.0);
     let chat_mode = state.corpora.read().await
         .get(&req.network_id)
@@ -1943,7 +1945,7 @@ async fn infer(
         Ok(InferResponse { output: Some(y.data), inference_id: None })
     } else if net.kind == kinds::NEXT_TOKEN {
         let prompt = req.prompt.unwrap_or_default();
-        let max_new = req.max_new_tokens.unwrap_or(64).min(4096).max(1);
+        let max_new = req.max_new_tokens.unwrap_or(64).clamp(1, 4096);
         let temperature = req.temperature.unwrap_or(0.0).max(0.0);
         let context_size = net.context_size
             .ok_or_else(|| "Next-token network missing context_size".to_string())?;

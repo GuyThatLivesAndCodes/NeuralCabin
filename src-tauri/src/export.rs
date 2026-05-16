@@ -1,17 +1,16 @@
-//! Model export to PyTorch (.pt), ONNX (.onnx), safetensors (.safetensors),
-//! and GGUF (.gguf).
+//! Model export to PyTorch (.pt), ONNX (.onnx), and GGUF (.gguf).
 //!
-//! All four formats are produced from a `neuralcabin_engine::nn::Model`'s
-//! linear weights + activations. We avoid pulling in PyTorch/ONNX runtimes
+//! All three formats are produced from a `neuralcabin_engine::nn::Model` or
+//! `TransformerModel`'s weights. We avoid pulling in PyTorch / ONNX runtimes
 //! as dependencies — each writer constructs the file-format bytes directly.
 //!
-//! Caveat on GGUF: the file is well-formed but uses architecture name
-//! `"neuralcabin"`, which llama.cpp / LM Studio do not know how to run.
-//! llama.cpp only accepts a fixed list of transformer architectures, each
-//! with a hardcoded tensor layout (token_embd + per-block QKV + ...) — our
-//! plain MLP has none of those. We keep the writer for completeness and
-//! custom tooling, but the UI hides it for next-token networks and
-//! recommends safetensors instead.
+//! GGUF has two flavours:
+//! - The MLP `Model` exporter (`export_gguf`) uses the architecture name
+//!   `"neuralcabin"`, which is a custom schema for our own tooling. It is
+//!   well-formed GGUF but llama.cpp / LM Studio don't know how to run it.
+//! - The `TransformerModel` exporter (`llama_gguf::export`) writes a real
+//!   `general.architecture = "llama"` file with the full llama tensor layout
+//!   so the result loads in llama.cpp / LM Studio directly.
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{Cursor, Write};
@@ -115,11 +114,11 @@ fn export_pytorch(_net: &Network, model: &Model) -> Result<Vec<u8>, String> {
                 w_t.push(w[c * out_dim + r]);
             }
         }
-        zw.start_file(&format!("archive/data/{w_idx}"), opts)
+        zw.start_file(format!("archive/data/{w_idx}").as_str(), opts)
             .map_err(|e| format!("zip w{i}: {e}"))?;
         write_f32_le(&mut zw, &w_t)?;
 
-        zw.start_file(&format!("archive/data/{b_idx}"), opts)
+        zw.start_file(format!("archive/data/{b_idx}").as_str(), opts)
             .map_err(|e| format!("zip b{i}: {e}"))?;
         write_f32_le(&mut zw, b)?;
     }
@@ -608,13 +607,13 @@ fn export_gguf(net: &Network, model: &Model) -> Result<Vec<u8>, String> {
     buf.extend_from_slice(&info_section);
 
     // Pad to ALIGN.
-    while (buf.len() as u64) % ALIGN != 0 { buf.push(0); }
+    while !(buf.len() as u64).is_multiple_of(ALIGN) { buf.push(0); }
     let data_start = buf.len() as u64;
 
     // Lay out tensor data with per-tensor alignment, compute offsets.
     let mut offsets: Vec<u64> = Vec::with_capacity(tensors.len());
     for t in &tensors {
-        while (buf.len() as u64 - data_start) % ALIGN != 0 { buf.push(0); }
+        while !(buf.len() as u64 - data_start).is_multiple_of(ALIGN) { buf.push(0); }
         offsets.push(buf.len() as u64 - data_start);
         for v in &t.data { buf.write_f32::<LittleEndian>(*v).unwrap(); }
     }
@@ -673,7 +672,7 @@ mod llama_gguf {
     ///   - llama.attention.head_count[_kv], rope.{freq_base, dimension_count}
     ///   - tokenizer.ggml.{model, tokens, scores, token_type, bos/eos/pad ids}
     ///   - per-block: blk.N.{attn_norm, attn_q, attn_k, attn_v, attn_output,
-    ///                      ffn_norm, ffn_gate, ffn_up, ffn_down}.weight
+    ///     ffn_norm, ffn_gate, ffn_up, ffn_down}.weight
     ///   - top-level: token_embd.weight, output_norm.weight, output.weight
     ///
     /// All weight matrices are written in (out, in) order — that's the
@@ -782,12 +781,12 @@ mod llama_gguf {
         buf.extend_from_slice(&info_section);
 
         // Align to ALIGN, then start tensor data.
-        while (buf.len() as u64) % ALIGN != 0 { buf.push(0); }
+        while !(buf.len() as u64).is_multiple_of(ALIGN) { buf.push(0); }
         let data_start = buf.len() as u64;
 
         let mut offsets: Vec<u64> = Vec::with_capacity(tensors.len());
         for t in &tensors {
-            while (buf.len() as u64 - data_start) % ALIGN != 0 { buf.push(0); }
+            while !(buf.len() as u64 - data_start).is_multiple_of(ALIGN) { buf.push(0); }
             offsets.push(buf.len() as u64 - data_start);
             for v in &t.data { buf.write_f32::<LittleEndian>(*v).unwrap(); }
         }
@@ -938,7 +937,7 @@ mod transformer_pytorch {
         zw.start_file("archive/data.pkl", opts).map_err(|e| format!("zip: {e}"))?;
         zw.write_all(&pickle).map_err(|e| format!("write: {e}"))?;
         for (i, m) in mats.iter().enumerate() {
-            zw.start_file(&format!("archive/data/{i}"), opts).map_err(|e| format!("zip: {e}"))?;
+            zw.start_file(format!("archive/data/{i}").as_str(), opts).map_err(|e| format!("zip: {e}"))?;
             for v in &m.data { zw.write_f32::<LittleEndian>(*v).map_err(|e| format!("write: {e}"))?; }
         }
         let cursor = zw.finish().map_err(|e| format!("zip finish: {e}"))?;

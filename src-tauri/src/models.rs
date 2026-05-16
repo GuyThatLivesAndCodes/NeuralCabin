@@ -241,6 +241,33 @@ pub struct TrainingError {
     pub message: String,
 }
 
+// ─── Training history ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingConfigSummary {
+    pub optimizer: String,
+    pub lr: f32,
+    pub batch_size: usize,
+    pub epochs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingRun {
+    pub id: String,
+    pub network_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    /// "completed" | "cancelled" | "aborted" | "error"
+    pub status: String,
+    pub config_summary: TrainingConfigSummary,
+    pub total_epochs: usize,
+    pub epochs_run: usize,
+    pub final_loss: f32,
+    pub elapsed_secs: f32,
+    /// Downsampled to ≤500 points so state.json stays compact.
+    pub loss_history: Vec<f32>,
+}
+
 // ─── Inference (streaming) ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

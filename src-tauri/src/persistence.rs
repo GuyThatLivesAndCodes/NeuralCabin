@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use neuralcabin_engine::nn::Model;
 use neuralcabin_engine::tokenizer::Vocabulary;
 
-use crate::models::{Corpus, Network, VocabularyInfo};
+use crate::models::{Corpus, Network, TrainingRun, VocabularyInfo};
 use crate::{AppState, VocabEntry};
 
 pub const STATE_FILENAME: &str = "state.json";
@@ -33,6 +33,9 @@ pub struct PersistedState {
     pub vocabs: HashMap<String, PersistedVocab>,
     #[serde(default)]
     pub models: HashMap<String, Model>,
+    /// Per-network training run history, keyed by network id.
+    #[serde(default)]
+    pub training_history: HashMap<String, Vec<TrainingRun>>,
 }
 
 impl Default for PersistedState {
@@ -43,6 +46,7 @@ impl Default for PersistedState {
             corpora: HashMap::new(),
             vocabs: HashMap::new(),
             models: HashMap::new(),
+            training_history: HashMap::new(),
         }
     }
 }
@@ -79,7 +83,9 @@ pub async fn snapshot(state: &AppState) -> PersistedState {
         }
     }
 
-    PersistedState { format_version: FORMAT_VERSION, networks, corpora, vocabs, models }
+    let training_history = state.training_history.read().await.clone();
+
+    PersistedState { format_version: FORMAT_VERSION, networks, corpora, vocabs, models, training_history }
 }
 
 /// Persist the full state to `<data_dir>/state.json`. The write is atomic:
@@ -148,6 +154,7 @@ pub async fn apply(state: &AppState, persisted: PersistedState) {
     for (k, m) in persisted.models {
         models.insert(k, Arc::new(RwLock::new(m)));
     }
+    *state.training_history.write().await = persisted.training_history;
 }
 
 /// Return the configured data directory, or None if persistence is disabled

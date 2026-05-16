@@ -737,14 +737,25 @@ mod llama_gguf {
         write_kv_u32(&mut meta, "general.file_type", 0); kv_count += 1;
         write_kv_u32(&mut meta, "general.quantization_version", 2); kv_count += 1;
 
-        // Tokenizer. We use the simplest "no_vocab" alternative isn't valid
-        // for chat — instead we declare model=llama and ship tokens as strings.
-        // llama.cpp's BPE/SPM tokenizer needs scores; we give every user-token
-        // a score of 0 and use type=USER_DEFINED (4) for everything. Special
-        // tokens get type=CONTROL (3) so they aren't substrings of generation.
+        // Tokenizer. We declare the SentencePiece-style "llama" tokenizer:
+        // - tokenizer.ggml.tokens / scores / token_type describe every vocab
+        //   entry. Our reserved (pad/unk/bos/eos/user/assistant) are CONTROL,
+        //   everything else is USER_DEFINED — llama.cpp's SPM tokenizer
+        //   matches USER_DEFINED tokens as literal substrings, which fits our
+        //   char/word/subword vocabulary perfectly.
+        // - `tokenizer.ggml.pre` is intentionally *not* written: it is the
+        //   BPE pretokenizer-regex hint and llama.cpp errors out on SPM
+        //   models that carry it.
+        // - The `add_*_token` and `add_space_prefix` bool flags must be set
+        //   explicitly; without them llama.cpp falls back to SPM defaults
+        //   (insert <s> prefix, prepend "▁"), which don't match how our
+        //   vocab was built and cause `tokenize` to throw on the first call.
+        // - A minimal chat template lets LM Studio's chat UI work on
+        //   fine-tuned networks.
         write_kv_string(&mut meta, "tokenizer.ggml.model", "llama"); kv_count += 1;
-        write_kv_string(&mut meta, "tokenizer.ggml.pre", "default"); kv_count += 1;
         write_kv_string_array(&mut meta, "tokenizer.ggml.tokens", tokens); kv_count += 1;
+        // SPM uses scores as Viterbi log-probabilities; 0.0 across the board
+        // collapses to "prefer longest match", which is exactly what we want.
         let scores: Vec<f32> = vec![0.0; tokens.len()];
         write_kv_f32_array(&mut meta, "tokenizer.ggml.scores", &scores); kv_count += 1;
         let token_types: Vec<i32> = tokens.iter().enumerate().map(|(i, _)| {
@@ -756,6 +767,17 @@ mod llama_gguf {
         write_kv_u32(&mut meta, "tokenizer.ggml.eos_token_id", neuralcabin_engine::tokenizer::EOS_ID); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.padding_token_id", neuralcabin_engine::tokenizer::PAD_ID); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.unknown_token_id", neuralcabin_engine::tokenizer::UNK_ID); kv_count += 1;
+        write_kv_bool(&mut meta, "tokenizer.ggml.add_bos_token",   false); kv_count += 1;
+        write_kv_bool(&mut meta, "tokenizer.ggml.add_eos_token",   false); kv_count += 1;
+        write_kv_bool(&mut meta, "tokenizer.ggml.add_space_prefix", false); kv_count += 1;
+        // Chat template (Jinja-style). When the network is fine-tuned we wrap
+        // turns in <user>/<assistant> markers; mirror that so LM Studio's chat
+        // surface produces well-formed prompts.
+        let chat_template = "{% for m in messages %}\
+            {% if m['role'] == 'user' %}<user>{{ m['content'] }}<eos><assistant>\
+            {% elif m['role'] == 'assistant' %}{{ m['content'] }}<eos>\
+            {% endif %}{% endfor %}";
+        write_kv_string(&mut meta, "tokenizer.chat_template", chat_template); kv_count += 1;
 
         // Assemble header.
         const ALIGN: u64 = 32;
@@ -828,9 +850,15 @@ mod llama_gguf {
     const TY_UINT32: u32 = 4;
     const TY_INT32:  u32 = 5;
     const TY_FLOAT32: u32 = 6;
+    const TY_BOOL:   u32 = 7;
     const TY_STRING: u32 = 8;
     const TY_ARRAY:  u32 = 9;
 
+    fn write_kv_bool(buf: &mut Vec<u8>, k: &str, v: bool) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_BOOL).unwrap();
+        buf.push(if v { 1 } else { 0 });
+    }
     fn write_kv_string(buf: &mut Vec<u8>, k: &str, v: &str) {
         write_string(buf, k);
         buf.write_u32::<LittleEndian>(TY_STRING).unwrap();

@@ -3,7 +3,17 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 // ─── Network ────────────────────────────────────────────────────────────────
 
-export type NetworkKind = 'feedforward' | 'next_token'
+export type NetworkKind = 'feedforward' | 'next_token' | 'transformer'
+
+export interface TransformerHParams {
+  n_ctx:     number
+  n_embd:    number
+  n_layers:  number
+  n_heads:   number
+  n_ff:      number
+  rope_theta: number
+  rms_eps:   number
+}
 export type Activation = 'identity' | 'relu' | 'sigmoid' | 'tanh' | 'softmax'
 
 export type Layer =
@@ -23,6 +33,7 @@ export interface Network {
   parameter_count: number
   hidden_layers?: Layer[] | null
   context_size?: number | null
+  transformer?: TransformerHParams | null
 }
 
 export interface CreateNetworkRequest {
@@ -32,6 +43,7 @@ export interface CreateNetworkRequest {
   layers: Layer[]
   input_dim?: number | null
   context_size?: number | null
+  transformer?: TransformerHParams | null
 }
 
 export const networks = {

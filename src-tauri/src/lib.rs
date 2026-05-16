@@ -15,6 +15,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use neuralcabin_engine::nn::{Layer, LayerSpec, Model};
+use neuralcabin_engine::transformer::{
+    TransformerConfig, TransformerModel,
+};
 use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
 use neuralcabin_engine::tensor::{SplitMix64, Tensor};
 use neuralcabin_engine::tokenizer::{
@@ -32,6 +35,7 @@ use neuralcabin_engine::{Activation, Loss};
 pub struct AppState {
     pub(crate) networks:         Arc<RwLock<HashMap<String, Network>>>,
     pub(crate) models:           Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
+    pub(crate) transformers:     Arc<RwLock<HashMap<String, Arc<RwLock<TransformerModel>>>>>,
     pub(crate) vocabs:           Arc<RwLock<HashMap<String, VocabEntry>>>,
     pub(crate) corpora:          Arc<RwLock<HashMap<String, Corpus>>>,
     pub(crate) trainers:         Arc<RwLock<HashMap<String, TrainerHandle>>>,
@@ -68,6 +72,7 @@ impl AppState {
         Self {
             networks:         Arc::new(RwLock::new(HashMap::new())),
             models:           Arc::new(RwLock::new(HashMap::new())),
+            transformers:     Arc::new(RwLock::new(HashMap::new())),
             vocabs:           Arc::new(RwLock::new(HashMap::new())),
             corpora:          Arc::new(RwLock::new(HashMap::new())),
             trainers:         Arc::new(RwLock::new(HashMap::new())),
@@ -192,6 +197,28 @@ async fn get_or_load_model(
     }
 }
 
+/// Same as `get_or_load_model` for the transformer kind.
+async fn get_or_load_transformer(
+    state: &AppState,
+    net: &Network,
+) -> Result<Arc<RwLock<TransformerModel>>, String> {
+    if let Some(m) = state.transformers.read().await.get(&net.id).cloned() {
+        return Ok(m);
+    }
+    let Some(data_dir) = persistence::data_dir(state).await else {
+        return Err("Transformer model not loaded — build vocabulary by saving a corpus first.".into());
+    };
+    match persistence::load_transformer(&net.id, &data_dir).await {
+        Ok(Some(model)) => {
+            let arc = Arc::new(RwLock::new(model));
+            state.transformers.write().await.insert(net.id.clone(), arc.clone());
+            Ok(arc)
+        }
+        Ok(None) => Err("Transformer model not loaded — build vocabulary by saving a corpus first.".into()),
+        Err(e)   => Err(format!("failed to load transformer: {e}")),
+    }
+}
+
 // ─── Parsing helpers ────────────────────────────────────────────────────────
 
 fn parse_activation(name: &str) -> Result<Activation, String> {
@@ -256,6 +283,75 @@ fn build_optimizer(cfg: &OptimizerConfig, _shapes: &[Vec<usize>]) -> Result<Opti
     // With the Burn migration, the `Optimizer` type alias is just the kind/config.
     // Burn builds the per-step optimizer instance inside `train_step` itself.
     Ok(kind)
+}
+
+fn validate_transformer_hparams(hp: &TransformerHParams) -> Result<(), String> {
+    if hp.n_ctx == 0    { return Err("transformer n_ctx must be > 0".into()); }
+    if hp.n_embd == 0   { return Err("transformer n_embd must be > 0".into()); }
+    if hp.n_layers == 0 { return Err("transformer n_layers must be > 0".into()); }
+    if hp.n_heads == 0  { return Err("transformer n_heads must be > 0".into()); }
+    if hp.n_ff == 0     { return Err("transformer n_ff must be > 0".into()); }
+    if hp.n_embd % hp.n_heads != 0 {
+        return Err(format!(
+            "transformer n_embd ({}) must be divisible by n_heads ({})",
+            hp.n_embd, hp.n_heads
+        ));
+    }
+    let head_dim = hp.n_embd / hp.n_heads;
+    if head_dim % 2 != 0 {
+        return Err(format!(
+            "transformer head_dim (n_embd/n_heads = {head_dim}) must be even for RoPE"
+        ));
+    }
+    Ok(())
+}
+
+/// Rebuild a transformer model after the corpus vocabulary changes. Keeps
+/// the existing weights if `vocab_size` matches the current model; otherwise
+/// reinitializes (since the embedding and LM head depend on vocab size) and
+/// marks the network as untrained.
+async fn rebuild_transformer_model(
+    state: &State<'_, AppState>,
+    net: &Network,
+    vocab_size: usize,
+) -> Result<(), String> {
+    let hp = net.transformer.clone()
+        .ok_or_else(|| "transformer network missing hparams".to_string())?;
+
+    // Fast path: existing model already at this vocab size.
+    if let Some(existing) = state.transformers.read().await.get(&net.id).cloned() {
+        if existing.read().await.config.vocab_size == vocab_size {
+            return Ok(());
+        }
+    } else if let Some(dir) = persistence::data_dir(state).await {
+        if let Ok(Some(loaded)) = persistence::load_transformer(&net.id, &dir).await {
+            if loaded.config.vocab_size == vocab_size {
+                state.transformers.write().await
+                    .insert(net.id.clone(), Arc::new(RwLock::new(loaded)));
+                return Ok(());
+            }
+        }
+    }
+
+    let cfg = TransformerConfig {
+        vocab_size,
+        n_ctx:     hp.n_ctx,
+        n_embd:    hp.n_embd,
+        n_layers:  hp.n_layers,
+        n_heads:   hp.n_heads,
+        n_ff:      hp.n_ff,
+        rope_theta: hp.rope_theta,
+        rms_eps:    hp.rms_eps,
+    };
+    let model = TransformerModel::new(cfg, net.seed);
+    let parameter_count = model.parameter_count();
+    state.transformers.write().await
+        .insert(net.id.clone(), Arc::new(RwLock::new(model)));
+    if let Some(n) = state.networks.write().await.get_mut(&net.id) {
+        n.parameter_count = parameter_count;
+        n.trained = false;
+    }
+    Ok(())
 }
 
 fn build_layer_specs(layers: &[LayerDef], input_dim: usize) -> Result<(Vec<LayerSpec>, usize), String> {
@@ -329,10 +425,43 @@ pub(crate) async fn create_network_internal(
             name, kind: req.kind, seed: req.seed, created_at: now, trained: false,
             input_dim, output_dim,
             layers: req.layers, parameter_count,
-            hidden_layers: None, context_size: None,
+            hidden_layers: None, context_size: None, transformer: None,
+        }
+    } else if req.kind == kinds::TRANSFORMER {
+        // Transformer: materialise the model now with a vocab placeholder; it
+        // gets rebuilt on first corpus save once the real vocab size is known.
+        // We accept hparams via `req.transformer` — `req.layers` is ignored.
+        let hp = req.transformer.clone()
+            .ok_or_else(|| "transformer network requires `transformer` hparams".to_string())?;
+        validate_transformer_hparams(&hp)?;
+        // Initial placeholder vocab — overwritten when a corpus is attached.
+        let placeholder_vocab = 32;
+        let cfg = TransformerConfig {
+            vocab_size: placeholder_vocab,
+            n_ctx:     hp.n_ctx,
+            n_embd:    hp.n_embd,
+            n_layers:  hp.n_layers,
+            n_heads:   hp.n_heads,
+            n_ff:      hp.n_ff,
+            rope_theta: hp.rope_theta,
+            rms_eps:    hp.rms_eps,
+        };
+        let model = TransformerModel::new(cfg, req.seed);
+        let parameter_count = model.parameter_count();
+        state.transformers.write().await.insert(
+            id.clone(), Arc::new(RwLock::new(model)),
+        );
+        Network {
+            id: id.clone(),
+            name, kind: req.kind, seed: req.seed, created_at: now, trained: false,
+            input_dim: 0, output_dim: 0,
+            layers: Vec::new(), parameter_count,
+            hidden_layers: None,
+            context_size: Some(hp.n_ctx),
+            transformer: Some(hp),
         }
     } else {
-        // Next-token: only the hidden chain is meaningful at this point.
+        // Next-token (MLP-on-window): only the hidden chain is meaningful at this point.
         let context_size = req.context_size.unwrap_or(0);
         if context_size == 0 {
             return Err("next-token network requires context_size > 0".into());
@@ -344,6 +473,7 @@ pub(crate) async fn create_network_internal(
             layers: Vec::new(), parameter_count: 0,
             hidden_layers: Some(req.layers),
             context_size: Some(context_size),
+            transformer: None,
         }
     };
 
@@ -370,11 +500,15 @@ async fn delete_network(app: AppHandle, id: String) -> Result<bool, String> {
 pub(crate) async fn delete_network_internal(app: &AppHandle, id: &str) -> Result<bool, String> {
     let state = app.state::<AppState>();
     state.models.write().await.remove(id);
+    state.transformers.write().await.remove(id);
     state.vocabs.write().await.remove(id);
     state.corpora.write().await.remove(id);
     state.training_history.write().await.remove(id);
     if let Some(dir) = persistence::data_dir(&state).await {
         if let Err(e) = persistence::delete_model(id, &dir).await {
+            eprintln!("[neuralcabin] {e}");
+        }
+        if let Err(e) = persistence::delete_transformer(id, &dir).await {
             eprintln!("[neuralcabin] {e}");
         }
     }
@@ -526,7 +660,7 @@ async fn set_corpus(
         let ff = req.feedforward.ok_or_else(|| "feedforward corpus required".to_string())?;
         validate_feedforward(&ff, &net)?;
         corpus.feedforward = Some(ff);
-    } else if net.kind == kinds::NEXT_TOKEN {
+    } else if net.kind == kinds::NEXT_TOKEN || net.kind == kinds::TRANSFORMER {
         corpus.text  = req.text;
         corpus.pairs = req.pairs;
         corpus.stage = req.stage;
@@ -537,10 +671,10 @@ async fn set_corpus(
     // Persist the corpus first so subsequent operations see it.
     state.corpora.write().await.insert(net.id.clone(), corpus.clone());
 
-    // For next-token networks, auto-build the vocabulary from the new corpus so
-    // the user doesn't have to do it manually. Without this, training would
-    // immediately fail with "no vocabulary" after saving a corpus.
-    if net.kind == kinds::NEXT_TOKEN {
+    // For text-based networks, auto-build the vocabulary from the new corpus
+    // so the user doesn't have to do it manually. Without this, training
+    // would immediately fail with "no vocabulary" after saving a corpus.
+    if net.kind == kinds::NEXT_TOKEN || net.kind == kinds::TRANSFORMER {
         let mode_name = req.vocab_mode.as_deref().unwrap_or("char");
         if let Ok(mode) = parse_tokenizer_mode(mode_name) {
             if !matches!(mode, TokenizerMode::Advanced) {
@@ -565,7 +699,11 @@ async fn set_corpus(
                         info,
                     };
                     state.vocabs.write().await.insert(net.id.clone(), entry);
-                    rebuild_next_token_model(&state, &net, vocab_size).await?;
+                    if net.kind == kinds::NEXT_TOKEN {
+                        rebuild_next_token_model(&state, &net, vocab_size).await?;
+                    } else {
+                        rebuild_transformer_model(&state, &net, vocab_size).await?;
+                    }
                 }
             }
         }
@@ -632,7 +770,7 @@ async fn compute_stats(
         stats.training_examples = Some(ff.rows);
     }
 
-    if net.kind == kinds::NEXT_TOKEN {
+    if net.kind == kinds::NEXT_TOKEN || net.kind == kinds::TRANSFORMER {
         if let Some(text) = &corpus.text {
             stats.text_chars = Some(text.chars().count());
         }
@@ -704,8 +842,8 @@ async fn build_vocabulary(
     }
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
-    if net.kind != kinds::NEXT_TOKEN {
-        return Err("vocabularies apply only to next-token networks".to_string());
+    if net.kind != kinds::NEXT_TOKEN && net.kind != kinds::TRANSFORMER {
+        return Err("vocabularies apply only to text networks (next-token or transformer)".to_string());
     }
     let corpus = state.corpora.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".to_string())?;
@@ -735,8 +873,8 @@ async fn set_advanced_vocabulary(
 ) -> Result<VocabularyInfo, String> {
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
-    if net.kind != kinds::NEXT_TOKEN {
-        return Err("vocabularies apply only to next-token networks".to_string());
+    if net.kind != kinds::NEXT_TOKEN && net.kind != kinds::TRANSFORMER {
+        return Err("vocabularies apply only to text networks (next-token or transformer)".to_string());
     }
     let trimmed: Vec<String> = req.tokens.into_iter()
         .map(|t| t.trim().to_string())
@@ -770,7 +908,11 @@ async fn finalize_vocab(
     state.vocabs.write().await.insert(net.id.clone(), entry);
 
     // Materialize the model: input = vocab × context, hidden chain, output = vocab.
-    rebuild_next_token_model(&state, &net, vocab.size()).await?;
+    if net.kind == kinds::TRANSFORMER {
+        rebuild_transformer_model(&state, &net, vocab.size()).await?;
+    } else {
+        rebuild_next_token_model(&state, &net, vocab.size()).await?;
+    }
     persist(&state).await?;
     Ok(info)
 }
@@ -922,6 +1064,303 @@ async fn tokenize_preview(
     Ok(ids.into_iter().map(|id| (id, v.token_of(id).to_string())).collect())
 }
 
+// ─── Transformer training ──────────────────────────────────────────────────
+
+async fn start_transformer_training(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    net: Network,
+    corpus: Corpus,
+    req: StartTrainingRequest,
+) -> Result<StartTrainingResponse, String> {
+    if req.config.epochs == 0 { return Err("epochs must be > 0".into()); }
+    let entry = state.vocabs.read().await.get(&req.network_id).cloned()
+        .ok_or_else(|| "Vocabulary missing — save a corpus first".to_string())?;
+    let vocab_size = entry.vocab.read().await.size();
+    rebuild_transformer_model(state, &net, vocab_size).await?;
+    let model_arc = get_or_load_transformer(state, &net).await?;
+
+    // Reload network (parameter count may have updated).
+    let net = state.networks.read().await.get(&req.network_id).cloned().unwrap_or(net);
+    let hp = net.transformer.clone()
+        .ok_or_else(|| "transformer network missing hparams".to_string())?;
+    let n_ctx = hp.n_ctx;
+
+    // Build (input, target) token sequences from the corpus.
+    let vocab = entry.vocab.read().await.clone();
+    let sequences = build_transformer_sequences(&corpus, &vocab, n_ctx)?;
+    let total_examples = sequences.len();
+    if total_examples == 0 {
+        return Err(format!("No training sequences produced (need ≥ {} tokens)", n_ctx + 1));
+    }
+    if net.parameter_count == 0 {
+        return Err("Transformer has no parameters — internal state is broken".into());
+    }
+
+    let opt_kind = build_optimizer(&req.config.optimizer, &[])?;
+    let batch_size = req.config.batch_size.max(1);
+
+    let training_id = Uuid::new_v4().to_string();
+    let started_at = Utc::now();
+    let cancel   = Arc::new(AtomicBool::new(false));
+    let rollback = Arc::new(AtomicBool::new(false));
+    let training_state = Arc::new(RwLock::new(TrainingState {
+        running: true,
+        total_epochs: req.config.epochs,
+        ..Default::default()
+    }));
+    state.trainers.write().await.insert(training_id.clone(), TrainerHandle {
+        state: training_state.clone(),
+        cancel: cancel.clone(),
+        rollback: rollback.clone(),
+    });
+
+    let app_clone = app.clone();
+    let networks_handle = state.networks.clone();
+    let id_clone = training_id.clone();
+    let cfg = req.config.clone();
+    let net_id = req.network_id.clone();
+    let n_embd = hp.n_embd;
+
+    tokio::spawn(async move {
+        run_transformer_training_loop(
+            app_clone, id_clone, net_id, cfg, started_at, model_arc, networks_handle,
+            sequences, n_ctx, n_embd, opt_kind, batch_size,
+            training_state, cancel, rollback,
+        ).await;
+    });
+
+    Ok(StartTrainingResponse { training_id, status: "running".into() })
+}
+
+/// Turn the corpus into a flat list of `(input[n_ctx], target[n_ctx])`
+/// sequences. We use the same vocab/tokenization the MLP next-token path
+/// uses, so users can switch architectures without rebuilding the corpus.
+fn build_transformer_sequences(
+    corpus: &Corpus,
+    vocab: &Vocabulary,
+    n_ctx: usize,
+) -> Result<Vec<(Vec<u32>, Vec<u32>)>, String> {
+    use neuralcabin_engine::tokenizer::{ASSISTANT_ID, EOS_ID, USER_ID};
+    let stage = corpus.stage.as_deref().unwrap_or("pretrain");
+    let mut sequences = Vec::new();
+
+    match stage {
+        "pretrain" => {
+            let text = corpus.text.as_deref()
+                .ok_or_else(|| "Pretraining requires a text corpus".to_string())?;
+            let ids = vocab.encode(text);
+            if ids.len() < n_ctx + 1 {
+                return Err(format!(
+                    "Text has {} tokens, need at least {} for n_ctx = {n_ctx}",
+                    ids.len(), n_ctx + 1
+                ));
+            }
+            // Sliding window over the entire corpus.
+            for start in 0..=(ids.len() - n_ctx - 1) {
+                let input  = ids[start..start + n_ctx].to_vec();
+                let target = ids[start + 1..start + n_ctx + 1].to_vec();
+                sequences.push((input, target));
+            }
+        }
+        "finetune" => {
+            let pairs = corpus.pairs.as_ref()
+                .ok_or_else(|| "Fine-tuning requires input/output pairs".to_string())?;
+            if pairs.is_empty() {
+                return Err("Fine-tuning needs at least one input/output pair".into());
+            }
+            for p in pairs {
+                // <user> input <eos> <assistant> output <eos>
+                let mut ids = vec![USER_ID];
+                ids.extend(vocab.encode(&p.input));
+                ids.push(EOS_ID);
+                ids.push(ASSISTANT_ID);
+                ids.extend(vocab.encode(&p.output));
+                ids.push(EOS_ID);
+
+                // Pad or trim to exactly n_ctx + 1, so we can build one (in, tgt)
+                // pair per example.
+                let needed = n_ctx + 1;
+                if ids.len() < needed {
+                    while ids.len() < needed { ids.push(EOS_ID); }
+                } else if ids.len() > needed {
+                    ids.truncate(needed);
+                }
+                let input:  Vec<u32> = ids[..n_ctx].to_vec();
+                let target: Vec<u32> = ids[1..n_ctx + 1].to_vec();
+                sequences.push((input, target));
+            }
+        }
+        other => return Err(format!("unknown stage '{other}'")),
+    }
+    Ok(sequences)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_transformer_training_loop(
+    app: AppHandle,
+    training_id: String,
+    network_id: String,
+    cfg: TrainingConfig,
+    started_at: DateTime<Utc>,
+    model_arc: Arc<RwLock<TransformerModel>>,
+    networks_handle: Arc<RwLock<HashMap<String, Network>>>,
+    sequences: Vec<(Vec<u32>, Vec<u32>)>,
+    n_ctx: usize,
+    _n_embd: usize,
+    opt_kind: neuralcabin_engine::optimizer::OptimizerKind,
+    batch_size: usize,
+    training_state: Arc<RwLock<TrainingState>>,
+    cancel: Arc<AtomicBool>,
+    rollback: Arc<AtomicBool>,
+) {
+    let initial_snapshot: TransformerModel = model_arc.read().await.clone();
+    let start = std::time::Instant::now();
+    let mut loss_history: Vec<f32> = Vec::with_capacity(cfg.epochs);
+    let mut rng = SplitMix64::new(cfg.seed.wrapping_add(0x5A5A_A5A5_A5A5_5A5A));
+    let mut indices: Vec<usize> = (0..sequences.len()).collect();
+    let device = neuralcabin_engine::default_gpu_device();
+    let mut step_counter: u64 = 0;
+
+    for epoch in 1..=cfg.epochs {
+        if cancel.load(Ordering::Relaxed) {
+            transformer_finish_cancelled(
+                &app, &training_id, &network_id, &cfg, started_at,
+                epoch.saturating_sub(1), &loss_history, start,
+                &training_state, &model_arc, &rollback, &initial_snapshot, &networks_handle,
+            ).await;
+            return;
+        }
+
+        // Shuffle sequence indices each epoch.
+        for i in (1..indices.len()).rev() {
+            let j = (rng.next_u64() as usize) % (i + 1);
+            indices.swap(i, j);
+        }
+
+        let mut epoch_loss = 0.0_f32;
+        let mut batches = 0_usize;
+        for chunk in indices.chunks(batch_size) {
+            if cancel.load(Ordering::Relaxed) { break; }
+            let b = chunk.len();
+            // Flatten this batch into contiguous (b*n_ctx) input/target arrays.
+            let mut input_flat  = Vec::with_capacity(b * n_ctx);
+            let mut target_flat = Vec::with_capacity(b * n_ctx);
+            for &i in chunk {
+                input_flat.extend_from_slice(&sequences[i].0);
+                target_flat.extend_from_slice(&sequences[i].1);
+            }
+            let loss = {
+                let mut model = model_arc.write().await;
+                step_counter += 1;
+                neuralcabin_engine::transformer::train_step_on_device::<
+                    neuralcabin_engine::GpuAutodiffBackend,
+                >(
+                    &mut model, &opt_kind, step_counter,
+                    &input_flat, &target_flat, b, n_ctx, &device,
+                )
+            };
+            if !loss.is_finite() {
+                let elapsed = start.elapsed().as_secs_f32();
+                let run = build_training_run_record(
+                    &training_id, &network_id, &cfg, started_at,
+                    epoch, loss_history.last().copied().unwrap_or(0.0),
+                    elapsed, &loss_history, "error",
+                );
+                record_and_persist_run(&app, run).await;
+                mark_error(&training_state, &training_id, &app,
+                    format!("Loss diverged to {loss} at epoch {epoch}")).await;
+                return;
+            }
+            epoch_loss += loss;
+            batches += 1;
+        }
+        let mean_loss = epoch_loss / batches.max(1) as f32;
+        loss_history.push(mean_loss);
+
+        let elapsed = start.elapsed().as_secs_f32();
+        {
+            let mut s = training_state.write().await;
+            s.epoch = epoch; s.last_loss = mean_loss;
+            s.loss_history = loss_history.clone(); s.elapsed_secs = elapsed;
+        }
+        let _ = app.emit("training_update", TrainingUpdate {
+            training_id: training_id.clone(),
+            epoch, total_epochs: cfg.epochs,
+            loss: mean_loss, loss_history: loss_history.clone(),
+            elapsed_secs: elapsed,
+        });
+        tokio::task::yield_now().await;
+    }
+
+    let elapsed = start.elapsed().as_secs_f32();
+    let final_loss = loss_history.last().copied().unwrap_or(0.0);
+    let epochs_completed = loss_history.len();
+    {
+        let mut s = training_state.write().await;
+        s.running = false; s.stopped = true; s.elapsed_secs = elapsed;
+    }
+    if let Some(net) = networks_handle.write().await.get_mut(&network_id) {
+        net.trained = true;
+    }
+    let run = build_training_run_record(
+        &training_id, &network_id, &cfg, started_at,
+        epochs_completed, final_loss, elapsed, &loss_history, "completed",
+    );
+    record_and_persist_run(&app, run).await;
+    let _ = app.emit("training_finished", TrainingFinished {
+        training_id,
+        status: "completed".into(),
+        final_loss, total_epochs: cfg.epochs, elapsed_secs: elapsed,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn transformer_finish_cancelled(
+    app: &AppHandle,
+    training_id: &str,
+    network_id: &str,
+    cfg: &TrainingConfig,
+    started_at: DateTime<Utc>,
+    epochs_run: usize,
+    loss_history: &[f32],
+    start: std::time::Instant,
+    training_state: &Arc<RwLock<TrainingState>>,
+    model_arc: &Arc<RwLock<TransformerModel>>,
+    rollback: &Arc<AtomicBool>,
+    initial_snapshot: &TransformerModel,
+    networks_handle: &Arc<RwLock<HashMap<String, Network>>>,
+) {
+    if rollback.load(Ordering::Relaxed) {
+        let mut m = model_arc.write().await;
+        *m = initial_snapshot.clone();
+    }
+    let elapsed = start.elapsed().as_secs_f32();
+    let final_loss = loss_history.last().copied().unwrap_or(0.0);
+    let aborted = rollback.load(Ordering::Relaxed);
+    let status = if aborted { "aborted" } else { "cancelled" };
+    {
+        let mut s = training_state.write().await;
+        s.running = false; s.stopped = true; s.cancelled = true;
+        s.elapsed_secs = elapsed;
+    }
+    if !aborted && epochs_run > 0 {
+        if let Some(net) = networks_handle.write().await.get_mut(network_id) {
+            net.trained = true;
+        }
+    }
+    let run = build_training_run_record(
+        training_id, network_id, cfg, started_at,
+        epochs_run, final_loss, elapsed, loss_history, status,
+    );
+    record_and_persist_run(app, run).await;
+    let _ = app.emit("training_finished", TrainingFinished {
+        training_id: training_id.to_string(),
+        status: status.into(),
+        final_loss, total_epochs: cfg.epochs, elapsed_secs: elapsed,
+    });
+}
+
 // ─── Training ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -934,6 +1373,13 @@ async fn start_training(
         .ok_or_else(|| "Network not found".to_string())?;
     let corpus = state.corpora.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".to_string())?;
+
+    // Transformer kind has its own training loop (token sequences, RoPE,
+    // attention) so we dispatch before touching `model_arc`.
+    if net.kind == kinds::TRANSFORMER {
+        return start_transformer_training(&app, &state, net, corpus, req).await;
+    }
+
     let model_arc = get_or_load_model(&state, &net).await?;
 
     let (x, y, loss_kind, total_examples) = if net.kind == kinds::FEEDFORWARD {
@@ -1341,6 +1787,132 @@ async fn mark_error(
 
 // ─── Inference ──────────────────────────────────────────────────────────────
 
+async fn infer_transformer(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    net: Network,
+    req: InferRequest,
+) -> Result<InferResponse, String> {
+    use neuralcabin_engine::tokenizer::{ASSISTANT_ID, EOS_ID, USER_ID, RESERVED};
+    let hp = net.transformer.clone()
+        .ok_or_else(|| "transformer network missing hparams".to_string())?;
+    let n_ctx = hp.n_ctx;
+    let entry = state.vocabs.read().await.get(&req.network_id).cloned()
+        .ok_or_else(|| "Vocabulary missing — save a corpus first".to_string())?;
+    let model_arc = get_or_load_transformer(state, &net).await?;
+
+    let prompt = req.prompt.unwrap_or_default();
+    let max_new = req.max_new_tokens.unwrap_or(64).min(4096).max(1);
+    let temperature = req.temperature.unwrap_or(0.0).max(0.0);
+    let chat_mode = state.corpora.read().await
+        .get(&req.network_id)
+        .and_then(|c| c.stage.clone())
+        .map(|s| s == "finetune")
+        .unwrap_or(false);
+    let messages = req.messages.clone();
+
+    let inference_id = Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.inferrers.write().await.insert(inference_id.clone(), InferenceHandle {
+        cancel: cancel.clone(),
+    });
+
+    let app_clone = app.clone();
+    let inferrers_handle = state.inferrers.clone();
+    let id_clone = inference_id.clone();
+
+    tokio::spawn(async move {
+        let vocab = entry.vocab.read().await.clone();
+        let mut ids: Vec<u32> = Vec::new();
+        if let Some(msgs) = messages.as_ref().filter(|_| chat_mode) {
+            for m in msgs {
+                match m.role.as_str() {
+                    "user"      => ids.push(USER_ID),
+                    "assistant" => ids.push(ASSISTANT_ID),
+                    _ => continue,
+                }
+                ids.extend(vocab.encode(&m.text));
+                ids.push(EOS_ID);
+            }
+            ids.push(ASSISTANT_ID);
+        } else if chat_mode {
+            ids.push(USER_ID);
+            ids.extend(vocab.encode(&prompt));
+            ids.push(EOS_ID);
+            ids.push(ASSISTANT_ID);
+        } else {
+            ids.extend(vocab.encode(&prompt));
+        }
+        let initial_len = ids.len();
+        let mut generated = String::new();
+        let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new as u64).wrapping_mul(0x9E3779B1));
+        let device = neuralcabin_engine::default_gpu_device();
+
+        for index in 0..max_new {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = app_clone.emit("inference_finished", InferenceFinished {
+                    inference_id: id_clone.clone(),
+                    status: "cancelled".into(),
+                    generated: generated.clone(),
+                    token_count: ids.len() - initial_len,
+                });
+                break;
+            }
+            // Take the last n_ctx tokens; pad-left with EOS if shorter.
+            let mut window: Vec<u32> = if ids.len() >= n_ctx {
+                ids[ids.len() - n_ctx..].to_vec()
+            } else {
+                let mut w = vec![EOS_ID; n_ctx - ids.len()];
+                w.extend_from_slice(&ids);
+                w
+            };
+            // forward returns logits for every position; we want the LAST one.
+            let model = model_arc.read().await;
+            let logits = neuralcabin_engine::transformer::forward_logits::<
+                neuralcabin_engine::GpuBackend,
+            >(&model, &window, &device);
+            drop(model);
+            let vocab_sz = vocab.size();
+            let last_row = &logits[logits.len() - vocab_sz..];
+            // softmax for sampling.
+            let mut row = last_row.to_vec();
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            for v in row.iter_mut() { *v = (*v - mx).exp(); }
+            let s: f32 = row.iter().sum();
+            for v in row.iter_mut() { *v /= s; }
+
+            let chosen = if temperature <= f32::EPSILON {
+                argmax_local(&row)
+            } else {
+                sample_with_temperature_local(&row, temperature, &mut rng)
+            };
+            let prob = row[chosen];
+            let token = vocab.token_of(chosen as u32).to_string();
+            let visible = if (chosen as u32) < RESERVED as u32 { String::new() } else { token.clone() };
+            generated.push_str(&visible);
+            let _ = app_clone.emit("inference_token", InferenceToken {
+                inference_id: id_clone.clone(),
+                index, token: token.clone(), probability: prob,
+            });
+            if (chosen as u32) == EOS_ID { break; }
+            ids.push(chosen as u32);
+            // Suppress unused warning while we keep the variable for future
+            // KV-cache work — the window is recomputed every step today.
+            let _ = &mut window;
+            tokio::task::yield_now().await;
+        }
+        let _ = app_clone.emit("inference_finished", InferenceFinished {
+            inference_id: id_clone.clone(),
+            status: "completed".into(),
+            generated,
+            token_count: ids.len() - initial_len,
+        });
+        inferrers_handle.write().await.remove(&id_clone);
+    });
+
+    Ok(InferResponse { output: None, inference_id: Some(inference_id) })
+}
+
 #[tauri::command]
 async fn infer(
     app: AppHandle,
@@ -1349,6 +1921,11 @@ async fn infer(
 ) -> Result<InferResponse, String> {
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
+
+    if net.kind == kinds::TRANSFORMER {
+        return infer_transformer(&app, &state, net, req).await;
+    }
+
     let model_arc = get_or_load_model(&state, &net).await?;
 
     if net.kind == kinds::FEEDFORWARD {
@@ -1639,15 +2216,24 @@ async fn export_network(
     use base64::Engine as _;
     let net = state.networks.read().await.get(&network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
-    if net.kind != kinds::NEXT_TOKEN && format == "gguf" {
-        return Err("GGUF export is only meaningful for next-token networks".into());
-    }
     if !export::FORMATS.contains(&format.as_str()) {
         return Err(format!("unknown format '{format}' (expected pytorch|onnx|gguf)"));
     }
-    let model_arc = get_or_load_model(&state, &net).await?;
-    let model = model_arc.read().await.clone();
-    let bytes = export::export_model(&format, &net, &model)?;
+    if net.kind == kinds::FEEDFORWARD && format == "gguf" {
+        return Err("GGUF export is only meaningful for text-generation networks".into());
+    }
+    let bytes = if net.kind == kinds::TRANSFORMER {
+        let model_arc = get_or_load_transformer(&state, &net).await?;
+        let model = model_arc.read().await.clone();
+        let tokens: Vec<String> = state.vocabs.read().await.get(&network_id)
+            .map(|e| e.info.tokens.clone())
+            .ok_or_else(|| "Vocabulary missing for transformer — save a corpus first".to_string())?;
+        export::export_transformer(&format, &net, &model, &tokens)?
+    } else {
+        let model_arc = get_or_load_model(&state, &net).await?;
+        let model = model_arc.read().await.clone();
+        export::export_model(&format, &net, &model)?
+    };
     let ext = export::extension_for(&format);
     let safe_name: String = net.name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })

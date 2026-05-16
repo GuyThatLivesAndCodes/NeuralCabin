@@ -18,6 +18,7 @@ pub mod data;
 pub mod persistence;
 pub mod tokenizer;
 pub mod corpus;
+pub mod transformer;
 
 pub use activations::Activation;
 pub use backend::{

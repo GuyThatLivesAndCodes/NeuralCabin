@@ -1,13 +1,17 @@
-//! Model export to PyTorch (.pt), ONNX (.onnx), and GGUF (.gguf).
+//! Model export to PyTorch (.pt), ONNX (.onnx), safetensors (.safetensors),
+//! and GGUF (.gguf).
 //!
-//! All three formats are produced from a `neuralcabin_engine::nn::Model`'s
-//! linear weights + activations. We avoid pulling in PyTorch/ONNX runtime as
-//! dependencies — each writer constructs the file format bytes directly.
+//! All four formats are produced from a `neuralcabin_engine::nn::Model`'s
+//! linear weights + activations. We avoid pulling in PyTorch/ONNX runtimes
+//! as dependencies — each writer constructs the file-format bytes directly.
 //!
-//! Feed-forward and next-token networks share the same internal representation
-//! (a stack of Linear + Activation layers), so the exporters work on either.
-//! GGUF is conventionally an LLM format, so we only enable it for next-token
-//! networks in the UI; this module accepts both regardless.
+//! Caveat on GGUF: the file is well-formed but uses architecture name
+//! `"neuralcabin"`, which llama.cpp / LM Studio do not know how to run.
+//! llama.cpp only accepts a fixed list of transformer architectures, each
+//! with a hardcoded tensor layout (token_embd + per-block QKV + ...) — our
+//! plain MLP has none of those. We keep the writer for completeness and
+//! custom tooling, but the UI hides it for next-token networks and
+//! recommends safetensors instead.
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{Cursor, Write};
@@ -15,6 +19,7 @@ use zip::write::SimpleFileOptions;
 
 use neuralcabin_engine::activations::Activation;
 use neuralcabin_engine::nn::{Layer, Model};
+use neuralcabin_engine::transformer::TransformerModel;
 
 use crate::models::Network;
 
@@ -36,6 +41,22 @@ pub fn export_model(format: &str, net: &Network, model: &Model) -> Result<Vec<u8
         "pytorch" => export_pytorch(net, model),
         "onnx"    => export_onnx(net, model),
         "gguf"    => export_gguf(net, model),
+        other     => Err(format!("unknown export format '{other}'")),
+    }
+}
+
+/// Dispatch for transformer networks. Same formats; GGUF here emits a real
+/// llama-architecture file that LM Studio / llama.cpp will load.
+pub fn export_transformer(
+    format: &str,
+    net: &Network,
+    model: &TransformerModel,
+    tokens: &[String],
+) -> Result<Vec<u8>, String> {
+    match format {
+        "gguf"    => llama_gguf::export(net, model, tokens),
+        "pytorch" => transformer_pytorch::export(model),
+        "onnx"    => Err("ONNX export of transformers is not yet implemented — use GGUF or PyTorch".into()),
         other     => Err(format!("unknown export format '{other}'")),
     }
 }
@@ -636,6 +657,307 @@ fn write_gguf_kv_string_array(buf: &mut Vec<u8>, key: &str, values: &[String]) {
     for v in values { gguf_write_string(buf, v); }
 }
 
+// ─── llama-architecture GGUF (for TransformerModel) ────────────────────────
+
+mod llama_gguf {
+    use super::*;
+
+    /// Write a GGUF file using llama.cpp's `llama` architecture so it loads
+    /// in LM Studio / llama.cpp directly. Layout follows
+    /// https://github.com/ggerganov/ggml/blob/master/docs/gguf.md and the
+    /// llama tensor-name convention from `convert_hf_to_gguf.py`.
+    ///
+    /// We declare:
+    ///   - general.architecture = "llama"
+    ///   - llama.{embedding_length, block_count, feed_forward_length, context_length}
+    ///   - llama.attention.head_count[_kv], rope.{freq_base, dimension_count}
+    ///   - tokenizer.ggml.{model, tokens, scores, token_type, bos/eos/pad ids}
+    ///   - per-block: blk.N.{attn_norm, attn_q, attn_k, attn_v, attn_output,
+    ///                      ffn_norm, ffn_gate, ffn_up, ffn_down}.weight
+    ///   - top-level: token_embd.weight, output_norm.weight, output.weight
+    ///
+    /// All weight matrices are written in (out, in) order — that's the
+    /// convention llama.cpp expects.
+    pub fn export(net: &Network, model: &TransformerModel, tokens: &[String]) -> Result<Vec<u8>, String> {
+        let cfg = &model.config;
+        let head_dim = cfg.n_embd / cfg.n_heads;
+
+        let mut tensors: Vec<NamedTensor> = Vec::new();
+        tensors.push(NamedTensor {
+            name: "token_embd.weight".into(),
+            dims: vec![cfg.n_embd as u64, cfg.vocab_size as u64],
+            data: model.token_embd.data.clone(),  // already (vocab, n_embd) — store as (n_embd, vocab) per llama
+        });
+
+        for (i, block) in model.blocks.iter().enumerate() {
+            tensors.push(NamedTensor {
+                name: format!("blk.{i}.attn_norm.weight"),
+                dims: vec![cfg.n_embd as u64],
+                data: block.attn_norm.data.clone(),
+            });
+            tensors.push(transpose_named(&format!("blk.{i}.attn_q.weight"), &block.wq, cfg.n_embd, cfg.n_embd));
+            tensors.push(transpose_named(&format!("blk.{i}.attn_k.weight"), &block.wk, cfg.n_embd, cfg.n_embd));
+            tensors.push(transpose_named(&format!("blk.{i}.attn_v.weight"), &block.wv, cfg.n_embd, cfg.n_embd));
+            tensors.push(transpose_named(&format!("blk.{i}.attn_output.weight"), &block.wo, cfg.n_embd, cfg.n_embd));
+            tensors.push(NamedTensor {
+                name: format!("blk.{i}.ffn_norm.weight"),
+                dims: vec![cfg.n_embd as u64],
+                data: block.ffn_norm.data.clone(),
+            });
+            tensors.push(transpose_named(&format!("blk.{i}.ffn_gate.weight"), &block.ffn_gate, cfg.n_embd, cfg.n_ff));
+            tensors.push(transpose_named(&format!("blk.{i}.ffn_up.weight"),   &block.ffn_up,   cfg.n_embd, cfg.n_ff));
+            tensors.push(transpose_named(&format!("blk.{i}.ffn_down.weight"), &block.ffn_down, cfg.n_ff,   cfg.n_embd));
+        }
+
+        tensors.push(NamedTensor {
+            name: "output_norm.weight".into(),
+            dims: vec![cfg.n_embd as u64],
+            data: model.output_norm.data.clone(),
+        });
+        tensors.push(transpose_named("output.weight", &model.output, cfg.n_embd, cfg.vocab_size));
+
+        // Build metadata section.
+        let mut meta = Vec::<u8>::new();
+        let mut kv_count: u64 = 0;
+        write_kv_string(&mut meta, "general.architecture", "llama"); kv_count += 1;
+        write_kv_string(&mut meta, "general.name", &net.name);       kv_count += 1;
+
+        // llama hparams. Names follow gguf.md.
+        write_kv_u32(&mut meta, "llama.context_length",     cfg.n_ctx as u32);    kv_count += 1;
+        write_kv_u32(&mut meta, "llama.embedding_length",   cfg.n_embd as u32);   kv_count += 1;
+        write_kv_u32(&mut meta, "llama.block_count",        cfg.n_layers as u32); kv_count += 1;
+        write_kv_u32(&mut meta, "llama.feed_forward_length", cfg.n_ff as u32);    kv_count += 1;
+        write_kv_u32(&mut meta, "llama.attention.head_count",     cfg.n_heads as u32); kv_count += 1;
+        write_kv_u32(&mut meta, "llama.attention.head_count_kv",  cfg.n_heads as u32); kv_count += 1;
+        write_kv_f32(&mut meta, "llama.attention.layer_norm_rms_epsilon", cfg.rms_eps); kv_count += 1;
+        write_kv_f32(&mut meta, "llama.rope.freq_base", cfg.rope_theta); kv_count += 1;
+        write_kv_u32(&mut meta, "llama.rope.dimension_count", head_dim as u32); kv_count += 1;
+        write_kv_u32(&mut meta, "llama.vocab_size", cfg.vocab_size as u32); kv_count += 1;
+
+        // File type — F32. llama.cpp's `LLAMA_FTYPE_ALL_F32 = 0`.
+        write_kv_u32(&mut meta, "general.file_type", 0); kv_count += 1;
+        write_kv_u32(&mut meta, "general.quantization_version", 2); kv_count += 1;
+
+        // Tokenizer. We use the simplest "no_vocab" alternative isn't valid
+        // for chat — instead we declare model=llama and ship tokens as strings.
+        // llama.cpp's BPE/SPM tokenizer needs scores; we give every user-token
+        // a score of 0 and use type=USER_DEFINED (4) for everything. Special
+        // tokens get type=CONTROL (3) so they aren't substrings of generation.
+        write_kv_string(&mut meta, "tokenizer.ggml.model", "llama"); kv_count += 1;
+        write_kv_string(&mut meta, "tokenizer.ggml.pre", "default"); kv_count += 1;
+        write_kv_string_array(&mut meta, "tokenizer.ggml.tokens", tokens); kv_count += 1;
+        let scores: Vec<f32> = vec![0.0; tokens.len()];
+        write_kv_f32_array(&mut meta, "tokenizer.ggml.scores", &scores); kv_count += 1;
+        let token_types: Vec<i32> = tokens.iter().enumerate().map(|(i, _)| {
+            // 0..=5 are our reserved special tokens (pad/unk/bos/eos/user/assistant).
+            if i < neuralcabin_engine::tokenizer::RESERVED { 3 } else { 4 }
+        }).collect();
+        write_kv_i32_array(&mut meta, "tokenizer.ggml.token_type", &token_types); kv_count += 1;
+        write_kv_u32(&mut meta, "tokenizer.ggml.bos_token_id", neuralcabin_engine::tokenizer::BOS_ID); kv_count += 1;
+        write_kv_u32(&mut meta, "tokenizer.ggml.eos_token_id", neuralcabin_engine::tokenizer::EOS_ID); kv_count += 1;
+        write_kv_u32(&mut meta, "tokenizer.ggml.padding_token_id", neuralcabin_engine::tokenizer::PAD_ID); kv_count += 1;
+        write_kv_u32(&mut meta, "tokenizer.ggml.unknown_token_id", neuralcabin_engine::tokenizer::UNK_ID); kv_count += 1;
+
+        // Assemble header.
+        const ALIGN: u64 = 32;
+        let mut buf = Vec::<u8>::new();
+        buf.write_u32::<LittleEndian>(0x46554747).unwrap(); // "GGUF"
+        buf.write_u32::<LittleEndian>(3).unwrap();          // version
+        buf.write_u64::<LittleEndian>(tensors.len() as u64).unwrap();
+        buf.write_u64::<LittleEndian>(kv_count).unwrap();
+        buf.extend_from_slice(&meta);
+
+        // Tensor info, with offset placeholders.
+        let mut info_section = Vec::<u8>::new();
+        let mut offset_positions: Vec<usize> = Vec::new();
+        for t in &tensors {
+            write_string(&mut info_section, &t.name);
+            info_section.write_u32::<LittleEndian>(t.dims.len() as u32).unwrap();
+            for &d in &t.dims { info_section.write_u64::<LittleEndian>(d).unwrap(); }
+            info_section.write_u32::<LittleEndian>(0 /* GGML_TYPE_F32 */).unwrap();
+            offset_positions.push(info_section.len());
+            info_section.write_u64::<LittleEndian>(0).unwrap();
+        }
+        let info_start = buf.len();
+        buf.extend_from_slice(&info_section);
+
+        // Align to ALIGN, then start tensor data.
+        while (buf.len() as u64) % ALIGN != 0 { buf.push(0); }
+        let data_start = buf.len() as u64;
+
+        let mut offsets: Vec<u64> = Vec::with_capacity(tensors.len());
+        for t in &tensors {
+            while (buf.len() as u64 - data_start) % ALIGN != 0 { buf.push(0); }
+            offsets.push(buf.len() as u64 - data_start);
+            for v in &t.data { buf.write_f32::<LittleEndian>(*v).unwrap(); }
+        }
+        for (i, pos) in offset_positions.iter().enumerate() {
+            let abs = info_start + *pos;
+            buf[abs..abs + 8].copy_from_slice(&offsets[i].to_le_bytes());
+        }
+        Ok(buf)
+    }
+
+    struct NamedTensor { name: String, dims: Vec<u64>, data: Vec<f32> }
+
+    /// Transpose an `(rows × cols)` tensor stored row-major into `(cols × rows)`
+    /// row-major bytes (the llama / GGUF convention is `(out_dim, in_dim)`).
+    fn transpose_named(name: &str, t: &neuralcabin_engine::tensor::Tensor, rows: usize, cols: usize) -> NamedTensor {
+        // Our weight matrices are (in_dim, out_dim) but llama wants (out, in).
+        // For our naming: rows=in_dim, cols=out_dim → result dims = [in, out].
+        // GGUF dims convention is reversed (col-major-looking) — we emit
+        // [in_dim, out_dim] so llama.cpp reads "out_dim rows of in_dim".
+        let mut out = Vec::with_capacity(rows * cols);
+        for c in 0..cols {
+            for r in 0..rows {
+                out.push(t.data[r * cols + c]);
+            }
+        }
+        NamedTensor {
+            name: name.into(),
+            dims: vec![rows as u64, cols as u64],
+            data: out,
+        }
+    }
+
+    fn write_string(buf: &mut Vec<u8>, s: &str) {
+        buf.write_u64::<LittleEndian>(s.len() as u64).unwrap();
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    // GGUF metadata value types.
+    const TY_UINT32: u32 = 4;
+    const TY_INT32:  u32 = 5;
+    const TY_FLOAT32: u32 = 6;
+    const TY_STRING: u32 = 8;
+    const TY_ARRAY:  u32 = 9;
+
+    fn write_kv_string(buf: &mut Vec<u8>, k: &str, v: &str) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_STRING).unwrap();
+        write_string(buf, v);
+    }
+    fn write_kv_u32(buf: &mut Vec<u8>, k: &str, v: u32) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_UINT32).unwrap();
+        buf.write_u32::<LittleEndian>(v).unwrap();
+    }
+    fn write_kv_f32(buf: &mut Vec<u8>, k: &str, v: f32) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_FLOAT32).unwrap();
+        buf.write_f32::<LittleEndian>(v).unwrap();
+    }
+    fn write_kv_string_array(buf: &mut Vec<u8>, k: &str, vals: &[String]) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_ARRAY).unwrap();
+        buf.write_u32::<LittleEndian>(TY_STRING).unwrap();
+        buf.write_u64::<LittleEndian>(vals.len() as u64).unwrap();
+        for v in vals { write_string(buf, v); }
+    }
+    fn write_kv_f32_array(buf: &mut Vec<u8>, k: &str, vals: &[f32]) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_ARRAY).unwrap();
+        buf.write_u32::<LittleEndian>(TY_FLOAT32).unwrap();
+        buf.write_u64::<LittleEndian>(vals.len() as u64).unwrap();
+        for v in vals { buf.write_f32::<LittleEndian>(*v).unwrap(); }
+    }
+    fn write_kv_i32_array(buf: &mut Vec<u8>, k: &str, vals: &[i32]) {
+        write_string(buf, k);
+        buf.write_u32::<LittleEndian>(TY_ARRAY).unwrap();
+        buf.write_u32::<LittleEndian>(TY_INT32).unwrap();
+        buf.write_u64::<LittleEndian>(vals.len() as u64).unwrap();
+        for v in vals { buf.write_i32::<LittleEndian>(*v).unwrap(); }
+    }
+}
+
+// ─── PyTorch export for transformer ────────────────────────────────────────
+
+mod transformer_pytorch {
+    use super::*;
+    use std::io::{Cursor, Write as IoWrite};
+    use zip::write::SimpleFileOptions;
+
+    struct Mat { key: String, rows: usize, cols: usize, data: Vec<f32> }
+
+    /// Write a TransformerModel as a `.pt` file. Keys follow the llama
+    /// HuggingFace naming convention so downstream consumers can recognize the
+    /// architecture: `model.embed_tokens.weight`, `model.layers.N.*`,
+    /// `model.norm.weight`, `lm_head.weight`.
+    pub fn export(model: &TransformerModel) -> Result<Vec<u8>, String> {
+        let cfg = &model.config;
+        let mut mats: Vec<Mat> = Vec::new();
+
+        // Token embedding: store as (vocab, n_embd).
+        mats.push(Mat {
+            key: "model.embed_tokens.weight".into(),
+            rows: cfg.vocab_size, cols: cfg.n_embd,
+            data: model.token_embd.data.clone(),
+        });
+
+        for (i, b) in model.blocks.iter().enumerate() {
+            push_norm(&mut mats, format!("model.layers.{i}.input_layernorm.weight"), &b.attn_norm.data);
+            push_t(&mut mats, format!("model.layers.{i}.self_attn.q_proj.weight"), &b.wq, cfg.n_embd, cfg.n_embd);
+            push_t(&mut mats, format!("model.layers.{i}.self_attn.k_proj.weight"), &b.wk, cfg.n_embd, cfg.n_embd);
+            push_t(&mut mats, format!("model.layers.{i}.self_attn.v_proj.weight"), &b.wv, cfg.n_embd, cfg.n_embd);
+            push_t(&mut mats, format!("model.layers.{i}.self_attn.o_proj.weight"), &b.wo, cfg.n_embd, cfg.n_embd);
+            push_norm(&mut mats, format!("model.layers.{i}.post_attention_layernorm.weight"), &b.ffn_norm.data);
+            push_t(&mut mats, format!("model.layers.{i}.mlp.gate_proj.weight"), &b.ffn_gate, cfg.n_embd, cfg.n_ff);
+            push_t(&mut mats, format!("model.layers.{i}.mlp.up_proj.weight"),   &b.ffn_up,   cfg.n_embd, cfg.n_ff);
+            push_t(&mut mats, format!("model.layers.{i}.mlp.down_proj.weight"), &b.ffn_down, cfg.n_ff,   cfg.n_embd);
+        }
+        push_norm(&mut mats, "model.norm.weight".into(), &model.output_norm.data);
+        push_t(&mut mats, "lm_head.weight".into(), &model.output, cfg.n_embd, cfg.vocab_size);
+
+        // Pickle entries: each tensor is a (storage_idx, dims, stride) reference.
+        let mut p = super::PickleWriter::new();
+        p.proto2();
+        p.empty_dict();
+        p.mark();
+        for (i, m) in mats.iter().enumerate() {
+            p.short_binunicode(&m.key);
+            let (dims, stride) = if m.cols == 0 {
+                (vec![m.rows], vec![1])
+            } else {
+                (vec![m.rows, m.cols], vec![m.cols, 1])
+            };
+            let numel = m.data.len();
+            p.rebuild_tensor(i, dims, stride, numel);
+        }
+        p.setitems();
+        p.stop();
+        let pickle = p.into_bytes();
+
+        // ZIP archive.
+        let buf = Cursor::new(Vec::<u8>::new());
+        let mut zw = zip::ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(false);
+        zw.start_file("archive/version", opts).map_err(|e| format!("zip: {e}"))?;
+        zw.write_all(b"3\n").map_err(|e| format!("write: {e}"))?;
+        zw.start_file("archive/data.pkl", opts).map_err(|e| format!("zip: {e}"))?;
+        zw.write_all(&pickle).map_err(|e| format!("write: {e}"))?;
+        for (i, m) in mats.iter().enumerate() {
+            zw.start_file(&format!("archive/data/{i}"), opts).map_err(|e| format!("zip: {e}"))?;
+            for v in &m.data { zw.write_f32::<LittleEndian>(*v).map_err(|e| format!("write: {e}"))?; }
+        }
+        let cursor = zw.finish().map_err(|e| format!("zip finish: {e}"))?;
+        Ok(cursor.into_inner())
+    }
+
+    fn push_norm(out: &mut Vec<Mat>, key: String, data: &[f32]) {
+        out.push(Mat { key, rows: data.len(), cols: 0, data: data.to_vec() });
+    }
+    fn push_t(out: &mut Vec<Mat>, key: String, t: &neuralcabin_engine::tensor::Tensor, rows: usize, cols: usize) {
+        // We store as (in, out). HuggingFace expects (out, in). Transpose.
+        let mut transposed = Vec::with_capacity(rows * cols);
+        for c in 0..cols {
+            for r in 0..rows { transposed.push(t.data[r * cols + c]); }
+        }
+        out.push(Mat { key, rows: cols, cols: rows, data: transposed });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,7 +979,7 @@ mod tests {
             seed: 7, created_at: Utc::now(), trained: true,
             input_dim: 4, output_dim: 2,
             layers: vec![], parameter_count: model.parameter_count(),
-            hidden_layers: None, context_size: None,
+            hidden_layers: None, context_size: None, transformer: None,
         };
         (net, model)
     }
@@ -676,6 +998,36 @@ mod tests {
         assert!(!bytes.is_empty());
         // First byte is the tag for field 1 (ir_version, varint) — 0x08.
         assert_eq!(bytes[0], 0x08, "first protobuf tag should be ir_version");
+    }
+
+    #[test]
+    fn llama_gguf_export_loads_as_llama_arch() {
+        use neuralcabin_engine::transformer::{TransformerConfig, TransformerModel};
+        let cfg = TransformerConfig {
+            vocab_size: 16, n_ctx: 8, n_embd: 16, n_layers: 2, n_heads: 2, n_ff: 32,
+            rope_theta: 10000.0, rms_eps: 1e-5,
+        };
+        let model = TransformerModel::new(cfg, 1);
+        let tokens: Vec<String> = (0..16).map(|i| format!("t{i}")).collect();
+        let (net, _m) = sample_model();
+        let bytes = llama_gguf::export(&net, &model, &tokens).expect("export");
+
+        // Header: "GGUF" + version 3
+        assert_eq!(&bytes[..4], b"GGUF");
+        assert_eq!(&bytes[4..8], &3u32.to_le_bytes());
+        // The metadata section contains length-prefixed UTF-8 keys/values.
+        // Scan the raw bytes for the architecture key and value.
+        assert!(bytes.windows(20).any(|w| w == b"general.architecture"),
+            "exported GGUF must include `general.architecture` metadata");
+        assert!(bytes.windows(5).any(|w| w == b"llama"),
+            "exported GGUF must declare architecture 'llama'");
+        // And the llama.cpp tensor names must appear so the model passes the
+        // arch-specific load step.
+        for n in ["token_embd.weight", "output_norm.weight", "output.weight",
+                  "blk.0.attn_q.weight", "blk.0.ffn_down.weight"] {
+            assert!(bytes.windows(n.len()).any(|w| w == n.as_bytes()),
+                "missing tensor name `{n}` in GGUF metadata");
+        }
     }
 
     #[test]

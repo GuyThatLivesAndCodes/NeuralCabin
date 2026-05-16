@@ -6,9 +6,27 @@ use serde::{Deserialize, Serialize};
 pub mod kinds {
     pub const FEEDFORWARD: &str = "feedforward";
     pub const NEXT_TOKEN:  &str = "next_token";
+    /// Decoder-only llama-style transformer. Produces GGUF files that load
+    /// directly in llama.cpp / LM Studio (architecture = "llama").
+    pub const TRANSFORMER: &str = "transformer";
 
-    pub fn all() -> [&'static str; 2] { [FEEDFORWARD, NEXT_TOKEN] }
+    pub fn all() -> [&'static str; 3] { [FEEDFORWARD, NEXT_TOKEN, TRANSFORMER] }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformerHParams {
+    pub n_ctx:     usize,
+    pub n_embd:    usize,
+    pub n_layers:  usize,
+    pub n_heads:   usize,
+    pub n_ff:      usize,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default = "default_rms_eps")]
+    pub rms_eps: f32,
+}
+fn default_rope_theta() -> f32 { 10000.0 }
+fn default_rms_eps()    -> f32 { 1e-5 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Network {
@@ -32,6 +50,12 @@ pub struct Network {
     // Next-token only.
     pub hidden_layers: Option<Vec<LayerDef>>,
     pub context_size: Option<usize>,
+
+    // Transformer only. Architecture hparams used to build the LM at create
+    // time. The vocabulary is grown to size from the attached corpus; if its
+    // real size differs from `vocab_size` here, training will rebuild.
+    #[serde(default)]
+    pub transformer: Option<TransformerHParams>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +81,9 @@ pub struct CreateNetworkRequest {
     /// Next-token only.
     #[serde(default)]
     pub context_size: Option<usize>,
+    /// Transformer only.
+    #[serde(default)]
+    pub transformer: Option<TransformerHParams>,
 }
 
 // ─── Vocabulary ─────────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 
 use neuralcabin_engine::nn::Model;
 use neuralcabin_engine::tokenizer::Vocabulary;
+use neuralcabin_engine::transformer::TransformerModel;
 
 use crate::models::{Corpus, Network, TrainingRun, VocabularyInfo};
 use crate::server::{ServerConfig, ServerRuntime};
@@ -121,6 +122,55 @@ pub async fn model_file_exists(network_id: &str, data_dir: &Path) -> bool {
     tokio::fs::try_exists(model_path(data_dir, network_id)).await.unwrap_or(false)
 }
 
+// ─── Transformer file helpers ─────────────────────────────────────────────
+//
+// Stored in a sibling directory so a single network ID never has both a Model
+// and a TransformerModel — the network's `kind` chooses which is canonical.
+
+fn transformer_path(data_dir: &Path, network_id: &str) -> PathBuf {
+    data_dir.join("transformers").join(format!("{network_id}.json"))
+}
+
+pub async fn save_transformer(t: &TransformerModel, network_id: &str, data_dir: &Path) -> Result<(), String> {
+    let json = serde_json::to_vec(t)
+        .map_err(|e| format!("serialize transformer {network_id}: {e}"))?;
+    let dir = data_dir.join("transformers");
+    tokio::fs::create_dir_all(&dir).await
+        .map_err(|e| format!("create transformers dir: {e}"))?;
+    let path = transformer_path(data_dir, network_id);
+    let tmp = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, &json).await
+        .map_err(|e| format!("write transformer tmp {network_id}: {e}"))?;
+    tokio::fs::rename(&tmp, &path).await
+        .map_err(|e| format!("rename transformer file {network_id}: {e}"))?;
+    Ok(())
+}
+
+pub async fn load_transformer(network_id: &str, data_dir: &Path) -> Result<Option<TransformerModel>, String> {
+    let path = transformer_path(data_dir, network_id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read transformer {}: {e}", path.display())),
+    };
+    let model: TransformerModel = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse transformer {}: {e}", path.display()))?;
+    Ok(Some(model))
+}
+
+pub async fn delete_transformer(network_id: &str, data_dir: &Path) -> Result<(), String> {
+    let path = transformer_path(data_dir, network_id);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("delete transformer {}: {e}", path.display())),
+    }
+}
+
+pub async fn transformer_file_exists(network_id: &str, data_dir: &Path) -> bool {
+    tokio::fs::try_exists(transformer_path(data_dir, network_id)).await.unwrap_or(false)
+}
+
 // ─── Snapshot / save / load ──────────────────────────────────────────────────
 
 /// Build a `PersistedState` snapshot from the live `AppState`.
@@ -162,6 +212,14 @@ pub async fn save_to_dir(state: &AppState, data_dir: &Path) -> Result<(), String
     for (id, model_arc) in models.iter() {
         let model = model_arc.read().await.clone();
         if let Err(e) = save_model(&model, id, data_dir).await {
+            eprintln!("[neuralcabin] {e}");
+        }
+    }
+    drop(models);
+    let transformers = state.transformers.read().await;
+    for (id, t_arc) in transformers.iter() {
+        let t = t_arc.read().await.clone();
+        if let Err(e) = save_transformer(&t, id, data_dir).await {
             eprintln!("[neuralcabin] {e}");
         }
     }
@@ -250,9 +308,15 @@ pub async fn apply(state: &AppState, persisted: PersistedState) {
 pub async fn reset_missing_model_flags(state: &AppState, data_dir: &Path) {
     let mut networks = state.networks.write().await;
     for (id, net) in networks.iter_mut() {
-        if net.trained && !model_file_exists(id, data_dir).await {
+        if !net.trained { continue; }
+        let exists = if net.kind == crate::models::kinds::TRANSFORMER {
+            transformer_file_exists(id, data_dir).await
+        } else {
+            model_file_exists(id, data_dir).await
+        };
+        if !exists {
             eprintln!(
-                "[neuralcabin] model file missing for '{}' ('{}'): marking untrained",
+                "[neuralcabin] weights missing for '{}' ('{}'): marking untrained",
                 id, net.name
             );
             net.trained = false;
@@ -301,6 +365,7 @@ mod tests {
             parameter_count: 17,
             hidden_layers: None,
             context_size: None,
+            transformer: None,
         }
     }
 

@@ -1,102 +1,192 @@
-export default function DocsTab() {
+import { Network } from '../api'
+
+export default function DocsTab({ networks: list }: { networks: Network[] }) {
+  const ff = list.filter(n => n.kind === 'feedforward')
+  const nt = list.filter(n => n.kind === 'next_token')
+  const trained = list.filter(n => n.trained).length
+
   return (
     <div className="tab-content">
-      <h2>📖 Documentation</h2>
+      <h2>Documentation</h2>
+      <p className="muted">
+        Honest reference for what NeuralCabin does and how its pieces fit
+        together. The numbers below are live — they reflect the current state
+        of your workspace.
+      </p>
 
       <div className="card">
-        <h3>Getting Started in 4 Steps</h3>
-        <ol style={{ paddingLeft: '20px', lineHeight: '1.8' }}>
-          <li>
-            <strong>Create a Network</strong> - Go to the <span style={{ color: '#d65a2a' }}>Networks</span> tab and click "Create New Network"
-          </li>
-          <li>
-            <strong>Create a Dataset</strong> - In the <span style={{ color: '#d65a2a' }}>Training</span> tab, create an XOR dataset
-          </li>
-          <li>
-            <strong>Start Training</strong> - Select your network and dataset, then click "Start Training"
-          </li>
-          <li>
-            <strong>Monitor Progress</strong> - Watch the loss curve update in real-time as your network trains
-          </li>
+        <h3>Workspace status</h3>
+        <table>
+          <tbody>
+            <tr><th>Total networks</th><td>{list.length}</td></tr>
+            <tr><th>Feed-forward</th><td>{ff.length}</td></tr>
+            <tr><th>Next-token</th><td>{nt.length}</td></tr>
+            <tr><th>Trained at least once</th><td>{trained}</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <h3>What this app actually does</h3>
+        <p>
+          NeuralCabin trains small neural networks entirely in Rust, with no
+          Python, no PyTorch, and no remote services. Training and inference
+          run on your GPU via the <a href="https://burn.dev" target="_blank"
+          rel="noreferrer">Burn</a> framework with the WGPU backend — on
+          laptops and low-end PCs that falls back gracefully to integrated
+          GPUs or CPU compute. The engine supports:
+        </p>
+        <ul style={{ paddingLeft: 20, lineHeight: 1.7 }}>
+          <li><code>Linear</code> (fully-connected) layers and five activations
+              (<code>identity</code>, <code>relu</code>, <code>sigmoid</code>, <code>tanh</code>, <code>softmax</code>).</li>
+          <li>Automatic differentiation provided by Burn's autodiff backend.</li>
+          <li>Two losses: <code>MeanSquaredError</code> and softmax + <code>CrossEntropy</code>.</li>
+          <li>Four optimizers: <code>Adam</code>, <code>AdamW</code>, <code>LAMB</code>, and <code>SGD</code> (with optional momentum).</li>
+          <li>Char-level and word-level tokenizers for text networks.</li>
+        </ul>
+        <p className="mt-2 muted">
+          <strong>What this app is NOT:</strong> there is no transformer,
+          no self-attention, no convolution, no RNN. Sequence modeling is a
+          fully-connected MLP that consumes a sliding window of one-hot tokens
+          and predicts the next token. It works for tiny corpora — don’t expect
+          GPT-quality output.
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>Workflow</h3>
+        <ol style={{ paddingLeft: 20, lineHeight: 1.8 }}>
+          <li><strong>Networks tab</strong>: design the architecture. Pick
+              feed-forward (numeric in/out) or next-token (text). The hidden-layer
+              spec field accepts a comma-separated list of dims and activations,
+              e.g. <code>64,relu,32,relu</code>.</li>
+          <li><strong>Corpus tab</strong>: attach training data. The form changes
+              with the network kind:
+              <ul style={{ paddingLeft: 20, marginTop: 6 }}>
+                <li>Feed-forward: paste or upload CSV — each row is{' '}
+                    <code>in_dim + out_dim</code> comma-separated numbers.</li>
+                <li>Next-token, <em>pretraining</em>: bulk-upload one or more
+                    <code>.txt</code> files. The vocabulary is built automatically.</li>
+                <li>Next-token, <em>fine-tuning</em>: provide input/output pairs
+                    in the editor or import a JSON file.</li>
+              </ul></li>
+          <li><strong>Vocabulary tab</strong>: inspect the vocabulary that the
+              corpus produced for next-token networks. Export to JSON.</li>
+          <li><strong>Training tab</strong>: pick epochs, batch size, optimizer,
+              learning rate, and (for fine-tuning) whether to mask user tokens.
+              Loss curves stream live as the model trains.</li>
+          <li><strong>Inference tab</strong>: feed inputs (or a prompt) to a
+              trained network. For next-token networks you also get per-token
+              probabilities for transparency.</li>
         </ol>
       </div>
 
       <div className="card">
-        <h3>Tab Guide</h3>
-        <div style={{ display: 'grid', gap: '12px' }}>
-          <div style={{ borderLeft: '4px solid #d65a2a', paddingLeft: '12px' }}>
-            <strong style={{ color: '#d65a2a' }}>🧠 Networks</strong>
-            <p style={{ fontSize: '14px', margin: '4px 0 0 0' }}>Create, view, and delete neural networks</p>
+        <h3>Network types</h3>
+        <div className="grid-2">
+          <div>
+            <h4>Feed-forward</h4>
+            <p>Numeric vectors in, numeric vectors out. Use for regression
+              (continuous targets) or classification (one-hot targets with a
+              softmax / cross-entropy combo).</p>
+            <p className="muted small mt-1">
+              Examples: XOR, polynomial regression, small tabular classifiers.
+            </p>
           </div>
-          <div style={{ borderLeft: '4px solid #d65a2a', paddingLeft: '12px' }}>
-            <strong style={{ color: '#d65a2a' }}>⚡ Training</strong>
-            <p style={{ fontSize: '14px', margin: '4px 0 0 0' }}>Configure and monitor training sessions with live loss plotting</p>
-          </div>
-          <div style={{ borderLeft: '4px solid #d65a2a', paddingLeft: '12px' }}>
-            <strong style={{ color: '#d65a2a' }}>📚 Corpus</strong>
-            <p style={{ fontSize: '14px', margin: '4px 0 0 0' }}>Manage training datasets (coming soon)</p>
-          </div>
-          <div style={{ borderLeft: '4px solid #d65a2a', paddingLeft: '12px' }}>
-            <strong style={{ color: '#d65a2a' }}>📝 Vocabulary</strong>
-            <p style={{ fontSize: '14px', margin: '4px 0 0 0' }}>Configure vocabularies for sequence models (coming soon)</p>
-          </div>
-          <div style={{ borderLeft: '4px solid #d65a2a', paddingLeft: '12px' }}>
-            <strong style={{ color: '#d65a2a' }}>🔮 Inference</strong>
-            <p style={{ fontSize: '14px', margin: '4px 0 0 0' }}>Test trained models with custom inputs (coming soon)</p>
-          </div>
-          <div style={{ borderLeft: '4px solid #d65a2a', paddingLeft: '12px' }}>
-            <strong style={{ color: '#d65a2a' }}>🔌 Plugins</strong>
-            <p style={{ fontSize: '14px', margin: '4px 0 0 0' }}>Extend NeuralCabin with custom plugins (coming soon)</p>
+          <div>
+            <h4>Next-token prediction</h4>
+            <p>Text in, text out — modelled as predicting the next token from a
+              fixed-size window of preceding tokens. The window is one-hot
+              encoded then fed through dense layers to <code>vocab_size</code> logits.</p>
+            <p className="muted small mt-1">
+              Two stages: <em>pretraining</em> on free-form text, then
+              optional <em>fine-tuning</em> on input/output pairs.
+            </p>
           </div>
         </div>
       </div>
 
       <div className="card">
-        <h3>Technology Stack</h3>
-        <p style={{ color: '#7d6b5f', marginBottom: '12px' }}>
-          NeuralCabin is built with modern, pure-Rust technology for maximum performance and safety.
+        <h3>Fine-tuning format</h3>
+        <p>
+          The fine-tuning JSON format used by the Corpus tab is a flat array of
+          objects, each with an <code>input</code> and <code>output</code> string:
         </p>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-          <div>
-            <p style={{ fontWeight: '600', color: '#d65a2a', marginBottom: '4px' }}>Backend</p>
-            <p style={{ fontSize: '13px' }}>Rust • Axum • Tokio</p>
-          </div>
-          <div>
-            <p style={{ fontWeight: '600', color: '#d65a2a', marginBottom: '4px' }}>Frontend</p>
-            <p style={{ fontSize: '13px' }}>React • TypeScript • Vite</p>
-          </div>
-          <div>
-            <p style={{ fontWeight: '600', color: '#d65a2a', marginBottom: '4px' }}>Engine</p>
-            <p style={{ fontSize: '13px' }}>Pure Rust • No External Math</p>
-          </div>
-          <div>
-            <p style={{ fontWeight: '600', color: '#d65a2a', marginBottom: '4px' }}>Communication</p>
-            <p style={{ fontSize: '13px' }}>REST API • WebSocket</p>
-          </div>
-        </div>
+        <pre style={{
+          background: 'var(--bg-input)', padding: 12, borderRadius: 'var(--radius)',
+          border: '1px solid var(--border)', overflow: 'auto', fontSize: 12,
+        }}>{`[
+  { "input": "what is 2 + 2?",   "output": "4" },
+  { "input": "what is 3 + 5?",   "output": "8" },
+  { "input": "is the sky blue?", "output": "yes" }
+]`}</pre>
+        <p className="mt-1">
+          Internally each pair is encoded as{' '}
+          <code>&lt;user&gt; input &lt;eos&gt; &lt;assistant&gt; output &lt;eos&gt;</code>{' '}
+          and one training example is emitted per token transition. With{' '}
+          <em>mask user tokens</em> on (the default), the model is only scored
+          on producing the assistant output — so it learns exactly when its
+          turn starts and when to stop.
+        </p>
       </div>
 
       <div className="card">
-        <h3>Current Features</h3>
-        <ul style={{ paddingLeft: '20px', lineHeight: '1.8' }}>
-          <li>✅ Create and manage neural networks</li>
-          <li>✅ Configure and run training sessions</li>
-          <li>✅ Real-time loss plotting via WebSocket</li>
-          <li>✅ Multiple optimizer support (Adam, SGD)</li>
-          <li>✅ Configurable epochs and batch size</li>
-        </ul>
+        <h3>Reserved vocabulary tokens</h3>
+        <table>
+          <thead><tr><th>ID</th><th>Token</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>0</code></td><td><code>&lt;pad&gt;</code></td><td>Left-padding for short contexts.</td></tr>
+            <tr><td><code>1</code></td><td><code>&lt;unk&gt;</code></td><td>Anything not in the trained vocab.</td></tr>
+            <tr><td><code>2</code></td><td><code>&lt;bos&gt;</code></td><td>Beginning of sequence (reserved).</td></tr>
+            <tr><td><code>3</code></td><td><code>&lt;eos&gt;</code></td><td>End of a turn; halts generation when sampled.</td></tr>
+            <tr><td><code>4</code></td><td><code>&lt;user&gt;</code></td><td>Start of a user message in fine-tune / chat mode.</td></tr>
+            <tr><td><code>5</code></td><td><code>&lt;assistant&gt;</code></td><td>Start of an assistant reply in fine-tune / chat mode.</td></tr>
+          </tbody>
+        </table>
+        <p className="muted small mt-1">
+          Fine-tuning pairs are encoded as{' '}
+          <code>&lt;user&gt; input &lt;eos&gt; &lt;assistant&gt; output &lt;eos&gt;</code>,
+          and the chat inference prompt is wrapped the same way so the model
+          knows when to start its reply and when to stop.
+        </p>
       </div>
 
       <div className="card">
-        <h3>Coming Soon</h3>
-        <ul style={{ paddingLeft: '20px', lineHeight: '1.8' }}>
-          <li>Model persistence and loading</li>
-          <li>Corpus/dataset file upload</li>
-          <li>Vocabulary editor</li>
-          <li>Inference/generation features</li>
-          <li>Plugin system</li>
-          <li>Training pause/resume</li>
-        </ul>
+        <h3>Hidden-layer mini-language</h3>
+        <p>
+          The hidden-layer field on the Networks form takes a comma-separated
+          list. Numbers become Linear layers (with the given output dim);
+          words become activations.
+        </p>
+        <table>
+          <thead><tr><th>Spec</th><th>Resulting layers</th></tr></thead>
+          <tbody>
+            <tr><td><code>8,tanh</code></td><td>Linear → 8 · tanh</td></tr>
+            <tr><td><code>64,relu,32,relu</code></td><td>Linear → 64 · relu · Linear → 32 · relu</td></tr>
+            <tr><td><code>(empty)</code></td><td>Direct projection from input to output (no hidden layer)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <h3>How training actually runs</h3>
+        <ol style={{ paddingLeft: 20, lineHeight: 1.7 }}>
+          <li>The frontend sends a <code>StartTrainingRequest</code> over Tauri IPC.</li>
+          <li>The backend builds an <code>(X, Y)</code> tensor pair from the
+              attached corpus — sliding windows for next-token networks, raw
+              rows for feed-forward.</li>
+          <li>An <code>Optimizer</code> is constructed sized to the model’s
+              actual parameter shapes.</li>
+          <li>For each epoch the example indices are shuffled (deterministic
+              from <code>seed</code>) and processed in batches.</li>
+          <li>Each batch runs a real autograd pass: the loss is built into a
+              fresh tape, gradients flow backward, and the optimizer updates
+              weights in place.</li>
+          <li>After every epoch, a <code>training_update</code> event is emitted
+              with the mean batch loss.</li>
+          <li>When the run finishes, the network is marked as <code>trained</code>
+              and inference becomes meaningful.</li>
+        </ol>
       </div>
     </div>
   )

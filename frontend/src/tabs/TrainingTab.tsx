@@ -1,327 +1,328 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { type UnlistenFn } from '@tauri-apps/api/event'
-import { networks, datasets, training, Network, Dataset } from '../api'
+import {
+  training, corpus, OptimizerConfig, CorpusStats,
+} from '../api'
+import type { TabProps } from '../App'
 
-export default function TrainingTab() {
-  const [networksList, setNetworksList] = useState<Network[]>([])
-  const [datasetsList, setDatasetsList] = useState<Dataset[]>([])
-  const [selectedNetworkId, setSelectedNetworkId] = useState('')
-  const [selectedDatasetId, setSelectedDatasetId] = useState('')
+interface RunState {
+  running: boolean
+  epoch: number
+  totalEpochs: number
+  lastLoss: number
+  lossHistory: number[]
+  elapsedSecs: number
+  finalStatus?: 'completed' | 'cancelled' | 'aborted'
+}
+
+const EMPTY_RUN: RunState = { running: false, epoch: 0, totalEpochs: 0, lastLoss: 0, lossHistory: [], elapsedSecs: 0 }
+
+export default function TrainingTab({ network, refreshNetworks }: TabProps) {
+  const [stats, setStats] = useState<CorpusStats | null>(null)
+
+  const [epochs, setEpochs] = useState(500)
+  const [batchSize, setBatchSize] = useState(32)
+  const [seed, setSeed] = useState(42)
+  const [optKind, setOptKind] = useState<'adam' | 'adamw' | 'lamb' | 'sgd'>('adam')
+  const [lr, setLr] = useState(0.01)
+  const [momentum, setMomentum] = useState(0.9)
+  const [maskUserTokens, setMaskUserTokens] = useState(true)
+
   const [trainingId, setTrainingId] = useState<string | null>(null)
-  const [trainingStatus, setTrainingStatus] = useState({
-    running: false,
-    epoch: 0,
-    totalEpochs: 0,
-    lastLoss: 0,
-    lossHistory: [] as number[],
-    elapsedSecs: 0,
-  })
+  const [run, setRun] = useState<RunState>(EMPTY_RUN)
   const [error, setError] = useState<string | null>(null)
+  const finishedListenersRef = useRef<UnlistenFn[]>([])
 
   useEffect(() => {
-    loadNetworks()
-    loadDatasets()
-  }, [])
+    if (network) void loadStats(network.id)
+    else setStats(null)
+  }, [network])
 
+  const isNextToken = network?.kind === 'next_token'
+  const lossLabel = isNextToken ? 'crossentropy (forced for next-token)' : 'mse'
+
+  // Subscribe to training events whenever a job is active
   useEffect(() => {
     if (!trainingId) return
-
-    let unlistenUpdate: UnlistenFn | null = null
-    let unlistenFinished: UnlistenFn | null = null
-    let unlistenError: UnlistenFn | null = null
+    let cancelled = false
+    const cleanups: UnlistenFn[] = []
 
     const setup = async () => {
-      unlistenUpdate = await training.onUpdate((update) => {
-        if (update.training_id !== trainingId) return
-        setTrainingStatus({
-          running: true,
-          epoch: update.epoch,
-          totalEpochs: update.total_epochs,
-          lastLoss: update.loss,
-          lossHistory: update.loss_history,
-          elapsedSecs: update.elapsed_secs,
+      const u = await training.onUpdate(u => {
+        if (cancelled || u.training_id !== trainingId) return
+        setRun({
+          running: true, epoch: u.epoch, totalEpochs: u.total_epochs,
+          lastLoss: u.loss, lossHistory: u.loss_history, elapsedSecs: u.elapsed_secs,
         })
       })
-
-      unlistenFinished = await training.onFinished((result) => {
-        if (result.training_id !== trainingId) return
-        setTrainingStatus((prev) => ({
+      const f = await training.onFinished(r => {
+        if (cancelled || r.training_id !== trainingId) return
+        setRun(prev => ({
           ...prev,
           running: false,
-          lastLoss: result.final_loss,
+          lastLoss: r.final_loss,
+          elapsedSecs: r.elapsed_secs,
+          finalStatus: r.status,
         }))
+        // Reload network list so "trained" badge updates
+        void refreshNetworks()
       })
-
-      unlistenError = await training.onError((err) => {
-        if (err.training_id !== trainingId) return
+      const e = await training.onError(err => {
+        if (cancelled || err.training_id !== trainingId) return
         setError(err.message)
-        setTrainingStatus((prev) => ({ ...prev, running: false }))
+        setRun(prev => ({ ...prev, running: false }))
       })
+      cleanups.push(u, f, e)
     }
-
-    setup()
-
-    return () => {
-      unlistenUpdate?.()
-      unlistenFinished?.()
-      unlistenError?.()
-    }
+    void setup()
+    finishedListenersRef.current = cleanups
+    return () => { cancelled = true; cleanups.forEach(c => c()) }
   }, [trainingId])
 
-  const loadNetworks = async () => {
-    try {
-      const list = await networks.list()
-      setNetworksList(list)
-      if (list.length > 0) setSelectedNetworkId(list[0].id)
-    } catch (e) {
-      setError(String(e))
-    }
+  const loadStats = async (id: string) => {
+    try { setStats(await corpus.stats(id)) }
+    catch (e) { setStats(null) /* not having a corpus is OK */ }
   }
 
-  const loadDatasets = async () => {
+  const start = async () => {
+    if (!network) return
+    setError(null); setRun({ ...EMPTY_RUN, running: true, totalEpochs: epochs })
+    const optimizer: OptimizerConfig = { kind: optKind, lr }
+    if (optKind === 'sgd') optimizer.momentum = momentum
     try {
-      const list = await datasets.list()
-      setDatasetsList(list)
-      if (list.length > 0) setSelectedDatasetId(list[0].id)
-    } catch (e) {
-      setError(String(e))
-    }
-  }
-
-  const createDatasetXor = async () => {
-    try {
-      await datasets.create({ name: 'xor', kind: 'xor', seed: 42 })
-      await loadDatasets()
-    } catch (e) {
-      setError(String(e))
-    }
-  }
-
-  const startTraining = async () => {
-    if (!selectedNetworkId || !selectedDatasetId) {
-      setError('Please select both network and dataset')
-      return
-    }
-
-    try {
-      const response = await training.start({
-        network_id: selectedNetworkId,
-        dataset_id: selectedDatasetId,
+      const r = await training.start({
+        network_id: network.id,
         config: {
-          epochs: 2000,
-          batch_size: 4,
-          optimizer: { kind: 'adam', lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
-          loss: 'mse',
-          validation_frac: 0.2,
-          seed: 42,
+          epochs, batch_size: batchSize, optimizer,
+          loss: isNextToken ? 'crossentropy' : 'mse',
+          seed,
+          mask_user_tokens: isNextToken ? maskUserTokens : undefined,
         },
       })
-
-      setTrainingId(response.training_id)
-      setTrainingStatus({
-        running: true,
-        epoch: 0,
-        totalEpochs: 2000,
-        lastLoss: 0,
-        lossHistory: [],
-        elapsedSecs: 0,
-      })
-      setError(null)
+      setTrainingId(r.training_id)
     } catch (e) {
       setError(String(e))
+      setRun(EMPTY_RUN)
     }
   }
+
+  const reset = () => { setTrainingId(null); setRun(EMPTY_RUN); setError(null) }
+
+  const examples = stats?.training_examples ?? 0
+  const corpusReady = examples > 0
 
   return (
     <div className="tab-content">
-      <h2>⚡ Training</h2>
+      <h2>Training</h2>
+      <p className="muted">Train the selected network on its attached corpus.</p>
 
       {error && <div className="status error">{error}</div>}
 
+      {network && (
+        <div className="card">
+          <p className="muted">
+            <span className="chip">{network.name}</span>{' '}
+            <span className="chip">{network.input_dim} → {network.output_dim}</span>{' '}
+            <span className="chip">{network.parameter_count.toLocaleString()} params</span>{' '}
+            <span className="chip">{examples.toLocaleString()} training examples</span>
+            {!corpusReady && <span className="status error" style={{ display: 'inline-block', marginLeft: 8 }}>
+              No corpus attached. Add data on the Corpus tab.
+            </span>}
+          </p>
+        </div>
+      )}
+
       {!trainingId ? (
-        <div>
-          <div className="card">
-            <h3>Configure Training Session</h3>
-            <p style={{ color: '#7d6b5f', marginBottom: '16px' }}>
-              Select a network and dataset, then start training to monitor real-time loss.
-            </p>
-
-            <div style={{ marginBottom: '16px' }}>
-              <label>Select Network:</label>
-              {networksList.length === 0 ? (
-                <p style={{ color: '#9b8a7f', fontStyle: 'italic' }}>
-                  No networks found. Create one in the Networks tab.
-                </p>
-              ) : (
-                <select
-                  value={selectedNetworkId}
-                  onChange={(e) => setSelectedNetworkId(e.target.value)}
-                >
-                  {networksList.map((net) => (
-                    <option key={net.id} value={net.id}>
-                      {net.name} ({net.kind})
-                    </option>
-                  ))}
-                </select>
-              )}
+        <div className="card">
+          <h3>Configuration</h3>
+          <div className="grid-3">
+            <div>
+              <label>Epochs</label>
+              <input type="number" min={1} value={epochs}
+                onChange={e => setEpochs(Math.max(1, parseInt(e.target.value) || 1))} />
             </div>
-
-            <div style={{ marginBottom: '20px' }}>
-              <label>Select Dataset:</label>
-              {datasetsList.length === 0 ? (
-                <div>
-                  <p style={{ color: '#9b8a7f', fontStyle: 'italic', marginBottom: '8px' }}>
-                    No datasets available. Create one:
-                  </p>
-                  <button onClick={createDatasetXor} style={{ width: '100%' }}>
-                    + Create XOR Dataset
-                  </button>
-                </div>
-              ) : (
-                <select
-                  value={selectedDatasetId}
-                  onChange={(e) => setSelectedDatasetId(e.target.value)}
-                >
-                  {datasetsList.map((ds) => (
-                    <option key={ds.id} value={ds.id}>
-                      {ds.name} ({ds.samples} samples)
-                    </option>
-                  ))}
-                </select>
-              )}
+            <div>
+              <label>Batch size</label>
+              <input type="number" min={1} value={batchSize}
+                onChange={e => setBatchSize(Math.max(1, parseInt(e.target.value) || 1))} />
             </div>
-
-            <button
-              onClick={startTraining}
-              disabled={!selectedNetworkId || !selectedDatasetId}
-              style={{ width: '100%', padding: '12px', fontSize: '16px' }}
-            >
-              🚀 Start Training
-            </button>
+            <div>
+              <label>Seed</label>
+              <input type="number" value={seed}
+                onChange={e => setSeed(parseInt(e.target.value) || 0)} />
+            </div>
+            <div>
+              <label>Optimizer</label>
+              <select value={optKind} onChange={e => setOptKind(e.target.value as 'adam' | 'adamw' | 'lamb' | 'sgd')}>
+                <option value="adam">Adam</option>
+                <option value="adamw">AdamW</option>
+                <option value="lamb">LAMB</option>
+                <option value="sgd">SGD</option>
+              </select>
+            </div>
+            <div>
+              <label>Learning rate</label>
+              <input type="number" step="0.001" min={0} value={lr}
+                onChange={e => setLr(parseFloat(e.target.value) || 0)} />
+            </div>
+            {optKind === 'sgd' && (
+              <div>
+                <label>Momentum</label>
+                <input type="number" step="0.01" min={0} max={1} value={momentum}
+                  onChange={e => setMomentum(parseFloat(e.target.value) || 0)} />
+              </div>
+            )}
+            <div>
+              <label>Loss</label>
+              <input value={lossLabel} disabled />
+            </div>
+            {isNextToken && stats?.stage === 'finetune' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label>Mask user tokens</label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, textTransform: 'none', letterSpacing: 0, color: 'var(--text)' }}>
+                  <input type="checkbox" style={{ width: 'auto' }} checked={maskUserTokens}
+                    onChange={e => setMaskUserTokens(e.target.checked)} />
+                  Score loss only on assistant output
+                </label>
+              </div>
+            )}
           </div>
-
-          <div className="card">
-            <h3>Training Configuration</h3>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-              {[
-                ['Epochs', '2000'],
-                ['Batch Size', '4'],
-                ['Optimizer', 'Adam (lr=0.05)'],
-                ['Loss Function', 'Mean Squared Error'],
-              ].map(([label, value]) => (
-                <div key={label}>
-                  <p style={{ color: '#d65a2a', fontWeight: '600', marginBottom: '4px' }}>{label}</p>
-                  <p style={{ fontSize: label === 'Epochs' || label === 'Batch Size' ? '18px' : '14px', fontWeight: 'bold' }}>
-                    {value}
-                  </p>
-                </div>
-              ))}
-            </div>
+          <div className="flex mt-2">
+            <button onClick={start} disabled={!network || !corpusReady}>
+              Start training
+            </button>
           </div>
         </div>
       ) : (
-        <div>
-          <div className="status success">
-            ⚡ Training{trainingStatus.running ? ' in Progress' : ' Complete'}: Epoch{' '}
-            {trainingStatus.epoch} / {trainingStatus.totalEpochs}
-          </div>
-
-          <div className="card">
-            <h3>Training Metrics</h3>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px' }}>
-              <div>
-                <p style={{ color: '#9b8a7f', marginBottom: '4px' }}>Current Loss</p>
-                <p style={{ fontSize: '28px', color: '#d65a2a', fontWeight: 'bold' }}>
-                  {trainingStatus.lastLoss.toFixed(6)}
-                </p>
-              </div>
-              <div>
-                <p style={{ color: '#9b8a7f', marginBottom: '4px' }}>Elapsed Time</p>
-                <p style={{ fontSize: '28px', color: '#d65a2a', fontWeight: 'bold' }}>
-                  {trainingStatus.elapsedSecs.toFixed(1)}s
-                </p>
-              </div>
-            </div>
-
-            <p style={{ color: '#9b8a7f', marginBottom: '8px', fontSize: '14px' }}>Progress</p>
-            <div
-              style={{
-                width: '100%',
-                height: '32px',
-                background: '#f0e6dc',
-                borderRadius: '8px',
-                overflow: 'hidden',
-                border: '2px solid #e0b8a0',
-              }}
-            >
-              <div
-                style={{
-                  height: '100%',
-                  width: `${(trainingStatus.epoch / (trainingStatus.totalEpochs || 1)) * 100}%`,
-                  background: 'linear-gradient(90deg, #d65a2a 0%, #e07640 100%)',
-                  transition: 'width 0.3s ease',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: 'white',
-                  fontSize: '12px',
-                  fontWeight: 'bold',
-                }}
-              >
-                {((trainingStatus.epoch / (trainingStatus.totalEpochs || 1)) * 100).toFixed(1)}%
-              </div>
-            </div>
-          </div>
-
-          <div className="plot">
-            <h3>Loss Over Time</h3>
-            {trainingStatus.lossHistory.length > 0 ? (
-              <svg
-                width="100%"
-                height="250"
-                style={{ background: '#f9f5f0', marginTop: '12px', borderRadius: '6px', border: '1px solid #e0b8a0' }}
-                viewBox="0 0 100 100"
-                preserveAspectRatio="none"
-              >
-                <line x1="0" y1="50" x2="100" y2="50" stroke="#e0b8a0" strokeWidth="0.2" />
-                <line x1="0" y1="25" x2="100" y2="25" stroke="#e0b8a0" strokeWidth="0.2" />
-                <line x1="0" y1="75" x2="100" y2="75" stroke="#e0b8a0" strokeWidth="0.2" />
-                <polyline
-                  points={trainingStatus.lossHistory
-                    .map((loss, i) => {
-                      const x = (i / (trainingStatus.lossHistory.length - 1 || 1)) * 100
-                      const maxLoss = Math.max(...trainingStatus.lossHistory)
-                      const y = (1 - loss / (maxLoss || 1)) * 90 + 5
-                      return `${x} ${y}`
-                    })
-                    .join(' ')}
-                  fill="none"
-                  stroke="#d65a2a"
-                  strokeWidth="0.8"
-                  vectorEffect="non-scaling-stroke"
-                />
-              </svg>
-            ) : (
-              <p style={{ color: '#9b8a7f', fontStyle: 'italic', marginTop: '20px', textAlign: 'center' }}>
-                Waiting for training data...
-              </p>
-            )}
-          </div>
-
-          {!trainingStatus.running && (
-            <button
-              onClick={() => {
-                setTrainingId(null)
-                setTrainingStatus({ running: false, epoch: 0, totalEpochs: 0, lastLoss: 0, lossHistory: [], elapsedSecs: 0 })
-                setError(null)
-              }}
-              style={{ width: '100%', padding: '12px', fontSize: '16px', marginTop: '12px' }}
-            >
-              🚀 Start New Training
-            </button>
-          )}
-        </div>
+        <RunView run={run} trainingId={trainingId} onReset={reset} onError={setError} />
       )}
+    </div>
+  )
+}
+
+function RunView({ run, trainingId, onReset, onError }: {
+  run: RunState
+  trainingId: string | null
+  onReset: () => void
+  onError: (e: string | null) => void
+}) {
+  const [stopping, setStopping] = useState<'stop' | 'abort' | null>(null)
+
+  const onStopHere = async () => {
+    if (!trainingId) return
+    setStopping('stop'); onError(null)
+    try { await training.stop(trainingId) }
+    catch (e) { onError(String(e)) }
+  }
+  const onAbort = async () => {
+    if (!trainingId) return
+    setStopping('abort'); onError(null)
+    try { await training.abort(trainingId) }
+    catch (e) { onError(String(e)) }
+  }
+
+  return (
+    <>
+      <div className={`status ${run.running ? '' : (run.finalStatus === 'aborted' ? 'error' : 'success')}`}>
+        {run.running
+          ? `Training… epoch ${run.epoch} / ${run.totalEpochs}`
+          : run.finalStatus === 'aborted'
+            ? `Aborted — model rolled back to pre-training weights (${run.elapsedSecs.toFixed(1)}s)`
+            : run.finalStatus === 'cancelled'
+              ? `Stopped at epoch ${run.epoch} — kept current weights (${run.elapsedSecs.toFixed(1)}s)`
+              : `Done — ${run.totalEpochs} epochs in ${run.elapsedSecs.toFixed(1)}s`}
+      </div>
+
+      <div className="card">
+        <div className="grid-3">
+          <Metric label="Epoch" value={`${run.epoch} / ${run.totalEpochs}`} />
+          <Metric label="Loss"  value={run.lastLoss.toFixed(6)} />
+          <Metric label="Time"  value={`${run.elapsedSecs.toFixed(1)}s`} />
+        </div>
+        <ProgressBar epoch={run.epoch} total={run.totalEpochs} />
+
+        {run.running && (
+          <div className="flex mt-2">
+            <button
+              className="secondary"
+              onClick={onStopHere}
+              disabled={stopping !== null}
+              title="Halt training and keep whatever the model has learned so far."
+            >
+              {stopping === 'stop' ? 'Stopping…' : 'Stop here'}
+            </button>
+            <button
+              className="danger"
+              onClick={onAbort}
+              disabled={stopping !== null}
+              title="Halt training AND revert the model to its pre-training weights."
+            >
+              {stopping === 'abort' ? 'Aborting…' : 'Abort'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="plot">
+        <h3>Loss over epochs</h3>
+        <LossPlot history={run.lossHistory} />
+      </div>
+
+      {!run.running && (
+        <button onClick={onReset}>Start a new run</button>
+      )}
+    </>
+  )
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="muted small">{label}</p>
+      <p style={{ fontSize: 22, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{value}</p>
+    </div>
+  )
+}
+
+function ProgressBar({ epoch, total }: { epoch: number; total: number }) {
+  const pct = total > 0 ? (epoch / total) * 100 : 0
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div style={{ height: 6, background: 'var(--bg-input)', borderRadius: 3, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: 'var(--accent)', transition: 'width 0.2s ease' }} />
+      </div>
+      <p className="muted small mt-1" style={{ textAlign: 'right' }}>{pct.toFixed(1)}%</p>
+    </div>
+  )
+}
+
+function LossPlot({ history }: { history: number[] }) {
+  if (history.length === 0) {
+    return <p className="muted">Waiting for first epoch…</p>
+  }
+  const max = Math.max(...history)
+  const min = Math.min(...history)
+  const range = max - min || 1
+
+  // SVG viewBox in 100x100, paint grid + line
+  const points = history.map((v, i) => {
+    const x = (i / Math.max(history.length - 1, 1)) * 100
+    const y = 100 - ((v - min) / range) * 90 - 5
+    return `${x},${y}`
+  }).join(' ')
+
+  return (
+    <div>
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none"
+           style={{ width: '100%', height: 220, background: 'var(--bg-input)', borderRadius: 4 }}>
+        {[25, 50, 75].map(y => (
+          <line key={y} x1="0" y1={y} x2="100" y2={y} stroke="var(--border-soft)" strokeWidth="0.2" />
+        ))}
+        <polyline points={points} fill="none" stroke="var(--accent)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <p className="muted small mt-1">
+        min {min.toFixed(6)} · max {max.toFixed(6)} · last {history[history.length - 1].toFixed(6)}
+      </p>
     </div>
   )
 }

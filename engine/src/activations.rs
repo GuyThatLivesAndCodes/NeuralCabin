@@ -1,8 +1,16 @@
-//! Activation functions used both at inference time (pure tensor ops) and as
-//! tape nodes during training (see `autograd::Tape`).
+//! Activation functions.
+//!
+//! Activations are stored as a serializable enum so models can be persisted.
+//! Two surfaces exist:
+//! - `apply(&Tensor)` — pure CPU op used for inference, eager evaluation, and
+//!   serialization round-trips.
+//! - `apply_burn(...)` — applies the activation to a Burn tensor inside the
+//!   training loop (called from `nn::Model::train_step`).
 
-use crate::autograd::{Tape, Value};
 use crate::tensor::Tensor;
+use burn::tensor::backend::Backend;
+use burn::tensor::activation;
+use burn::tensor::Tensor as BurnTensor;
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,8 +45,8 @@ impl Activation {
         ]
     }
 
-    /// Pure-tensor forward (used for inference and Softmax inside the cross-entropy
-    /// op).
+    /// Pure-tensor forward (CPU). Used for inference and inside the
+    /// softmax-cross-entropy loss.
     pub fn apply(&self, x: &Tensor) -> Tensor {
         match self {
             Activation::Identity => x.clone(),
@@ -49,19 +57,21 @@ impl Activation {
         }
     }
 
-    /// Tape forward: registers an autograd node for this activation.
-    /// Softmax during training is handled by `Tape::softmax_cross_entropy`,
-    /// so this function panics if you ask it to insert a standalone Softmax node.
-    pub fn forward(&self, tape: &mut Tape, x: Value) -> Value {
+    /// Apply this activation inside Burn's computation graph.
+    ///
+    /// Softmax during training is normally folded into the cross-entropy loss
+    /// (`loss::Loss::CrossEntropy` does this), so this path returns the raw
+    /// logits unchanged for `Softmax` — the loss handles it.
+    pub fn apply_burn<B: Backend>(&self, x: BurnTensor<B, 2>) -> BurnTensor<B, 2> {
         match self {
             Activation::Identity => x,
-            Activation::ReLU => tape.relu(x),
-            Activation::Sigmoid => tape.sigmoid(x),
-            Activation::Tanh => tape.tanh(x),
-            Activation::Softmax => panic!(
-                "Softmax cannot be used as an autograd activation node — pair it with \
-                 Loss::CrossEntropy at the model output instead."
-            ),
+            Activation::ReLU => activation::relu(x),
+            Activation::Sigmoid => activation::sigmoid(x),
+            Activation::Tanh => x.tanh(),
+            // The loss layer applies the softmax internally for numerical
+            // stability (`log_softmax + nll`). Returning the logits here is
+            // correct for that combo.
+            Activation::Softmax => x,
         }
     }
 }

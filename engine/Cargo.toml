@@ -13,3 +13,9 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Burn provides tensor ops, autodiff, and optimizers with a pluggable backend.
+# - `wgpu`     : GPU acceleration (cross-platform, runs on laptop/low-end GPUs)
+# - `autodiff` : automatic differentiation (replaces our hand-written tape)
+# - `ndarray`  : CPU backend (required so `cargo test` runs without a GPU)
+# - `std`      : standard library bridge
+burn = { version = "0.16", default-features = false, features = ["wgpu", "autodiff", "ndarray", "std"] }

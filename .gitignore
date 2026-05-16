@@ -7,3 +7,4 @@ data/
 .vscode/
 .idea/
 node_modules/
+src-tauri/gen/

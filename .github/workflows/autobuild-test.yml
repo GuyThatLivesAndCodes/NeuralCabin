@@ -62,12 +62,22 @@ jobs:
       - name: Generate Tauri icons
         run: npx tauri icon assets/icon.png
 
+      # Run the Tauri-crate unit tests (persistence roundtrip, etc.). Skipped
+      # on platforms where the engine-tests job already covers the same code
+      # path is NOT what we want — these tests live in the neuralcabin crate
+      # and depend on tauri's runtime, so they only compile after the system
+      # dependencies above are installed.
+      - name: Test Tauri crate
+        run: cargo test --package neuralcabin --lib --no-fail-fast
+
       - name: Build frontend
         run: npm --prefix frontend run build
 
-      # Build the Tauri binary (no installer bundle needed for CI checks)
+      # Build the Tauri app via the Tauri CLI so the frontend assets are
+      # bundled into the binary. Plain `cargo build` produces a binary that
+      # falls back to devUrl (localhost) at runtime — broken for end users.
       - name: Build Tauri app
-        run: cargo build --package neuralcabin --release
+        run: npm run tauri -- build --no-bundle
 
       - name: Upload binary (Linux)
         if: runner.os == 'Linux'

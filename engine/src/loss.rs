@@ -1,9 +1,11 @@
-//! Loss functions, both as eager scalars (for inference / metrics) and as
-//! autograd nodes (for training).
+//! Loss functions — eager (CPU) for evaluation and Burn-graph variants for
+//! training.
 
 use crate::activations::softmax_rows;
-use crate::autograd::{Tape, Value};
 use crate::tensor::Tensor;
+use burn::tensor::backend::Backend;
+use burn::tensor::activation::log_softmax;
+use burn::tensor::Tensor as BurnTensor;
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,15 +30,32 @@ impl Loss {
         &[Loss::MeanSquaredError, Loss::CrossEntropy]
     }
 
-    /// Build the loss into the tape and return the scalar loss handle.
-    pub fn build(&self, tape: &mut Tape, output: Value, target: &Tensor) -> Value {
+    /// Compute the loss inside Burn's autodiff graph. Returns a scalar tensor.
+    ///
+    /// - MSE        : mean over all elements of (pred - target)²
+    /// - CrossEntropy: softmax + categorical cross-entropy over the class axis.
+    ///   `target` is expected to be one-hot encoded with shape `(batch, classes)`.
+    pub fn forward_burn<B: Backend>(
+        &self,
+        pred: BurnTensor<B, 2>,
+        target: BurnTensor<B, 2>,
+    ) -> BurnTensor<B, 1> {
         match self {
-            Loss::MeanSquaredError => tape.mse_loss(output, target.clone()),
-            Loss::CrossEntropy => tape.softmax_cross_entropy(output, target.clone()),
+            Loss::MeanSquaredError => {
+                let diff = pred - target;
+                let sq = diff.clone() * diff;
+                sq.mean()
+            }
+            Loss::CrossEntropy => {
+                // log_softmax + categorical cross-entropy, averaged across batch.
+                // log_softmax expects the class dim; for `(batch, classes)` that's dim=1.
+                let log_p = log_softmax(pred, 1);
+                -(target * log_p).sum_dim(1).mean()
+            }
         }
     }
 
-    /// Eager scalar — handy for evaluating a model without the autograd tape.
+    /// Eager scalar — handy for evaluating a model without a Burn graph.
     pub fn eval(&self, output: &Tensor, target: &Tensor) -> f32 {
         match self {
             Loss::MeanSquaredError => {

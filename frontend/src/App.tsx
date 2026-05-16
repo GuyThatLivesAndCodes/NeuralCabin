@@ -1,68 +1,110 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import NetworksTab from './tabs/NetworksTab'
 import CorpusTab from './tabs/CorpusTab'
 import VocabTab from './tabs/VocabTab'
 import TrainingTab from './tabs/TrainingTab'
 import InferenceTab from './tabs/InferenceTab'
-import PluginsTab from './tabs/PluginsTab'
 import DocsTab from './tabs/DocsTab'
+import SettingsTab from './tabs/SettingsTab'
+import { networks, Network } from './api'
+import { applySettings, loadSettings } from './settings'
 
-type Tab = 'docs' | 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'plugins'
+type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'docs' | 'settings'
 
-function App() {
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'networks',  label: 'Networks' },
+  { id: 'corpus',    label: 'Corpus' },
+  { id: 'vocab',     label: 'Vocabulary' },
+  { id: 'training',  label: 'Training' },
+  { id: 'inference', label: 'Inference' },
+  { id: 'docs',      label: 'Documentation' },
+  { id: 'settings',  label: 'Settings' },
+]
+
+export interface TabProps {
+  network: Network | null
+  refreshNetworks: () => Promise<void>
+}
+
+export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('networks')
+  const [list, setList] = useState<Network[]>([])
+  const [selectedId, setSelectedId] = useState<string | null>(null)
 
-  const tabs: { id: Tab; label: string; icon: string }[] = [
-    { id: 'docs', label: 'Documentation', icon: '📖' },
-    { id: 'networks', label: 'Networks', icon: '🧠' },
-    { id: 'corpus', label: 'Corpus', icon: '📚' },
-    { id: 'vocab', label: 'Vocabulary', icon: '📝' },
-    { id: 'training', label: 'Training', icon: '⚡' },
-    { id: 'inference', label: 'Inference', icon: '🔮' },
-    { id: 'plugins', label: 'Plugins', icon: '🔌' },
-  ]
+  const refresh = useCallback(async () => {
+    try {
+      const items = await networks.list()
+      setList(items)
+      // If our selection has gone away (e.g. user deleted), reset.
+      setSelectedId(prev => {
+        if (prev && items.some(n => n.id === prev)) return prev
+        return items.length > 0 ? items[0].id : null
+      })
+    } catch {
+      setList([])
+      setSelectedId(null)
+    }
+  }, [])
+
+  useEffect(() => { void refresh() }, [refresh])
+
+  // Apply user theme settings on boot so the primary color picked in
+  // Settings persists across restarts.
+  useEffect(() => { applySettings(loadSettings()) }, [])
+
+  const selected = list.find(n => n.id === selectedId) ?? null
+  const props: TabProps = { network: selected, refreshNetworks: refresh }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
-      <header>
-        <div style={{ padding: '20px 24px' }}>
-          <h1>🧠 NeuralCabin</h1>
-          <p style={{ margin: '4px 0 0 0', color: '#9b8a7f', fontSize: '14px' }}>
-            Pure Rust Neural Network Workbench
-          </p>
+      <header className="app-header">
+        <h1>NeuralCabin</h1>
+        <span className="subtitle">Pure Rust neural-network workbench</span>
+        <div className="spacer" />
+        <div className="network-picker">
+          <label className="picker-label">Network</label>
+          <select
+            value={selectedId ?? ''}
+            onChange={e => setSelectedId(e.target.value || null)}
+            disabled={list.length === 0}
+          >
+            {list.length === 0 ? (
+              <option value="">— no networks yet —</option>
+            ) : (
+              list.map(n => (
+                <option key={n.id} value={n.id}>
+                  {n.name} · {n.kind === 'next_token' ? 'next-token' : 'feed-forward'}
+                  {n.trained ? ' · trained' : ''}
+                </option>
+              ))
+            )}
+          </select>
         </div>
       </header>
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        <nav className="tabs" style={{ width: '200px' }}>
-          {tabs.map((tab) => (
+        <nav className="tabs">
+          {TABS.map((tab) => (
             <button
               key={tab.id}
               className={`tab-button ${activeTab === tab.id ? 'active' : ''}`}
               onClick={() => setActiveTab(tab.id)}
-              style={{
-                fontSize: '14px',
-                paddingLeft: '16px',
-              }}
             >
-              <span style={{ marginRight: '8px' }}>{tab.icon}</span>
               {tab.label}
             </button>
           ))}
         </nav>
 
-        <div style={{ flex: 1, overflow: 'auto', background: 'linear-gradient(135deg, #faf8f3 0%, #f5ede2 100%)' }}>
-          {activeTab === 'docs' && <DocsTab />}
-          {activeTab === 'networks' && <NetworksTab />}
-          {activeTab === 'corpus' && <CorpusTab />}
-          {activeTab === 'vocab' && <VocabTab />}
-          {activeTab === 'training' && <TrainingTab />}
-          {activeTab === 'inference' && <InferenceTab />}
-          {activeTab === 'plugins' && <PluginsTab />}
-        </div>
+        <main style={{ flex: 1, overflow: 'auto' }}>
+          {activeTab === 'networks'  && <NetworksTab {...props} onSelect={setSelectedId} />}
+          {activeTab === 'corpus'    && <CorpusTab    {...props} />}
+          {activeTab === 'vocab'     && <VocabTab     {...props} />}
+          {activeTab === 'training'  && <TrainingTab  {...props} />}
+          {activeTab === 'inference' && <InferenceTab {...props} />}
+          {activeTab === 'docs'      && <DocsTab      networks={list} />}
+          {activeTab === 'settings'  && <SettingsTab  onChange={() => { /* re-render via state in tab */ }} />}
+        </main>
       </div>
     </div>
   )
 }
-
-export default App

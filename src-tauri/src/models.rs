@@ -244,6 +244,12 @@ pub struct TrainingError {
 // ─── Inference (streaming) ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String, // "user" | "assistant"
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferRequest {
     pub network_id: String,
     /// Feedforward only.
@@ -252,6 +258,12 @@ pub struct InferRequest {
     #[serde(default)] pub prompt: Option<String>,
     #[serde(default)] pub max_new_tokens: Option<usize>,
     #[serde(default)] pub temperature: Option<f32>,
+    /// Multi-turn chat history. When supplied (and the network is a fine-tune
+    /// model), the backend encodes every prior turn with `<user>` / `<assistant>`
+    /// markers so the model has actual conversational context. The final turn
+    /// must be `role: "user"` — the backend appends `<assistant>` and begins
+    /// generation from there.
+    #[serde(default)] pub messages: Option<Vec<ChatMessage>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

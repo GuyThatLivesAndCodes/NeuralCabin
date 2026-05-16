@@ -1078,6 +1078,16 @@ async fn infer(
             .map(|s| s == "finetune")
             .unwrap_or(false);
 
+        let messages = req.messages.clone();
+        if let Some(ms) = &messages {
+            if ms.is_empty() {
+                return Err("messages array must not be empty".into());
+            }
+            if ms.last().map(|m| m.role.as_str()) != Some("user") {
+                return Err("the last message must have role 'user'".into());
+            }
+        }
+
         let inference_id = Uuid::new_v4().to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         state.inferrers.write().await.insert(inference_id.clone(), InferenceHandle {
@@ -1089,7 +1099,7 @@ async fn infer(
         tokio::spawn(async move {
             run_generation(
                 app, id_clone.clone(), model_arc, entry.vocab,
-                prompt, context_size, max_new, temperature, chat_mode, cancel,
+                prompt, messages, context_size, max_new, temperature, chat_mode, cancel,
             ).await;
             inferrers_handle.write().await.remove(&id_clone);
         });
@@ -1119,6 +1129,7 @@ async fn run_generation(
     model_arc: Arc<RwLock<Model>>,
     vocab_arc: Arc<RwLock<Vocabulary>>,
     prompt: String,
+    messages: Option<Vec<ChatMessage>>,
     context_size: usize,
     max_new_tokens: usize,
     temperature: f32,
@@ -1128,8 +1139,22 @@ async fn run_generation(
     let model  = model_arc.read().await;
     let vocab  = vocab_arc.read().await;
     let mut ids: Vec<u32> = Vec::new();
-    if chat_mode {
-        // Match the fine-tuning encoding exactly: <user> {prompt} <eos> <assistant>
+    if let Some(msgs) = messages.as_ref().filter(|_| chat_mode) {
+        // Multi-turn chat: replay the full conversation with proper turn
+        // markers so the model sees the same shape as its training data.
+        // Sequence ends with `<assistant>`, which is where generation begins.
+        for m in msgs {
+            match m.role.as_str() {
+                "user"      => ids.push(USER_ID),
+                "assistant" => ids.push(ASSISTANT_ID),
+                _ => continue,
+            }
+            ids.extend(vocab.encode(&m.text));
+            ids.push(EOS_ID);
+        }
+        ids.push(ASSISTANT_ID);
+    } else if chat_mode {
+        // Single-turn chat: <user> {prompt} <eos> <assistant>
         ids.push(USER_ID);
         ids.extend(vocab.encode(&prompt));
         ids.push(EOS_ID);

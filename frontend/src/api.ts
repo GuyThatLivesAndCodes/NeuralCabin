@@ -203,12 +203,20 @@ export const training = {
 
 // ─── Inference ──────────────────────────────────────────────────────────────
 
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  text: string
+}
+
 export interface InferRequest {
   network_id: string
   features?: number[]
   prompt?: string
   max_new_tokens?: number
   temperature?: number
+  /** Full chat history for multi-turn conversations. The last message must
+   *  be `role: 'user'`; the backend appends `<assistant>` and generates. */
+  messages?: ChatMessage[]
 }
 
 export interface InferResponse {

@@ -374,13 +374,17 @@ function MultiTurnChat({ network, maxTokens, temp, onError }: {
         throw new Error(`Input contains unknown tokens (e.g. ${sample}).`)
       }
 
-      const prompt = userInput
+      // Build the full conversation history so the model gets actual
+      // multi-turn context. `newMessages` already includes the just-typed
+      // user message; the empty assistant placeholder is for streaming UI
+      // only and must NOT be sent to the backend.
+      const history = newMessages.map(m => ({ role: m.role, text: m.text }))
       newMessages.push({ role: 'assistant', text: '' })
       setMessages([...newMessages])
 
       const r = await inference.run({
         network_id: network.id,
-        prompt,
+        messages: history,
         max_new_tokens: maxTokens,
         temperature: temp,
       })

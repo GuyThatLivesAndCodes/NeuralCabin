@@ -1,21 +1,42 @@
 import { useEffect, useRef, useState } from 'react'
 import { type UnlistenFn } from '@tauri-apps/api/event'
-import { inference, vocabulary, Network, InferenceToken } from '../api'
+import { inference, vocabulary, corpus, Network, InferenceToken, CorpusStats } from '../api'
 import type { TabProps } from '../App'
 
 export default function InferenceTab({ network }: TabProps) {
   const [error, setError] = useState<string | null>(null)
+  const [corpusStats, setCorpusStats] = useState<CorpusStats | null>(null)
+
+  useEffect(() => {
+    if (!network) {
+      setCorpusStats(null)
+      return
+    }
+    const fetch = async () => {
+      try {
+        const stats = await corpus.stats(network.id)
+        setCorpusStats(stats)
+      } catch (e) {
+        setCorpusStats(null)
+      }
+    }
+    void fetch()
+  }, [network?.id])
+
+  const isFinetuned = network?.kind === 'next_token' && corpusStats?.stage === 'finetune'
 
   return (
     <div className="tab-content">
       <h2>Inference</h2>
-      <p className="muted">Run a trained network on new inputs.</p>
+      <p className="muted">
+        {isFinetuned ? 'Chat with a fine-tuned model.' : 'Run a trained network on new inputs.'}
+      </p>
 
       {error && <div className="status error">{error}</div>}
 
       {network && !network.trained && (
         <div className="status mt-1">
-          This network hasn’t been trained yet — predictions will be random.
+          This network hasn't been trained yet — predictions will be random.
         </div>
       )}
 
@@ -23,8 +44,463 @@ export default function InferenceTab({ network }: TabProps) {
         <div className="card"><p className="muted">Select a network to run inference.</p></div>
       ) : network.kind === 'feedforward' ? (
         <FeedforwardInference network={network} onError={setError} />
+      ) : isFinetuned ? (
+        <ChatInference network={network} onError={setError} />
       ) : (
         <NextTokenInference network={network} onError={setError} />
+      )}
+    </div>
+  )
+}
+
+// ─── Chat inference (fine-tuned models) ───────────────────────────────────────
+
+type ChatMode = 'simple' | 'multiturn'
+interface Message { role: 'user' | 'assistant'; text: string }
+
+function ChatInference({ network, onError }: {
+  network: Network; onError: (e: string | null) => void
+}) {
+  const [mode, setMode] = useState<ChatMode>('simple')
+  const [maxNewTokens, setMaxNewTokens] = useState(128)
+  const [temperature, setTemperature] = useState(0.7)
+
+  return (
+    <>
+      <div className="card">
+        <h3>Mode</h3>
+        <div className="flex" style={{ gap: 8 }}>
+          <button
+            className={mode === 'simple' ? '' : 'secondary'}
+            onClick={() => setMode('simple')}
+          >
+            Simple Q&A
+          </button>
+          <button
+            className={mode === 'multiturn' ? '' : 'secondary'}
+            onClick={() => setMode('multiturn')}
+          >
+            Multi-turn Chat
+          </button>
+        </div>
+      </div>
+
+      {mode === 'simple' ? (
+        <SimpleChat network={network} maxTokens={maxNewTokens} temp={temperature} onError={onError} />
+      ) : (
+        <MultiTurnChat network={network} maxTokens={maxNewTokens} temp={temperature} onError={onError} />
+      )}
+
+      <div className="card">
+        <h3>Generation settings</h3>
+        <div className="grid-2">
+          <div>
+            <label>Max new tokens</label>
+            <input type="number" min={1} max={2048} value={maxNewTokens}
+              onChange={e => setMaxNewTokens(Math.max(1, Math.min(2048, parseInt(e.target.value) || 128)))} />
+          </div>
+          <div>
+            <label>Temperature</label>
+            <input type="number" step="0.1" min={0} max={2} value={temperature}
+              onChange={e => setTemperature(Math.max(0, parseFloat(e.target.value) || 0.7))} />
+            <small>0 = greedy. 0.5-1.5 = creative.</small>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
+const UNK_ID = 1
+
+function SimpleChat({ network, maxTokens, temp, onError }: {
+  network: Network; maxTokens: number; temp: number; onError: (e: string | null) => void
+}) {
+  const [userMessage, setUserMessage] = useState('')
+  const [assistantMessage, setAssistantMessage] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [inferenceId, setInferenceId] = useState<string | null>(null)
+  const activeIdRef = useRef<string | null>(null)
+  const busyRef = useRef(false)
+
+  useEffect(() => {
+    setUserMessage(''); setAssistantMessage(null); setInferenceId(null)
+    activeIdRef.current = null
+    busyRef.current = false
+    setBusy(false)
+  }, [network.id])
+
+  useEffect(() => {
+    let cancelled = false
+    const cleanups: UnlistenFn[] = []
+    const setup = async () => {
+      const u1 = await inference.onToken(t => {
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && t.inference_id !== activeIdRef.current) return
+        setAssistantMessage(prev => (prev || '') + t.token)
+      })
+      const u2 = await inference.onFinished(r => {
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && r.inference_id !== activeIdRef.current) return
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      })
+      const u3 = await inference.onError(err => {
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && err.inference_id !== activeIdRef.current) return
+        onError(err.message)
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      })
+      if (cancelled) { u1(); u2(); u3(); return }
+      cleanups.push(u1, u2, u3)
+    }
+    void setup()
+    return () => { cancelled = true; cleanups.forEach(c => c()) }
+  }, [network.id])
+
+  const generate = async () => {
+    if (!userMessage.trim()) return
+    onError(null)
+    setAssistantMessage('')
+    busyRef.current = true
+    activeIdRef.current = null
+    setBusy(true)
+    try {
+      const toks = await vocabulary.tokenize(network.id, userMessage)
+      const unknown = toks.filter(([id]) => id === UNK_ID)
+      if (unknown.length > 0) {
+        const sample = unknown.slice(0, 3).map(([, s]) => JSON.stringify(s)).join(', ')
+        throw new Error(`Input contains unknown tokens (e.g. ${sample}).`)
+      }
+      const r = await inference.run({
+        network_id: network.id,
+        prompt: userMessage,
+        max_new_tokens: maxTokens,
+        temperature: temp,
+      })
+      const id = r.inference_id ?? null
+      activeIdRef.current = id
+      setInferenceId(id)
+      if (!id) {
+        busyRef.current = false
+        setBusy(false)
+      }
+    } catch (e) {
+      busyRef.current = false
+      activeIdRef.current = null
+      setBusy(false)
+      onError(String(e))
+    }
+  }
+
+  const stop = async () => {
+    const id = activeIdRef.current ?? inferenceId
+    if (!id) {
+      busyRef.current = false
+      setBusy(false)
+      setInferenceId(null)
+      return
+    }
+    try {
+      await inference.stop(id)
+    } catch (e) {
+      onError(String(e))
+    }
+    setTimeout(() => {
+      if (busyRef.current && activeIdRef.current === id) {
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      }
+    }, 2000)
+  }
+
+  const reset = () => {
+    setUserMessage('')
+    setAssistantMessage(null)
+    busyRef.current = false
+    setBusy(false)
+    setInferenceId(null)
+    activeIdRef.current = null
+    onError(null)
+  }
+
+  const regenerate = async () => {
+    if (!userMessage.trim()) return
+    onError(null)
+    setAssistantMessage('')
+    busyRef.current = true
+    activeIdRef.current = null
+    setBusy(true)
+    try {
+      const r = await inference.run({
+        network_id: network.id,
+        prompt: userMessage,
+        max_new_tokens: maxTokens,
+        temperature: temp,
+      })
+      const id = r.inference_id ?? null
+      activeIdRef.current = id
+      setInferenceId(id)
+      if (!id) {
+        busyRef.current = false
+        setBusy(false)
+      }
+    } catch (e) {
+      busyRef.current = false
+      activeIdRef.current = null
+      setBusy(false)
+      onError(String(e))
+    }
+  }
+
+  return (
+    <div className="card">
+      <h3>Message</h3>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div>
+          <label style={{ display: 'block', marginBottom: 6 }}>Your question</label>
+          <textarea
+            rows={3}
+            value={userMessage}
+            onChange={e => setUserMessage(e.target.value)}
+            disabled={busy}
+            placeholder="Ask the model something..."
+          />
+        </div>
+        <div className="flex" style={{ gap: 8 }}>
+          <button onClick={generate} disabled={busy || !userMessage.trim()}>
+            {busy ? 'Generating...' : 'Generate'}
+          </button>
+          {busy && <button className="secondary" onClick={stop}>Stop</button>}
+          {assistantMessage && <button className="secondary" onClick={regenerate} disabled={busy}>Regenerate</button>}
+          {assistantMessage && <button className="secondary" onClick={reset}>Reset</button>}
+        </div>
+      </div>
+
+      {assistantMessage && (
+        <div style={{ marginTop: 20 }}>
+          <h4 style={{ marginBottom: 8 }}>Response</h4>
+          <div style={{
+            background: 'var(--bg-input)', padding: 12, borderRadius: 'var(--radius)',
+            border: '1px solid var(--border)', whiteSpace: 'pre-wrap',
+            fontFamily: 'var(--font-mono)', fontSize: 13,
+          }}>
+            {assistantMessage}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function MultiTurnChat({ network, maxTokens, temp, onError }: {
+  network: Network; maxTokens: number; temp: number; onError: (e: string | null) => void
+}) {
+  const [messages, setMessages] = useState<Message[]>([])
+  const [userInput, setUserInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [inferenceId, setInferenceId] = useState<string | null>(null)
+  const activeIdRef = useRef<string | null>(null)
+  const busyRef = useRef(false)
+
+  useEffect(() => {
+    setMessages([]); setUserInput(''); setInferenceId(null)
+    activeIdRef.current = null
+    busyRef.current = false
+    setBusy(false)
+  }, [network.id])
+
+  useEffect(() => {
+    let cancelled = false
+    const cleanups: UnlistenFn[] = []
+    const setup = async () => {
+      const u1 = await inference.onToken(t => {
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && t.inference_id !== activeIdRef.current) return
+        setMessages(prev => {
+          const last = prev[prev.length - 1]
+          if (last && last.role === 'assistant') {
+            return [...prev.slice(0, -1), { ...last, text: last.text + t.token }]
+          }
+          return prev
+        })
+      })
+      const u2 = await inference.onFinished(r => {
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && r.inference_id !== activeIdRef.current) return
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      })
+      const u3 = await inference.onError(err => {
+        if (cancelled || !busyRef.current) return
+        if (activeIdRef.current && err.inference_id !== activeIdRef.current) return
+        onError(err.message)
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      })
+      if (cancelled) { u1(); u2(); u3(); return }
+      cleanups.push(u1, u2, u3)
+    }
+    void setup()
+    return () => { cancelled = true; cleanups.forEach(c => c()) }
+  }, [network.id])
+
+  const send = async () => {
+    if (!userInput.trim()) return
+    onError(null)
+    const newMessages = [...messages, { role: 'user' as const, text: userInput }]
+    setMessages(newMessages)
+    setUserInput('')
+    busyRef.current = true
+    activeIdRef.current = null
+    setBusy(true)
+
+    try {
+      const toks = await vocabulary.tokenize(network.id, userInput)
+      const unknown = toks.filter(([id]) => id === UNK_ID)
+      if (unknown.length > 0) {
+        const sample = unknown.slice(0, 3).map(([, s]) => JSON.stringify(s)).join(', ')
+        throw new Error(`Input contains unknown tokens (e.g. ${sample}).`)
+      }
+
+      const prompt = userInput
+      newMessages.push({ role: 'assistant', text: '' })
+      setMessages([...newMessages])
+
+      const r = await inference.run({
+        network_id: network.id,
+        prompt,
+        max_new_tokens: maxTokens,
+        temperature: temp,
+      })
+      const id = r.inference_id ?? null
+      activeIdRef.current = id
+      setInferenceId(id)
+      if (!id) {
+        busyRef.current = false
+        setBusy(false)
+      }
+    } catch (e) {
+      busyRef.current = false
+      activeIdRef.current = null
+      setBusy(false)
+      onError(String(e))
+    }
+  }
+
+  const stop = async () => {
+    const id = activeIdRef.current ?? inferenceId
+    if (!id) {
+      busyRef.current = false
+      setBusy(false)
+      setInferenceId(null)
+      return
+    }
+    try {
+      await inference.stop(id)
+    } catch (e) {
+      onError(String(e))
+    }
+    setTimeout(() => {
+      if (busyRef.current && activeIdRef.current === id) {
+        busyRef.current = false
+        activeIdRef.current = null
+        setBusy(false)
+        setInferenceId(null)
+      }
+    }, 2000)
+  }
+
+  const deleteMessage = (index: number) => {
+    setMessages(messages.filter((_, i) => i !== index))
+  }
+
+  const reset = () => {
+    setMessages([])
+    setUserInput('')
+    busyRef.current = false
+    setBusy(false)
+    setInferenceId(null)
+    activeIdRef.current = null
+    onError(null)
+  }
+
+  return (
+    <div className="card">
+      <h3>Conversation</h3>
+      <div style={{
+        background: 'var(--bg-elev-1)', padding: 12, borderRadius: 'var(--radius)',
+        border: '1px solid var(--border)', minHeight: 300, maxHeight: 400, overflow: 'auto',
+        marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8,
+      }}>
+        {messages.length === 0 ? (
+          <div className="muted" style={{ margin: 'auto' }}>No messages yet. Start a conversation!</div>
+        ) : (
+          messages.map((msg, i) => (
+            <div key={i} style={{
+              display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+            }}>
+              <div style={{
+                maxWidth: '80%', padding: '8px 12px', borderRadius: 'var(--radius)',
+                background: msg.role === 'user' ? 'var(--accent)' : 'var(--bg-elev-2)',
+                color: msg.role === 'user' ? '#fff' : 'var(--text)',
+                wordBreak: 'break-word',
+              }}>
+                <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.5 }}>
+                  {msg.text}
+                </div>
+                {msg.role === 'assistant' && (
+                  <button
+                    className="secondary"
+                    onClick={() => deleteMessage(i)}
+                    style={{ marginTop: 4, padding: '2px 6px', fontSize: 11 }}
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>
+          ))
+        )}
+        {busy && (
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Generating...</span>
+            <span style={{ animation: 'pulse 1.5s infinite', color: 'var(--accent)' }}>●</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+        <input
+          type="text"
+          value={userInput}
+          onChange={e => setUserInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }}
+          disabled={busy}
+          placeholder="Type a message (Enter to send)..."
+          style={{ flex: 1 }}
+        />
+        <button onClick={send} disabled={busy || !userInput.trim()}>
+          {busy ? 'Sending...' : 'Send'}
+        </button>
+        {busy && <button className="secondary" onClick={stop}>Stop</button>}
+      </div>
+
+      {messages.length > 0 && (
+        <button className="secondary" onClick={reset} style={{ width: '100%' }}>
+          Reset conversation
+        </button>
       )}
     </div>
   )
@@ -39,7 +515,6 @@ function FeedforwardInference({ network, onError }: {
   const [output, setOutput] = useState<number[] | null>(null)
   const [busy, setBusy] = useState(false)
 
-  // Reset when network changes
   useEffect(() => { setInputs(Array(network.input_dim).fill('0')); setOutput(null) },
     [network.id, network.input_dim])
 
@@ -75,7 +550,7 @@ function FeedforwardInference({ network, onError }: {
         </div>
         <div className="flex mt-2">
           <button onClick={run} disabled={busy}>
-            {busy ? 'Running…' : 'Predict'}
+            {busy ? 'Running...' : 'Predict'}
           </button>
         </div>
       </div>
@@ -99,11 +574,6 @@ function FeedforwardInference({ network, onError }: {
 
 // ─── Next-token inference (streaming) ───────────────────────────────────────
 
-// UNK_ID — matches `tokenizer::UNK_ID` in the engine. The backend silently
-// emits this for any character/word that isn't in the trained vocabulary, so
-// we have to detect it explicitly in the frontend to fail fast.
-const UNK_ID = 1
-
 function NextTokenInference({ network, onError }: {
   network: Network; onError: (e: string | null) => void
 }) {
@@ -114,9 +584,6 @@ function NextTokenInference({ network, onError }: {
   const [tokens, setTokens] = useState<InferenceToken[]>([])
   const [busy, setBusy] = useState(false)
   const [inferenceId, setInferenceId] = useState<string | null>(null)
-  // Refs let the event listeners read the latest values without forcing a
-  // re-subscribe on every state change. Critical for the race fix: listeners
-  // are attached ONCE on mount, before the user can click Generate.
   const activeIdRef = useRef<string | null>(null)
   const busyRef = useRef(false)
 
@@ -127,12 +594,6 @@ function NextTokenInference({ network, onError }: {
     setBusy(false)
   }, [network.id])
 
-  // Attach listeners ONCE per network. Previously these were keyed on
-  // `inferenceId`, so they only got registered AFTER `inference.run()`
-  // returned — by which point the backend had already emitted events
-  // (sometimes including `inference_finished`), and we missed them. Missing
-  // `inference_finished` is exactly what made the Generate button stay
-  // grayed out forever.
   useEffect(() => {
     let cancelled = false
     const cleanups: UnlistenFn[] = []
@@ -170,8 +631,6 @@ function NextTokenInference({ network, onError }: {
   const run = async () => {
     onError(null)
     setGenerated(''); setTokens([])
-    // Mark busy BEFORE awaiting anything so the always-on listeners will
-    // accept the events that follow.
     busyRef.current = true
     activeIdRef.current = null
     setBusy(true)
@@ -198,8 +657,6 @@ function NextTokenInference({ network, onError }: {
       activeIdRef.current = id
       setInferenceId(id)
       if (!id) {
-        // Synchronous result (shouldn't happen for next-token, but bail safely
-        // rather than leaving the button stuck on "Generating…").
         busyRef.current = false
         setBusy(false)
       }
@@ -214,7 +671,6 @@ function NextTokenInference({ network, onError }: {
   const stop = async () => {
     const id = activeIdRef.current ?? inferenceId
     if (!id) {
-      // No active inference but the UI is stuck — unstick it locally.
       busyRef.current = false
       setBusy(false)
       setInferenceId(null)
@@ -225,9 +681,6 @@ function NextTokenInference({ network, onError }: {
     } catch (e) {
       onError(String(e))
     }
-    // Belt-and-braces: if the backend never emits `inference_finished` within
-    // 2 seconds of a stop, force the UI back to an idle state so the Generate
-    // button is usable again.
     setTimeout(() => {
       if (busyRef.current && activeIdRef.current === id) {
         busyRef.current = false
@@ -246,7 +699,7 @@ function NextTokenInference({ network, onError }: {
           rows={4}
           value={prompt}
           onChange={e => setPrompt(e.target.value)}
-          placeholder="Type a prompt to continue…"
+          placeholder="Type a prompt to continue..."
         />
         <div className="grid-3 mt-2">
           <div>
@@ -262,7 +715,7 @@ function NextTokenInference({ network, onError }: {
           </div>
         </div>
         <div className="flex mt-2">
-          <button onClick={run} disabled={busy}>{busy ? 'Generating…' : 'Generate'}</button>
+          <button onClick={run} disabled={busy}>{busy ? 'Generating...' : 'Generate'}</button>
           {busy && (
             <button className="secondary" onClick={stop}>
               Stop
@@ -311,6 +764,6 @@ function NextTokenInference({ network, onError }: {
 function visualize(t: string): string {
   if (t === '\n') return '\\n'
   if (t === '\t') return '\\t'
-  if (t === ' ')  return '·'  // visible space
+  if (t === ' ')  return '·'
   return t
 }

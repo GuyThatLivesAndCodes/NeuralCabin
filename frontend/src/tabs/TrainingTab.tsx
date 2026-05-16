@@ -23,7 +23,7 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
   const [epochs, setEpochs] = useState(500)
   const [batchSize, setBatchSize] = useState(32)
   const [seed, setSeed] = useState(42)
-  const [optKind, setOptKind] = useState<'adam' | 'sgd'>('adam')
+  const [optKind, setOptKind] = useState<'adam' | 'adamw' | 'lamb' | 'sgd'>('adam')
   const [lr, setLr] = useState(0.01)
   const [momentum, setMomentum] = useState(0.9)
   const [maskUserTokens, setMaskUserTokens] = useState(true)
@@ -153,8 +153,10 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
             </div>
             <div>
               <label>Optimizer</label>
-              <select value={optKind} onChange={e => setOptKind(e.target.value as 'adam' | 'sgd')}>
+              <select value={optKind} onChange={e => setOptKind(e.target.value as 'adam' | 'adamw' | 'lamb' | 'sgd')}>
                 <option value="adam">Adam</option>
+                <option value="adamw">AdamW</option>
+                <option value="lamb">LAMB</option>
                 <option value="sgd">SGD</option>
               </select>
             </div>

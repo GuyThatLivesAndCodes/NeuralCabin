@@ -38,7 +38,7 @@ export default function DocsTab({ networks: list }: { networks: Network[] }) {
               (<code>identity</code>, <code>relu</code>, <code>sigmoid</code>, <code>tanh</code>, <code>softmax</code>).</li>
           <li>A reverse-mode autograd tape with hand-written backward passes.</li>
           <li>Two losses: <code>MeanSquaredError</code> and softmax + <code>CrossEntropy</code>.</li>
-          <li>Two optimizers: <code>Adam</code> and <code>SGD</code> (with optional momentum).</li>
+          <li>Four optimizers: <code>Adam</code>, <code>AdamW</code>, <code>LAMB</code>, and <code>SGD</code> (with optional momentum).</li>
           <li>Char-level and word-level tokenizers for text networks.</li>
         </ul>
         <p className="mt-2 muted">

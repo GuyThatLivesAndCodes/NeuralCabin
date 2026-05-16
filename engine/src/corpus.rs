@@ -6,11 +6,12 @@
 //! the existing Linear + Activation layer stack — no new layer types required.
 //!
 //! For fine-tuning (input/output pairs), the same shape applies: each pair is
-//! tokenized into a single sequence `<bos> input <sep> output <eos>` and we
-//! emit one training example per output token.
+//! tokenized into a single sequence
+//! `<user> input <eos> <assistant> output <eos>` and we emit one training
+//! example per output token.
 
 use crate::tensor::Tensor;
-use crate::tokenizer::{Vocabulary, BOS_ID, EOS_ID, PAD_ID};
+use crate::tokenizer::{Vocabulary, ASSISTANT_ID, EOS_ID, PAD_ID, USER_ID};
 
 /// A single fine-tuning conversation pair.
 #[derive(Clone, Debug)]
@@ -57,13 +58,14 @@ pub fn build_pretraining_tensors(
 
 /// Build (X, Y) tensors from input/output pairs for fine-tuning.
 ///
-/// Each pair is encoded as `<bos> input <eos> output <eos>`. Sliding windows
-/// then teach the model to predict each token of the output (and the trailing
-/// <eos>) given the prior tokens.
+/// Each pair is encoded as `<user> input <eos> <assistant> output <eos>`.
+/// Sliding windows then teach the model to predict each token of the output
+/// (and the trailing <eos>) given the prior tokens, including the explicit
+/// `<assistant>` turn marker.
 ///
 /// If `mask_user_tokens` is true, only windows whose target falls strictly in
-/// the output region are emitted — the model is not penalised for failing to
-/// reproduce the user's input.
+/// the assistant region (everything after `<assistant>`) are emitted — the
+/// model is not penalised for failing to reproduce the user's input.
 pub fn build_finetuning_tensors(
     pairs: &[Pair],
     vocab: &Vocabulary,
@@ -77,9 +79,10 @@ pub fn build_finetuning_tensors(
 
     for pair in pairs {
         let mut seq: Vec<u32> = Vec::new();
-        seq.push(BOS_ID);
+        seq.push(USER_ID);
         seq.extend(vocab.encode(&pair.input));
         seq.push(EOS_ID);
+        seq.push(ASSISTANT_ID);
         let output_start = seq.len();
         seq.extend(vocab.encode(&pair.output));
         seq.push(EOS_ID);
@@ -169,9 +172,24 @@ mod tests {
         let v = vocab.size();
         let pairs = vec![Pair { input: "hi".into(), output: "there".into() }];
         let (x, _y) = build_finetuning_tensors(&pairs, &vocab, 4, false).unwrap();
-        // Sequence: <bos> h i <eos> t h e r e <eos> = 10 tokens, 9 transitions
+        // Sequence: <user> h i <eos> <assistant> t h e r e <eos>
+        //         =  1     2 3 4     5           6 7 8 9 10 11  = 11 tokens
+        // 10 transitions (predicting each subsequent token).
         assert_eq!(x.cols(), 4 * v);
-        assert_eq!(x.rows(), 9);
+        assert_eq!(x.rows(), 10);
+    }
+
+    #[test]
+    fn finetuning_masks_user_region() {
+        // With mask_user_tokens=true, only transitions producing tokens in
+        // the assistant region should be emitted. Output sequence is
+        // `<user> h i <eos> <assistant> y <eos>` — 7 tokens; the assistant
+        // region starts at index 5 (the 'y'). Targets in that region are
+        // 'y' (transition 5→6) and '<eos>' (transition 6→7), so 2 rows.
+        let vocab = char_vocab("hi y");
+        let pairs = vec![Pair { input: "hi".into(), output: "y".into() }];
+        let (x, _) = build_finetuning_tensors(&pairs, &vocab, 3, true).unwrap();
+        assert_eq!(x.rows(), 2);
     }
 
     #[test]

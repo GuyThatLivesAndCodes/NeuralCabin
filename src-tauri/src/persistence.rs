@@ -133,7 +133,11 @@ pub async fn apply(state: &AppState, persisted: PersistedState) {
     *state.corpora.write().await = persisted.corpora;
     let mut vocabs = state.vocabs.write().await;
     vocabs.clear();
-    for (k, pv) in persisted.vocabs {
+    for (k, mut pv) in persisted.vocabs {
+        // `Vocabulary` skips its lookup index during (de)serialization to keep
+        // state.json small; rebuild it now so `encode` works on the very next
+        // command after load.
+        pv.vocab.rebuild_index();
         vocabs.insert(k, VocabEntry {
             vocab: Arc::new(RwLock::new(pv.vocab)),
             info: pv.info,

@@ -16,7 +16,7 @@ use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
 use neuralcabin_engine::tensor::{SplitMix64, Tensor};
 use neuralcabin_engine::tokenizer::{
     TokenizerMode, Vocabulary, VocabularyOptions as EngineVocabularyOptions,
-    EOS_ID,
+    ASSISTANT_ID, EOS_ID, USER_ID,
 };
 use neuralcabin_engine::corpus::{
     build_finetuning_tensors, build_pretraining_tensors, encode_context, Pair,
@@ -1068,6 +1068,16 @@ async fn infer(
         let entry = state.vocabs.read().await.get(&req.network_id).cloned()
             .ok_or_else(|| "Vocabulary missing — build one on the Vocabulary tab first".to_string())?;
 
+        // For fine-tuned chat models the prompt is wrapped in chat turn
+        // markers so the model picks up where the training data left off:
+        //   <user> {prompt} <eos> <assistant> ...
+        // Generation continues until the assistant's own <eos>.
+        let chat_mode = state.corpora.read().await
+            .get(&req.network_id)
+            .and_then(|c| c.stage.clone())
+            .map(|s| s == "finetune")
+            .unwrap_or(false);
+
         let inference_id = Uuid::new_v4().to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         state.inferrers.write().await.insert(inference_id.clone(), InferenceHandle {
@@ -1079,7 +1089,7 @@ async fn infer(
         tokio::spawn(async move {
             run_generation(
                 app, id_clone.clone(), model_arc, entry.vocab,
-                prompt, context_size, max_new, temperature, cancel,
+                prompt, context_size, max_new, temperature, chat_mode, cancel,
             ).await;
             inferrers_handle.write().await.remove(&id_clone);
         });
@@ -1112,11 +1122,21 @@ async fn run_generation(
     context_size: usize,
     max_new_tokens: usize,
     temperature: f32,
+    chat_mode: bool,
     cancel: Arc<AtomicBool>,
 ) {
     let model  = model_arc.read().await;
     let vocab  = vocab_arc.read().await;
-    let mut ids: Vec<u32> = vocab.encode(&prompt);
+    let mut ids: Vec<u32> = Vec::new();
+    if chat_mode {
+        // Match the fine-tuning encoding exactly: <user> {prompt} <eos> <assistant>
+        ids.push(USER_ID);
+        ids.extend(vocab.encode(&prompt));
+        ids.push(EOS_ID);
+        ids.push(ASSISTANT_ID);
+    } else {
+        ids.extend(vocab.encode(&prompt));
+    }
     let initial_len = ids.len();
     let mut generated = String::new();
     let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new_tokens as u64).wrapping_mul(0x9E3779B1));

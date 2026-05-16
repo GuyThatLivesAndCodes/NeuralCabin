@@ -122,10 +122,11 @@ export default function DocsTab({ networks: list }: { networks: Network[] }) {
 ]`}</pre>
         <p className="mt-1">
           Internally each pair is encoded as{' '}
-          <code>&lt;bos&gt; input &lt;eos&gt; output &lt;eos&gt;</code> and one
-          training example is emitted per token transition. With <em>mask user
-          tokens</em> on (the default), the model is only scored on producing
-          the assistant output.
+          <code>&lt;user&gt; input &lt;eos&gt; &lt;assistant&gt; output &lt;eos&gt;</code>{' '}
+          and one training example is emitted per token transition. With{' '}
+          <em>mask user tokens</em> on (the default), the model is only scored
+          on producing the assistant output — so it learns exactly when its
+          turn starts and when to stop.
         </p>
       </div>
 
@@ -136,10 +137,18 @@ export default function DocsTab({ networks: list }: { networks: Network[] }) {
           <tbody>
             <tr><td><code>0</code></td><td><code>&lt;pad&gt;</code></td><td>Left-padding for short contexts.</td></tr>
             <tr><td><code>1</code></td><td><code>&lt;unk&gt;</code></td><td>Anything not in the trained vocab.</td></tr>
-            <tr><td><code>2</code></td><td><code>&lt;bos&gt;</code></td><td>Beginning of sequence (fine-tune).</td></tr>
-            <tr><td><code>3</code></td><td><code>&lt;eos&gt;</code></td><td>End of sequence; halts generation when sampled.</td></tr>
+            <tr><td><code>2</code></td><td><code>&lt;bos&gt;</code></td><td>Beginning of sequence (reserved).</td></tr>
+            <tr><td><code>3</code></td><td><code>&lt;eos&gt;</code></td><td>End of a turn; halts generation when sampled.</td></tr>
+            <tr><td><code>4</code></td><td><code>&lt;user&gt;</code></td><td>Start of a user message in fine-tune / chat mode.</td></tr>
+            <tr><td><code>5</code></td><td><code>&lt;assistant&gt;</code></td><td>Start of an assistant reply in fine-tune / chat mode.</td></tr>
           </tbody>
         </table>
+        <p className="muted small mt-1">
+          Fine-tuning pairs are encoded as{' '}
+          <code>&lt;user&gt; input &lt;eos&gt; &lt;assistant&gt; output &lt;eos&gt;</code>,
+          and the chat inference prompt is wrapped the same way so the model
+          knows when to start its reply and when to stop.
+        </p>
       </div>
 
       <div className="card">

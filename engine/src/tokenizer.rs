@@ -15,7 +15,12 @@
 //! the vocab become `<unk>`.
 //!
 //! Reserved indices:
-//!   0 = `<pad>`, 1 = `<unk>`, 2 = `<bos>`, 3 = `<eos>`
+//!   0 = `<pad>`, 1 = `<unk>`, 2 = `<bos>`, 3 = `<eos>`,
+//!   4 = `<user>`, 5 = `<assistant>`
+//!
+//! `<user>` / `<assistant>` mark conversation turns for fine-tuned chat
+//! models. The fine-tuning encoding is:
+//!   `<user> {prompt} <eos> <assistant> {reply} <eos>`
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,12 +29,16 @@ pub const PAD_ID: u32 = 0;
 pub const UNK_ID: u32 = 1;
 pub const BOS_ID: u32 = 2;
 pub const EOS_ID: u32 = 3;
-pub const RESERVED: usize = 4;
+pub const USER_ID: u32 = 4;
+pub const ASSISTANT_ID: u32 = 5;
+pub const RESERVED: usize = 6;
 
 const PAD: &str = "<pad>";
 const UNK: &str = "<unk>";
 const BOS: &str = "<bos>";
 const EOS: &str = "<eos>";
+const USER: &str = "<user>";
+const ASSISTANT: &str = "<assistant>";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenizerMode {
@@ -78,7 +87,10 @@ pub struct Vocabulary {
 
 impl Vocabulary {
     fn empty(mode: TokenizerMode) -> Self {
-        let tokens = vec![PAD.into(), UNK.into(), BOS.into(), EOS.into()];
+        let tokens = vec![
+            PAD.into(), UNK.into(), BOS.into(), EOS.into(),
+            USER.into(), ASSISTANT.into(),
+        ];
         let mut v = Self { mode, tokens, index: HashMap::new(), sorted_lengths: Vec::new() };
         v.rebuild_index();
         v
@@ -169,7 +181,7 @@ impl Vocabulary {
         for t in user_tokens {
             if t.is_empty() { continue; }
             // Skip reserved literals if user re-supplied them.
-            if matches!(t.as_str(), PAD | UNK | BOS | EOS) { continue; }
+            if matches!(t.as_str(), PAD | UNK | BOS | EOS | USER | ASSISTANT) { continue; }
             if !vocab.index.contains_key(t) {
                 vocab.add(t.clone());
             }
@@ -305,8 +317,15 @@ mod tests {
     #[test]
     fn char_mode_contains_only_chars() {
         let v = Vocabulary::build(TokenizerMode::Char, &["abca"], &VocabularyOptions::default());
-        // <pad>,<unk>,<bos>,<eos>, a, b, c
+        // reserved + a, b, c
         assert_eq!(v.size(), RESERVED + 3);
+    }
+
+    #[test]
+    fn reserved_tokens_include_chat_markers() {
+        let v = Vocabulary::build(TokenizerMode::Char, &["abc"], &VocabularyOptions::default());
+        assert_eq!(v.token_of(USER_ID), "<user>");
+        assert_eq!(v.token_of(ASSISTANT_ID), "<assistant>");
     }
 
     #[test]

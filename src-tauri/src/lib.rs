@@ -1424,6 +1424,14 @@ pub fn run() {
                         // so the UI reflects reality (models are no longer
                         // embedded in state.json — they live in models/<id>.json).
                         persistence::reset_missing_model_flags(app_state, &data_dir).await;
+                        // Re-save immediately in the current compact format.
+                        // This is a one-time migration: if the user had a large
+                        // legacy state.json with inline model weights, this
+                        // replaces it with a small metadata-only file so that
+                        // the next launch loads in milliseconds.
+                        if let Err(e) = persistence::save_to_dir(app_state, &data_dir).await {
+                            eprintln!("[neuralcabin] post-load migration save failed: {e}");
+                        }
                         eprintln!("[neuralcabin] loaded state from {}", data_dir.display());
                     }
                     Ok(None) => {

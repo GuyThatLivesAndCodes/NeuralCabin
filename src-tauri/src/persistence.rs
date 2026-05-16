@@ -174,22 +174,38 @@ pub async fn save_persisted(persisted: &PersistedState, data_dir: &Path) -> Resu
 
 /// Load `state.json`. Returns `Ok(None)` for a fresh install.
 /// Returns an error if the file is corrupt — we never silently wipe data.
+///
+/// Uses streaming deserialization (`serde_json::from_reader` via a
+/// `BufReader`) so that large unknown fields — in particular the legacy
+/// `models` blob that old builds wrote inline — are read and discarded in
+/// small chunks without ever being fully buffered in RAM.  A 6 GB legacy
+/// state.json therefore needs only ~8 KB of working memory to parse,
+/// rather than 6 GB.
 pub async fn load_from_dir(data_dir: &Path) -> Result<Option<PersistedState>, String> {
     let path = data_dir.join(STATE_FILENAME);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
-    };
-    let persisted: PersistedState = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("parse {}: {e}", path.display()))?;
-    if persisted.format_version > FORMAT_VERSION {
-        return Err(format!(
+
+    let result: Result<Option<PersistedState>, String> =
+        tokio::task::spawn_blocking(move || {
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(format!("read {}: {e}", path.display())),
+            };
+            let reader = std::io::BufReader::new(file);
+            let persisted: PersistedState = serde_json::from_reader(reader)
+                .map_err(|e| format!("parse {}: {e}", path.display()))?;
+            Ok(Some(persisted))
+        })
+        .await
+        .map_err(|e| format!("load_from_dir task panicked: {e}"))?;
+
+    match result? {
+        Some(p) if p.format_version > FORMAT_VERSION => Err(format!(
             "state.json format_version {} is newer than this build supports ({})",
-            persisted.format_version, FORMAT_VERSION
-        ));
+            p.format_version, FORMAT_VERSION
+        )),
+        other => Ok(other),
     }
-    Ok(Some(persisted))
 }
 
 /// Populate an empty `AppState` from a loaded snapshot.

@@ -50,8 +50,7 @@ impl Loss {
                 // log_softmax + categorical cross-entropy, averaged across batch.
                 // log_softmax expects the class dim; for `(batch, classes)` that's dim=1.
                 let log_p = log_softmax(pred, 1);
-                let nll = -(target * log_p).sum_dim(1).mean();
-                nll
+                -(target * log_p).sum_dim(1).mean()
             }
         }
     }

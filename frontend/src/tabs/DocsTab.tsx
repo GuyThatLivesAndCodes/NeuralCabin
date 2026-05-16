@@ -30,13 +30,16 @@ export default function DocsTab({ networks: list }: { networks: Network[] }) {
         <h3>What this app actually does</h3>
         <p>
           NeuralCabin trains small neural networks entirely in Rust, with no
-          Python, no PyTorch, no NumPy, and no remote services. The engine
-          implements:
+          Python, no PyTorch, and no remote services. Training and inference
+          run on your GPU via the <a href="https://burn.dev" target="_blank"
+          rel="noreferrer">Burn</a> framework with the WGPU backend — on
+          laptops and low-end PCs that falls back gracefully to integrated
+          GPUs or CPU compute. The engine supports:
         </p>
         <ul style={{ paddingLeft: 20, lineHeight: 1.7 }}>
           <li><code>Linear</code> (fully-connected) layers and five activations
               (<code>identity</code>, <code>relu</code>, <code>sigmoid</code>, <code>tanh</code>, <code>softmax</code>).</li>
-          <li>A reverse-mode autograd tape with hand-written backward passes.</li>
+          <li>Automatic differentiation provided by Burn's autodiff backend.</li>
           <li>Two losses: <code>MeanSquaredError</code> and softmax + <code>CrossEntropy</code>.</li>
           <li>Four optimizers: <code>Adam</code>, <code>AdamW</code>, <code>LAMB</code>, and <code>SGD</code> (with optional momentum).</li>
           <li>Char-level and word-level tokenizers for text networks.</li>

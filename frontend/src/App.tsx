@@ -5,9 +5,11 @@ import VocabTab from './tabs/VocabTab'
 import TrainingTab from './tabs/TrainingTab'
 import InferenceTab from './tabs/InferenceTab'
 import DocsTab from './tabs/DocsTab'
+import SettingsTab from './tabs/SettingsTab'
 import { networks, Network } from './api'
+import { applySettings, loadSettings } from './settings'
 
-type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'docs'
+type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'docs' | 'settings'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'networks',  label: 'Networks' },
@@ -16,6 +18,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'training',  label: 'Training' },
   { id: 'inference', label: 'Inference' },
   { id: 'docs',      label: 'Documentation' },
+  { id: 'settings',  label: 'Settings' },
 ]
 
 export interface TabProps {
@@ -44,6 +47,10 @@ export default function App() {
   }, [])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  // Apply user theme settings on boot so the primary color picked in
+  // Settings persists across restarts.
+  useEffect(() => { applySettings(loadSettings()) }, [])
 
   const selected = list.find(n => n.id === selectedId) ?? null
   const props: TabProps = { network: selected, refreshNetworks: refresh }
@@ -95,6 +102,7 @@ export default function App() {
           {activeTab === 'training'  && <TrainingTab  {...props} />}
           {activeTab === 'inference' && <InferenceTab {...props} />}
           {activeTab === 'docs'      && <DocsTab      networks={list} />}
+          {activeTab === 'settings'  && <SettingsTab  onChange={() => { /* re-render via state in tab */ }} />}
         </main>
       </div>
     </div>

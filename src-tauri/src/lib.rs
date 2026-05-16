@@ -150,6 +150,43 @@ async fn record_and_persist_run(app: &AppHandle, run: TrainingRun) {
     }
 }
 
+// ─── Lazy model loader ───────────────────────────────────────────────────────
+
+/// Produce the appropriate "model not ready" error for a network kind.
+fn model_missing_err(net: &Network) -> String {
+    if net.kind == kinds::NEXT_TOKEN {
+        "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
+    } else {
+        "Model state missing — try recreating the network.".to_string()
+    }
+}
+
+/// Return the in-memory model for `network_id`, loading it from its weight
+/// file on demand if it isn't already cached. Inserts the loaded model into
+/// `AppState.models` for subsequent calls.
+async fn get_or_load_model(
+    state: &AppState,
+    net: &Network,
+) -> Result<Arc<RwLock<Model>>, String> {
+    // Fast path: already in memory (e.g. just trained, or previously loaded).
+    if let Some(m) = state.models.read().await.get(&net.id).cloned() {
+        return Ok(m);
+    }
+    // Slow path: load from the per-network weight file.
+    let Some(data_dir) = persistence::data_dir(state).await else {
+        return Err(model_missing_err(net));
+    };
+    match persistence::load_model(&net.id, &data_dir).await {
+        Ok(Some(model)) => {
+            let arc = Arc::new(RwLock::new(model));
+            state.models.write().await.insert(net.id.clone(), arc.clone());
+            Ok(arc)
+        }
+        Ok(None) => Err(model_missing_err(net)),
+        Err(e)   => Err(format!("failed to load model: {e}")),
+    }
+}
+
 // ─── Parsing helpers ────────────────────────────────────────────────────────
 
 fn parse_activation(name: &str) -> Result<Activation, String> {
@@ -316,6 +353,11 @@ async fn delete_network(state: State<'_, AppState>, id: String) -> Result<bool, 
     state.vocabs.write().await.remove(&id);
     state.corpora.write().await.remove(&id);
     state.training_history.write().await.remove(&id);
+    if let Some(dir) = persistence::data_dir(&state).await {
+        if let Err(e) = persistence::delete_model(&id, &dir).await {
+            eprintln!("[neuralcabin] {e}");
+        }
+    }
     let removed = state.networks.write().await.remove(&id).is_some();
     persist(&state).await?;
     Ok(removed)
@@ -633,7 +675,29 @@ async fn rebuild_next_token_model(
     // weights. Re-building unconditionally on every set_corpus call wipes out
     // trained weights — the user's report ("training disappears after I save
     // the corpus / reopen the app") was exactly this bug.
-    if let Some(existing) = state.models.read().await.get(&net.id).cloned() {
+    //
+    // Models are lazy-loaded, so we check memory first then fall back to the
+    // weight file on disk. This preserves trained weights across restarts even
+    // though we no longer load models eagerly on startup.
+    let existing_arc = state.models.read().await.get(&net.id).cloned()
+        .or(None); // just for clarity; check disk below if None
+
+    let existing_arc = if let Some(a) = existing_arc {
+        Some(a)
+    } else if let Some(dir) = persistence::data_dir(state).await {
+        match persistence::load_model(&net.id, &dir).await {
+            Ok(Some(m)) => {
+                let a = Arc::new(RwLock::new(m));
+                state.models.write().await.insert(net.id.clone(), a.clone());
+                Some(a)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(existing) = existing_arc {
         let m = existing.read().await;
         if m.input_dim == input_dim && layers_match_specs(&m.layers, &specs) {
             return Ok(());
@@ -731,12 +795,7 @@ async fn start_training(
         .ok_or_else(|| "Network not found".to_string())?;
     let corpus = state.corpora.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".to_string())?;
-    let model_arc = state.models.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| if net.kind == kinds::NEXT_TOKEN {
-            "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
-        } else {
-            "Model state missing".to_string()
-        })?;
+    let model_arc = get_or_load_model(&state, &net).await?;
 
     let (x, y, loss_kind, total_examples) = if net.kind == kinds::FEEDFORWARD {
         let ff = corpus.feedforward.as_ref()
@@ -1139,12 +1198,7 @@ async fn infer(
 ) -> Result<InferResponse, String> {
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
-    let model_arc = state.models.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| if net.kind == kinds::NEXT_TOKEN {
-            "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
-        } else {
-            "Model state missing".to_string()
-        })?;
+    let model_arc = get_or_load_model(&state, &net).await?;
 
     if net.kind == kinds::FEEDFORWARD {
         let model = model_arc.read().await;
@@ -1365,6 +1419,11 @@ pub fn run() {
                 match persistence::load_from_dir(&data_dir).await {
                     Ok(Some(persisted)) => {
                         persistence::apply(app_state, persisted).await;
+                        // Cross-check 'trained' flags: if a network is marked
+                        // trained but its weight file is missing, reset the flag
+                        // so the UI reflects reality (models are no longer
+                        // embedded in state.json — they live in models/<id>.json).
+                        persistence::reset_missing_model_flags(app_state, &data_dir).await;
                         eprintln!("[neuralcabin] loaded state from {}", data_dir.display());
                     }
                     Ok(None) => {

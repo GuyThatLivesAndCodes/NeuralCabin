@@ -1,9 +1,17 @@
 //! Disk persistence for the entire app state.
 //!
-//! Everything lives in `<app_data_dir>/state.json` (one file, atomically
-//! replaced via a tempfile + rename). Writes happen synchronously after every
-//! mutating command — the state is small enough that this is fine, and it
-//! removes any window where data could be lost on crash.
+//! Metadata (networks, corpora, vocabs, training history) lives in
+//! `<app_data_dir>/state.json` — small enough to load atomically.
+//!
+//! Model weights are stored in separate files:
+//!   `<app_data_dir>/models/<network_id>.json`
+//!
+//! Models are NOT loaded on startup. They are loaded lazily the first time
+//! training or inference is requested for a network (see `load_model`).
+//! This prevents a large trained model from causing an OOM crash on launch.
+//!
+//! Writes to state.json are atomic (write tmp → rename). Model files are
+//! written the same way.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +29,12 @@ use crate::{AppState, VocabEntry};
 pub const STATE_FILENAME: &str = "state.json";
 pub const FORMAT_VERSION: u32 = 1;
 
-/// Top-level on-disk snapshot of the full workspace.
+/// Top-level on-disk snapshot. Intentionally excludes model weights — those
+/// live in `models/<id>.json` and are loaded lazily.
+///
+/// Old `state.json` files that contain a `models` field have it silently
+/// ignored on load (serde skips unknown fields by default), so upgrading
+/// from a build that stored weights inline does not corrupt the workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     pub format_version: u32,
@@ -31,9 +44,6 @@ pub struct PersistedState {
     pub corpora: HashMap<String, Corpus>,
     #[serde(default)]
     pub vocabs: HashMap<String, PersistedVocab>,
-    #[serde(default)]
-    pub models: HashMap<String, Model>,
-    /// Per-network training run history, keyed by network id.
     #[serde(default)]
     pub training_history: HashMap<String, Vec<TrainingRun>>,
 }
@@ -45,7 +55,6 @@ impl Default for PersistedState {
             networks: HashMap::new(),
             corpora: HashMap::new(),
             vocabs: HashMap::new(),
-            models: HashMap::new(),
             training_history: HashMap::new(),
         }
     }
@@ -57,43 +66,96 @@ pub struct PersistedVocab {
     pub vocab: Vocabulary,
 }
 
+// ─── Model file helpers ──────────────────────────────────────────────────────
+
+fn model_path(data_dir: &Path, network_id: &str) -> PathBuf {
+    data_dir.join("models").join(format!("{network_id}.json"))
+}
+
+/// Write a model's weights to its own file. Atomic: write tmp → rename.
+pub async fn save_model(model: &Model, network_id: &str, data_dir: &Path) -> Result<(), String> {
+    let json = serde_json::to_vec(model)
+        .map_err(|e| format!("serialize model {network_id}: {e}"))?;
+    let models_dir = data_dir.join("models");
+    tokio::fs::create_dir_all(&models_dir).await
+        .map_err(|e| format!("create models dir: {e}"))?;
+    let path = model_path(data_dir, network_id);
+    let tmp  = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, &json).await
+        .map_err(|e| format!("write model tmp {network_id}: {e}"))?;
+    tokio::fs::rename(&tmp, &path).await
+        .map_err(|e| format!("rename model file {network_id}: {e}"))?;
+    Ok(())
+}
+
+/// Load a model's weights from disk. Returns `Ok(None)` if the file doesn't
+/// exist (network not yet trained / weights not yet migrated).
+pub async fn load_model(network_id: &str, data_dir: &Path) -> Result<Option<Model>, String> {
+    let path = model_path(data_dir, network_id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read model {}: {e}", path.display())),
+    };
+    let model: Model = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse model {}: {e}", path.display()))?;
+    Ok(Some(model))
+}
+
+/// Delete a model's weight file. Silently succeeds if the file doesn't exist.
+pub async fn delete_model(network_id: &str, data_dir: &Path) -> Result<(), String> {
+    let path = model_path(data_dir, network_id);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("delete model {}: {e}", path.display())),
+    }
+}
+
+/// Returns true if a weight file exists for this network.
+pub async fn model_file_exists(network_id: &str, data_dir: &Path) -> bool {
+    tokio::fs::try_exists(model_path(data_dir, network_id)).await.unwrap_or(false)
+}
+
+// ─── Snapshot / save / load ──────────────────────────────────────────────────
+
 /// Build a `PersistedState` snapshot from the live `AppState`.
+/// Model weights are excluded — they are saved separately by `save_to_dir`.
 pub async fn snapshot(state: &AppState) -> PersistedState {
     let networks = state.networks.read().await.clone();
-    let corpora = state.corpora.read().await.clone();
+    let corpora  = state.corpora.read().await.clone();
 
     let mut vocabs: HashMap<String, PersistedVocab> = HashMap::new();
     {
         let live = state.vocabs.read().await;
         for (k, e) in live.iter() {
             let inner = e.vocab.read().await.clone();
-            vocabs.insert(k.clone(), PersistedVocab {
-                info: e.info.clone(),
-                vocab: inner,
-            });
-        }
-    }
-
-    let mut models: HashMap<String, Model> = HashMap::new();
-    {
-        let live = state.models.read().await;
-        for (k, m) in live.iter() {
-            let model = m.read().await.clone();
-            models.insert(k.clone(), model);
+            vocabs.insert(k.clone(), PersistedVocab { info: e.info.clone(), vocab: inner });
         }
     }
 
     let training_history = state.training_history.read().await.clone();
 
-    PersistedState { format_version: FORMAT_VERSION, networks, corpora, vocabs, models, training_history }
+    PersistedState { format_version: FORMAT_VERSION, networks, corpora, vocabs, training_history }
 }
 
-/// Persist the full state to `<data_dir>/state.json`. The write is atomic:
-/// we write to `state.json.tmp` first and then rename over the target so that
-/// a crash mid-write cannot leave the file half-written.
+/// Persist the full state: atomically replace `state.json` (no weights), then
+/// write a separate `models/<id>.json` for every model currently in memory.
 pub async fn save_to_dir(state: &AppState, data_dir: &Path) -> Result<(), String> {
+    // 1. Write the metadata snapshot.
     let persisted = snapshot(state).await;
-    save_persisted(&persisted, data_dir).await
+    save_persisted(&persisted, data_dir).await?;
+
+    // 2. Write each in-memory model to its own file. Non-fatal per model so
+    //    one corrupt model doesn't block saving everything else.
+    let models = state.models.read().await;
+    for (id, model_arc) in models.iter() {
+        let model = model_arc.read().await.clone();
+        if let Err(e) = save_model(&model, id, data_dir).await {
+            eprintln!("[neuralcabin] {e}");
+        }
+    }
+    Ok(())
 }
 
 pub async fn save_persisted(persisted: &PersistedState, data_dir: &Path) -> Result<(), String> {
@@ -102,7 +164,7 @@ pub async fn save_persisted(persisted: &PersistedState, data_dir: &Path) -> Resu
     tokio::fs::create_dir_all(data_dir).await
         .map_err(|e| format!("create data dir {}: {e}", data_dir.display()))?;
     let final_path = data_dir.join(STATE_FILENAME);
-    let tmp_path = data_dir.join(format!("{}.tmp", STATE_FILENAME));
+    let tmp_path   = data_dir.join(format!("{STATE_FILENAME}.tmp"));
     tokio::fs::write(&tmp_path, &json).await
         .map_err(|e| format!("write state tmp: {e}"))?;
     tokio::fs::rename(&tmp_path, &final_path).await
@@ -110,10 +172,8 @@ pub async fn save_persisted(persisted: &PersistedState, data_dir: &Path) -> Resu
     Ok(())
 }
 
-/// Load `state.json` from `data_dir`. Returns `Ok(None)` if the file doesn't
-/// exist yet (fresh install). Returns an error if the file exists but is
-/// corrupt — we DON'T silently wipe a corrupt state file, since that risks
-/// destroying the user's work.
+/// Load `state.json`. Returns `Ok(None)` for a fresh install.
+/// Returns an error if the file is corrupt — we never silently wipe data.
 pub async fn load_from_dir(data_dir: &Path) -> Result<Option<PersistedState>, String> {
     let path = data_dir.join(STATE_FILENAME);
     let bytes = match tokio::fs::read(&path).await {
@@ -132,39 +192,48 @@ pub async fn load_from_dir(data_dir: &Path) -> Result<Option<PersistedState>, St
     Ok(Some(persisted))
 }
 
-/// Populate an empty `AppState` from a loaded snapshot. Safe to call before
-/// the app is registered as a Tauri-managed state.
+/// Populate an empty `AppState` from a loaded snapshot.
+/// Models are intentionally NOT restored here — they are loaded lazily.
 pub async fn apply(state: &AppState, persisted: PersistedState) {
     *state.networks.write().await = persisted.networks;
-    *state.corpora.write().await = persisted.corpora;
+    *state.corpora.write().await  = persisted.corpora;
+
     let mut vocabs = state.vocabs.write().await;
     vocabs.clear();
     for (k, mut pv) in persisted.vocabs {
-        // `Vocabulary` skips its lookup index during (de)serialization to keep
-        // state.json small; rebuild it now so `encode` works on the very next
-        // command after load.
         pv.vocab.rebuild_index();
         vocabs.insert(k, VocabEntry {
             vocab: Arc::new(RwLock::new(pv.vocab)),
             info: pv.info,
         });
     }
-    let mut models = state.models.write().await;
-    models.clear();
-    for (k, m) in persisted.models {
-        models.insert(k, Arc::new(RwLock::new(m)));
-    }
+
     *state.training_history.write().await = persisted.training_history;
+    // state.models is intentionally left empty — loaded on demand.
 }
 
-/// Return the configured data directory, or None if persistence is disabled
-/// (e.g. during unit tests that don't go through the Tauri setup hook).
+/// After loading, cross-check the `trained` flag on each network against
+/// whether a model file actually exists. Networks whose weight file is missing
+/// are marked untrained so the UI shows the correct state.
+pub async fn reset_missing_model_flags(state: &AppState, data_dir: &Path) {
+    let mut networks = state.networks.write().await;
+    for (id, net) in networks.iter_mut() {
+        if net.trained && !model_file_exists(id, data_dir).await {
+            eprintln!(
+                "[neuralcabin] model file missing for '{}' ('{}'): marking untrained",
+                id, net.name
+            );
+            net.trained = false;
+        }
+    }
+}
+
+/// Return the configured data directory, or None if persistence is disabled.
 pub async fn data_dir(state: &AppState) -> Option<PathBuf> {
     state.data_dir.read().await.clone()
 }
 
-/// Best-effort save. Used by background tasks (e.g. training-loop) that have
-/// nowhere to return an error. Failure is logged to stderr but does not panic.
+/// Best-effort save for background tasks that can't propagate errors.
 pub async fn save_best_effort(state: &AppState) {
     let Some(dir) = data_dir(state).await else { return; };
     if let Err(e) = save_to_dir(state, &dir).await {
@@ -221,11 +290,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_and_apply_roundtrip() {
+    async fn snapshot_does_not_include_models() {
+        let original = AppState::new();
+        original.networks.write().await.insert("a".into(), sample_network("a"));
+        original.models.write().await.insert("a".into(), Arc::new(RwLock::new(sample_model())));
+
+        let snap = snapshot(&original).await;
+        // snapshot() intentionally omits model weights.
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("input_dim"), "model weights leaked into state snapshot");
+    }
+
+    #[tokio::test]
+    async fn apply_does_not_restore_models() {
         let original = AppState::new();
         original.networks.write().await.insert("a".into(), sample_network("a"));
         original.networks.write().await.insert("b".into(), sample_network("b"));
-        original.models.write().await.insert("a".into(), Arc::new(RwLock::new(sample_model())));
         original.corpora.write().await.insert("a".into(), Corpus {
             network_id: "a".into(),
             kind: kinds::FEEDFORWARD.into(),
@@ -255,10 +335,42 @@ mod tests {
         assert!(restored.networks.read().await.contains_key("b"));
         assert_eq!(restored.corpora.read().await.len(), 1);
         assert_eq!(restored.vocabs.read().await.len(), 1);
-        assert_eq!(restored.models.read().await.len(), 1);
+        // Models are loaded lazily — apply() leaves them empty.
+        assert_eq!(restored.models.read().await.len(), 0);
+    }
 
-        let restored_model = restored.models.read().await.get("a").cloned().unwrap();
-        assert_eq!(restored_model.read().await.input_dim, 2);
+    #[tokio::test]
+    async fn model_file_roundtrip() {
+        let dir = tempdir();
+        let model = sample_model();
+
+        save_model(&model, "net-x", &dir).await.expect("save");
+        assert!(dir.join("models").join("net-x.json").exists());
+
+        let loaded = load_model("net-x", &dir).await.expect("load").expect("exists");
+        assert_eq!(loaded.input_dim, model.input_dim);
+        assert_eq!(loaded.layers.len(), model.layers.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_model_returns_none_when_missing() {
+        let dir = tempdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = load_model("nonexistent", &dir).await.expect("no error");
+        assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_model_is_idempotent() {
+        let dir = tempdir();
+        let model = sample_model();
+        save_model(&model, "del-me", &dir).await.expect("save");
+        delete_model("del-me", &dir).await.expect("first delete");
+        delete_model("del-me", &dir).await.expect("second delete (idempotent)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -266,19 +378,29 @@ mod tests {
         let dir = tempdir();
         let original = AppState::new();
         original.networks.write().await.insert("net-1".into(), sample_network("net-1"));
+        // Put a model in memory — save_to_dir should write it to a separate file.
         original.models.write().await.insert("net-1".into(), Arc::new(RwLock::new(sample_model())));
 
         save_to_dir(&original, &dir).await.expect("save");
-        assert!(dir.join(STATE_FILENAME).exists());
+        assert!(dir.join(STATE_FILENAME).exists(), "state.json must exist");
+        assert!(dir.join("models").join("net-1.json").exists(), "model file must exist");
+
+        // state.json must NOT contain model weights.
+        let raw = std::fs::read_to_string(dir.join(STATE_FILENAME)).unwrap();
+        assert!(!raw.contains("\"models\""), "weights leaked into state.json");
 
         let loaded = load_from_dir(&dir).await.expect("load").expect("file exists");
         assert_eq!(loaded.format_version, FORMAT_VERSION);
         assert_eq!(loaded.networks.len(), 1);
-        assert_eq!(loaded.models.len(), 1);
 
         let restored = AppState::new();
         apply(&restored, loaded).await;
         assert_eq!(restored.networks.read().await.get("net-1").unwrap().name, "net-net-1");
+        // Models are loaded separately.
+        assert_eq!(restored.models.read().await.len(), 0);
+
+        let model = load_model("net-1", &dir).await.expect("ok").expect("exists");
+        assert_eq!(model.input_dim, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -297,7 +419,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(STATE_FILENAME), b"not json {").unwrap();
         let result = load_from_dir(&dir).await;
-        assert!(result.is_err(), "corrupt file should produce an error, not silently drop the state");
+        assert!(result.is_err(), "corrupt file should error, not silently drop state");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

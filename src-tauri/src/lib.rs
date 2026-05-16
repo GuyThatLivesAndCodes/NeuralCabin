@@ -1156,6 +1156,7 @@ async fn run_training_loop(
         model_arc: &Arc<RwLock<Model>>,
         rollback: &Arc<AtomicBool>,
         initial_snapshot: &Model,
+        networks_handle: &Arc<RwLock<HashMap<String, Network>>>,
     ) {
         if rollback.load(Ordering::Relaxed) {
             // Restore the model to its pre-training state. Any progress made
@@ -1165,11 +1166,21 @@ async fn run_training_loop(
         }
         let elapsed = start.elapsed().as_secs_f32();
         let final_loss = loss_history.last().copied().unwrap_or(0.0);
-        let status = if rollback.load(Ordering::Relaxed) { "aborted" } else { "cancelled" };
+        let aborted = rollback.load(Ordering::Relaxed);
+        let status = if aborted { "aborted" } else { "cancelled" };
         {
             let mut s = training_state.write().await;
             s.running = false; s.stopped = true; s.cancelled = true;
             s.elapsed_secs = elapsed;
+        }
+        // Stop (not Abort) keeps whatever weights the model has at this point.
+        // Those weights are real and the UI should reflect that the network is
+        // now trained — otherwise inference and the Networks tab keep showing
+        // "not trained" even though the model produces real outputs.
+        if !aborted && epochs_run > 0 {
+            if let Some(net) = networks_handle.write().await.get_mut(network_id) {
+                net.trained = true;
+            }
         }
         let run = build_training_run_record(
             training_id, network_id, cfg, started_at,
@@ -1191,6 +1202,7 @@ async fn run_training_loop(
                 &app, &training_id, &network_id, &cfg, started_at,
                 epoch.saturating_sub(1), &loss_history, start,
                 &training_state, &model_arc, &rollback, &initial_snapshot,
+                &networks_handle,
             ).await;
             return;
         }

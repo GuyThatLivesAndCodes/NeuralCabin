@@ -737,48 +737,35 @@ mod llama_gguf {
         write_kv_u32(&mut meta, "general.file_type", 0); kv_count += 1;
         write_kv_u32(&mut meta, "general.quantization_version", 2); kv_count += 1;
 
-        // Tokenizer. We declare the SentencePiece-style "llama" tokenizer:
-        // - tokenizer.ggml.tokens / scores / token_type describe every vocab
-        //   entry. Our reserved (pad/unk/bos/eos/user/assistant) are CONTROL,
-        //   everything else is USER_DEFINED — llama.cpp's SPM tokenizer
-        //   matches USER_DEFINED tokens as literal substrings, which fits our
-        //   char/word/subword vocabulary perfectly.
-        // - `tokenizer.ggml.pre` is intentionally *not* written: it is the
-        //   BPE pretokenizer-regex hint and llama.cpp errors out on SPM
-        //   models that carry it.
-        // - The `add_*_token` and `add_space_prefix` bool flags must be set
-        //   explicitly; without them llama.cpp falls back to SPM defaults
-        //   (insert <s> prefix, prepend "▁"), which don't match how our
-        //   vocab was built and cause `tokenize` to throw on the first call.
-        // - A minimal chat template lets LM Studio's chat UI work on
-        //   fine-tuned networks.
-        write_kv_string(&mut meta, "tokenizer.ggml.model", "llama"); kv_count += 1;
+        // Tokenizer. We use the **RWKV-world** tokenizer model
+        // (`tokenizer.ggml.model = "rwkv"`) rather than SentencePiece
+        // (`"llama"`): RWKV's tokenizer in llama.cpp is a plain trie that
+        // does greedy longest-prefix matching against the vocab, with no
+        // SentencePiece preconditions (no `▁` whitespace marker, no merge
+        // table, no scores, no byte-fallback table). That fits our
+        // arbitrary char/subword/word vocab perfectly. Without this,
+        // SPM tokenize would throw on edge cases (empty input, characters
+        // outside the vocab, round-tripped reserved markers like `<eos>`)
+        // and LM Studio would log "Unknown exception during tokenize"
+        // for every auxiliary tokenize RPC the chat UI makes.
+        write_kv_string(&mut meta, "tokenizer.ggml.model", "rwkv"); kv_count += 1;
         write_kv_string_array(&mut meta, "tokenizer.ggml.tokens", tokens); kv_count += 1;
-        // SPM uses scores as Viterbi log-probabilities; 0.0 across the board
-        // collapses to "prefer longest match", which is exactly what we want.
+        // RWKV doesn't use scores at runtime, but writing them keeps the
+        // metadata schema consistent with other architectures and
+        // satisfies clients that load the array unconditionally.
         let scores: Vec<f32> = vec![0.0; tokens.len()];
         write_kv_f32_array(&mut meta, "tokenizer.ggml.scores", &scores); kv_count += 1;
-        // Mark every token (including the reserved <pad>/<unk>/<bos>/<eos>/
-        // <user>/<assistant>) as USER_DEFINED so llama.cpp's SPM tokenizer
-        // matches them as literal substrings. We used to mark the reserved
-        // ones as CONTROL, but CONTROL tokens are insert-only — when chat
-        // round-tripped the literal string `<eos>` from our tokens table
-        // back through tokenize, llama.cpp couldn't match it and threw,
-        // which surfaced in LM Studio as "Unknown exception during tokenize".
-        let token_types: Vec<i32> = vec![4; tokens.len()];
+        // Token types: 1 = NORMAL for everything. RWKV's trie matcher
+        // treats every entry uniformly; the bos/eos/pad/unk markers are
+        // looked up by id, not type, so there's nothing to distinguish.
+        let token_types: Vec<i32> = vec![1; tokens.len()];
         write_kv_i32_array(&mut meta, "tokenizer.ggml.token_type", &token_types); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.bos_token_id", neuralcabin_engine::tokenizer::BOS_ID); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.eos_token_id", neuralcabin_engine::tokenizer::EOS_ID); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.padding_token_id", neuralcabin_engine::tokenizer::PAD_ID); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.unknown_token_id", neuralcabin_engine::tokenizer::UNK_ID); kv_count += 1;
-        write_kv_bool(&mut meta, "tokenizer.ggml.add_bos_token",   false); kv_count += 1;
-        write_kv_bool(&mut meta, "tokenizer.ggml.add_eos_token",   false); kv_count += 1;
-        write_kv_bool(&mut meta, "tokenizer.ggml.add_space_prefix", false); kv_count += 1;
-        // Disable byte fallback explicitly — our vocab doesn't include the
-        // 256 `<0xNN>` byte tokens that SPM byte-fallback would look up.
-        // With this off, any character not in vocab tokenizes to <unk>
-        // (id 1) instead of provoking an out-of-range lookup that throws.
-        write_kv_bool(&mut meta, "tokenizer.ggml.byte_fallback", false); kv_count += 1;
+        write_kv_bool(&mut meta, "tokenizer.ggml.add_bos_token", false); kv_count += 1;
+        write_kv_bool(&mut meta, "tokenizer.ggml.add_eos_token", false); kv_count += 1;
         // Chat template (Jinja-style). When the network is fine-tuned we wrap
         // turns in <user>/<assistant> markers; mirror that so LM Studio's chat
         // surface produces well-formed prompts.

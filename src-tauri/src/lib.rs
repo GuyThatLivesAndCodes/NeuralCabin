@@ -123,7 +123,7 @@ fn parse_tokenizer_mode(name: &str) -> Result<TokenizerMode, String> {
     }
 }
 
-fn build_optimizer(cfg: &OptimizerConfig, shapes: &[Vec<usize>]) -> Result<Optimizer, String> {
+fn build_optimizer(cfg: &OptimizerConfig, _shapes: &[Vec<usize>]) -> Result<Optimizer, String> {
     let kind = match cfg.kind.to_ascii_lowercase().as_str() {
         "adam" => OptimizerKind::Adam {
             lr: cfg.lr,
@@ -151,7 +151,9 @@ fn build_optimizer(cfg: &OptimizerConfig, shapes: &[Vec<usize>]) -> Result<Optim
         },
         other => return Err(format!("unknown optimizer '{other}' (expected adam|adamw|lamb|sgd)")),
     };
-    Ok(Optimizer::new(kind, shapes))
+    // With the Burn migration, the `Optimizer` type alias is just the kind/config.
+    // Burn builds the per-step optimizer instance inside `train_step` itself.
+    Ok(kind)
 }
 
 fn build_layer_specs(layers: &[LayerDef], input_dim: usize) -> Result<(Vec<LayerSpec>, usize), String> {
@@ -856,7 +858,7 @@ async fn run_training_loop(
         let m = model_arc.read().await;
         m.parameter_shapes()
     };
-    let mut optimizer = match build_optimizer(&cfg.optimizer, &shapes) {
+    let optimizer = match build_optimizer(&cfg.optimizer, &shapes) {
         Ok(o) => o,
         Err(e) => {
             mark_error(&training_state, &training_id, &app, e).await;
@@ -868,6 +870,14 @@ async fn run_training_loop(
     let mut loss_history: Vec<f32> = Vec::with_capacity(cfg.epochs);
     let mut rng = SplitMix64::new(cfg.seed.wrapping_add(0xA5A5_5A5A_5A5A_A5A5));
     let mut indices: Vec<usize> = (0..n).collect();
+
+    // Instantiate the WGPU device once for the entire training run. This is
+    // where the migration to Burn becomes visible at runtime — all subsequent
+    // tensor work happens on this device. On laptops without a discrete GPU,
+    // WGPU falls back to an integrated GPU; if neither is available it falls
+    // back to a CPU compute pipeline.
+    let device = neuralcabin_engine::default_gpu_device();
+    let mut step_counter: u64 = 0;
 
     /// Run the cleanup path for a cancelled training run. Honours `rollback`
     /// to decide whether to keep or revert the in-progress weights, persists
@@ -941,7 +951,10 @@ async fn run_training_loop(
             // between batches instead of waiting for the whole run to finish.
             let loss = {
                 let mut model = model_arc.write().await;
-                model.train_step(&mut optimizer, loss_kind, &bx, &by)
+                step_counter += 1;
+                neuralcabin_engine::train_step_on_device::<neuralcabin_engine::GpuAutodiffBackend>(
+                    &mut model, &optimizer, step_counter, loss_kind, &bx, &by, &device,
+                )
             };
             if !loss.is_finite() {
                 mark_error(&training_state, &training_id, &app,

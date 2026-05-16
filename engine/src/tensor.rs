@@ -1,13 +1,15 @@
 //! Dense, row-major N-dimensional tensor backed by a `Vec<f32>`.
 //!
-//! All math is implemented inline. No BLAS, no `ndarray`, no SIMD intrinsics —
-//! just straightforward Rust loops. Operations work on owned tensors and return
-//! owned tensors so the autograd tape can track them cleanly.
+//! This is the engine's *interchange* type — what crosses the public API and
+//! gets serialized to disk. The heavy lifting (matmul, autograd, optimizer
+//! updates) happens inside Burn, with conversions via `to_burn_2d()` /
+//! `from_burn_2d()` at the boundaries of `train_step` and `predict`.
 
 // Plain index loops are clearer than enumerate-style iterators for the small
 // dense numerical kernels in this file.
 #![allow(clippy::needless_range_loop)]
 
+use burn::tensor::{backend::Backend, Tensor as BurnTensor, TensorData};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -244,6 +246,32 @@ impl Tensor {
             out.extend_from_slice(&self.data);
         }
         Ok(Tensor { shape: vec![rows, c], data: out })
+    }
+
+    // ─── Burn bridge ─────────────────────────────────────────────────────────
+    //
+    // The training loop and inference path go through Burn so they can run on
+    // a GPU device. These helpers move data between `Tensor` and Burn's
+    // `Tensor<B, 2>`. We use `TensorData` (Burn's device-agnostic data
+    // container) as the intermediate representation.
+
+    /// Move a 2-D `Tensor` onto the given Burn backend / device.
+    pub fn to_burn_2d<B: Backend>(&self, device: &B::Device) -> BurnTensor<B, 2> {
+        assert_eq!(self.shape.len(), 2, "to_burn_2d expects a 2-D tensor, got {:?}", self.shape);
+        let data = TensorData::new(self.data.clone(), self.shape.clone());
+        BurnTensor::<B, 2>::from_data(data, device)
+    }
+
+    /// Pull a Burn 2-D tensor back to a CPU `Tensor`. Used after training to
+    /// write the updated weights back into `LinearLayer`.
+    pub fn from_burn_2d<B: Backend>(t: BurnTensor<B, 2>) -> Tensor {
+        let dims = t.dims();
+        let data: TensorData = t.into_data();
+        // `to_vec` returns the raw f32s in row-major order (which is what we use).
+        let values: Vec<f32> = data
+            .to_vec::<f32>()
+            .expect("Burn tensor must be f32 to convert to neuralcabin Tensor");
+        Tensor::new(vec![dims[0], dims[1]], values)
     }
 }
 

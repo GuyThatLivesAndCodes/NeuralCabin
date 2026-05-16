@@ -320,6 +320,7 @@ pub struct InferenceFinished {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // payload type only — emitted via Tauri events, never constructed directly
 pub struct InferenceError {
     pub inference_id: String,
     pub message: String,

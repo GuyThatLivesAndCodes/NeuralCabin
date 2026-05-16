@@ -296,9 +296,11 @@ mod tests {
         original.models.write().await.insert("a".into(), Arc::new(RwLock::new(sample_model())));
 
         let snap = snapshot(&original).await;
-        // snapshot() intentionally omits model weights.
+        // snapshot() intentionally omits model weights. `"weights"` is a field
+        // on LinearLayer inside Model and does not appear anywhere in the
+        // metadata-only snapshot (Network uses LayerDef which has no weights).
         let json = serde_json::to_string(&snap).unwrap();
-        assert!(!json.contains("input_dim"), "model weights leaked into state snapshot");
+        assert!(!json.contains("\"weights\""), "model weights leaked into state snapshot");
     }
 
     #[tokio::test]

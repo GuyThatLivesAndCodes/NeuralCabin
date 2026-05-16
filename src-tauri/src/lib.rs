@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use neuralcabin_engine::nn::{Layer, LayerSpec, Model};
 use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
 use neuralcabin_engine::tensor::{SplitMix64, Tensor};

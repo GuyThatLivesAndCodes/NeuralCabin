@@ -470,6 +470,7 @@ mod tests {
     use crate::backend::{CpuAutodiffBackend, CpuBackend};
     use crate::optimizer::OptimizerKind;
     use burn::tensor::backend::Backend;
+    use serial_test::serial;
 
     fn tiny_config(vocab: usize) -> TransformerConfig {
         TransformerConfig {
@@ -499,6 +500,7 @@ mod tests {
     /// decreases. The model is tiny so this is more about plumbing than
     /// learning quality.
     #[test]
+    #[serial(autodiff)]
     fn train_step_decreases_loss() {
         let cfg = tiny_config(8);
         let mut model = TransformerModel::new(cfg.clone(), 42);

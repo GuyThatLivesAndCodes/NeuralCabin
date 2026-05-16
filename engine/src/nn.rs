@@ -416,6 +416,7 @@ mod tests {
     /// XOR is the canonical "non-linearly separable" problem.  A small MLP must
     /// learn it; we assert the model converges below loss < 0.10 within budget.
     #[test]
+    #[serial_test::serial(autodiff)]
     fn mlp_learns_xor() {
         let specs = vec![
             LayerSpec::Linear { in_dim: 2, out_dim: 8 },

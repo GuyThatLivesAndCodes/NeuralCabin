@@ -19,3 +19,9 @@ serde_json = "1"
 # - `ndarray`  : CPU backend (required so `cargo test` runs without a GPU)
 # - `std`      : standard library bridge
 burn = { version = "0.16", default-features = false, features = ["wgpu", "autodiff", "ndarray", "std"] }
+
+[dev-dependencies]
+# Burn 0.16's autodiff backend has thread-local node state that breaks when
+# multiple training-step tests run in parallel. We serialize them with
+# `#[serial(autodiff)]` so the full suite is reliable under default cargo test.
+serial_test = "3"

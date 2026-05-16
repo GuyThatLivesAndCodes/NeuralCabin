@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { networks, Activation, Layer, Network, NetworkKind } from '../api'
+import { networks, exporter, Activation, ExportFormat, Layer, Network, NetworkKind } from '../api'
 import type { TabProps } from '../App'
 
 const ACTIVATIONS: Activation[] = ['identity', 'relu', 'sigmoid', 'tanh', 'softmax']
@@ -10,28 +10,31 @@ interface FormState {
   seed: number
   // Feedforward fields
   inputDim: number
-  hiddenSpec: string  // e.g. "8,relu,4,relu" — comma list of (number | activation)
+  hiddenSpec: string
   outputDim: number
   outputActivation: Activation
   // Next-token fields
-  vocabBudget: number  // Approx vocab size you expect — used to size the input layer
+  vocabBudget: number
   contextSize: number
-  embedHidden: string  // hidden layer sizes after the one-hot input, e.g. "64,relu,32,relu"
+  embedHidden: string
+  // Transformer fields
+  tNCtx:    number
+  tNEmbd:   number
+  tNLayers: number
+  tNHeads:  number
+  tNFf:     number
 }
 
 function defaultForm(kind: NetworkKind): FormState {
-  if (kind === 'feedforward') {
-    return {
-      name: 'xor-mlp', kind, seed: 42,
-      inputDim: 2, hiddenSpec: '8,tanh', outputDim: 1, outputActivation: 'sigmoid',
-      vocabBudget: 64, contextSize: 16, embedHidden: '64,relu',
-    }
-  }
-  return {
-    name: 'tiny-lm', kind, seed: 42,
-    inputDim: 2, hiddenSpec: '8,tanh', outputDim: 1, outputActivation: 'sigmoid',
+  const base = {
+    seed: 42,
+    inputDim: 2, hiddenSpec: '8,tanh', outputDim: 1, outputActivation: 'sigmoid' as Activation,
     vocabBudget: 64, contextSize: 16, embedHidden: '64,relu',
+    tNCtx: 64, tNEmbd: 64, tNLayers: 2, tNHeads: 4, tNFf: 256,
   }
+  if (kind === 'feedforward') return { ...base, name: 'xor-mlp', kind }
+  if (kind === 'transformer') return { ...base, name: 'nano-llama', kind }
+  return { ...base, name: 'tiny-lm', kind }
 }
 
 /**
@@ -77,6 +80,13 @@ function buildLayers(form: FormState): { layers: Layer[]; inputDim: number; outp
       layers.push({ type: 'activation', activation: form.outputActivation })
     }
     return { layers, inputDim: form.inputDim, outputDim: form.outputDim }
+  }
+
+  if (form.kind === 'transformer') {
+    // Transformer's architecture is parameterised by hparams, not a layer list.
+    // We report inputDim/outputDim as 0 here (they're driven by the vocab built
+    // from the attached corpus). The ArchitecturePreview shows the hparams.
+    return { layers: [], inputDim: 0, outputDim: 0 }
   }
 
   // next_token
@@ -130,7 +140,18 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
         seed: form.seed,
         layers: preview.layers,
         input_dim: preview.inputDim,
-        context_size: form.kind === 'next_token' ? form.contextSize : null,
+        context_size: form.kind === 'next_token' ? form.contextSize
+                     : form.kind === 'transformer' ? form.tNCtx
+                     : null,
+        transformer: form.kind === 'transformer' ? {
+          n_ctx:    form.tNCtx,
+          n_embd:   form.tNEmbd,
+          n_layers: form.tNLayers,
+          n_heads:  form.tNHeads,
+          n_ff:     form.tNFf,
+          rope_theta: 10000,
+          rms_eps:    1e-5,
+        } : null,
       })
       setShowForm(false)
       setForm(defaultForm(form.kind))
@@ -181,12 +202,62 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
                   }}
                 >
                   <option value="feedforward">Feed-forward (regression / classification)</option>
-                  <option value="next_token">Next-token prediction (text)</option>
+                  <option value="next_token">Next-token MLP (text on one-hot window)</option>
+                  <option value="transformer">Transformer LM (llama-style — exports to GGUF for llama.cpp / LM Studio)</option>
                 </select>
               </div>
             </div>
 
-            {form.kind === 'feedforward' ? (
+            {form.kind === 'transformer' ? (
+              <>
+                <div className="grid-3">
+                  <div>
+                    <label>Context length (n_ctx)</label>
+                    <input type="number" min={2} max={4096} value={form.tNCtx}
+                      onChange={e => setForm({ ...form, tNCtx: parseInt(e.target.value) || 2 })} />
+                    <small>Maximum tokens per sequence.</small>
+                  </div>
+                  <div>
+                    <label>Embedding dim (n_embd)</label>
+                    <input type="number" min={8} step={8} value={form.tNEmbd}
+                      onChange={e => setForm({ ...form, tNEmbd: parseInt(e.target.value) || 8 })} />
+                    <small>Must be divisible by n_heads; head_dim must be even (for RoPE).</small>
+                  </div>
+                  <div>
+                    <label>Heads (n_heads)</label>
+                    <input type="number" min={1} value={form.tNHeads}
+                      onChange={e => setForm({ ...form, tNHeads: parseInt(e.target.value) || 1 })} />
+                  </div>
+                </div>
+                <div className="grid-3">
+                  <div>
+                    <label>Layers (n_layers)</label>
+                    <input type="number" min={1} max={64} value={form.tNLayers}
+                      onChange={e => setForm({ ...form, tNLayers: parseInt(e.target.value) || 1 })} />
+                  </div>
+                  <div>
+                    <label>Feed-forward dim (n_ff)</label>
+                    <input type="number" min={8} value={form.tNFf}
+                      onChange={e => setForm({ ...form, tNFf: parseInt(e.target.value) || 8 })} />
+                    <small>Typical: 4 × n_embd.</small>
+                  </div>
+                  <div>
+                    <label>Seed</label>
+                    <input type="number" value={form.seed}
+                      onChange={e => setForm({ ...form, seed: parseInt(e.target.value) || 0 })} />
+                  </div>
+                </div>
+                <div className="card" style={{ background: 'var(--bg-input)', margin: 0 }}>
+                  <small className="muted">
+                    Pre-norm decoder-only transformer with multi-head causal
+                    self-attention, RoPE, and SwiGLU feed-forward. Architecture
+                    matches llama 2 so exported GGUF files load in llama.cpp /
+                    LM Studio. Vocabulary is built from the attached corpus on
+                    the Corpus tab — the embedding layer is resized to match.
+                  </small>
+                </div>
+              </>
+            ) : form.kind === 'feedforward' ? (
               <>
                 <div className="grid-3">
                   <div>
@@ -254,7 +325,9 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
               </div>
             )}
 
-            <ArchitecturePreview preview={preview} />
+            {form.kind === 'transformer'
+              ? <TransformerPreview form={form} />
+              : <ArchitecturePreview preview={preview} />}
 
             <div className="flex">
               <button onClick={onSubmit} disabled={busy || !!preview.error}>
@@ -281,9 +354,106 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
               {n.trained ? <> {' '}<span className="chip accent">trained</span></> : null}
             </p>
           </div>
-          <button className="danger" onClick={() => onDelete(n.id)}>Delete</button>
+          <div className="flex">
+            <ExportButton network={n} onError={setError} />
+            <button className="danger" onClick={() => onDelete(n.id)}>Delete</button>
+          </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+function ExportButton({ network, onError }: { network: Network; onError: (e: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState<ExportFormat | null>(null)
+
+  const formats: { id: ExportFormat; label: string; enabled: boolean; reason?: string }[] = [
+    { id: 'pytorch', label: 'PyTorch (.pt)', enabled: true },
+    {
+      id: 'onnx', label: 'ONNX (.onnx)',
+      enabled: network.kind !== 'transformer',
+      reason: network.kind === 'transformer' ? 'ONNX export for transformers is not yet implemented' : undefined,
+    },
+    {
+      id: 'gguf', label: 'GGUF (.gguf)',
+      enabled: network.kind !== 'feedforward',
+      reason: network.kind === 'feedforward'
+        ? 'GGUF is only useful for text-generation networks'
+        : (network.kind === 'next_token'
+            ? 'Uses a custom architecture — not loadable in llama.cpp / LM Studio. Use the transformer kind for that.'
+            : undefined),
+    },
+  ]
+
+  const doExport = async (fmt: ExportFormat) => {
+    setBusy(fmt)
+    try {
+      const payload = await exporter.run(network.id, fmt)
+      // Decode base64 → Blob → trigger download.
+      const bin = atob(payload.data_b64)
+      const bytes = new Uint8Array(bin.length)
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+      const blob = new Blob([bytes], { type: 'application/octet-stream' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = payload.filename
+      document.body.appendChild(a); a.click()
+      document.body.removeChild(a); URL.revokeObjectURL(url)
+      setOpen(false)
+    } catch (e) {
+      onError(String(e))
+    } finally { setBusy(null) }
+  }
+
+  if (!open) {
+    return <button className="secondary" onClick={() => setOpen(true)} disabled={!network.trained && network.kind === 'next_token'}>
+      Export
+    </button>
+  }
+
+  return (
+    <div className="flex" style={{ gap: 4 }}>
+      {formats.map(f => (
+        <button
+          key={f.id}
+          className="secondary"
+          disabled={!f.enabled || busy !== null}
+          title={f.reason}
+          onClick={() => doExport(f.id)}
+        >
+          {busy === f.id ? 'Exporting…' : f.label}
+        </button>
+      ))}
+      <button className="secondary" onClick={() => setOpen(false)}>Cancel</button>
+    </div>
+  )
+}
+
+function TransformerPreview({ form }: { form: FormState }) {
+  const headDim = form.tNHeads ? form.tNEmbd / form.tNHeads : 0
+  const errors: string[] = []
+  if (form.tNEmbd % form.tNHeads !== 0) errors.push(`n_embd (${form.tNEmbd}) must be divisible by n_heads (${form.tNHeads})`)
+  if (headDim % 2 !== 0)                errors.push(`head_dim (n_embd/n_heads = ${headDim}) must be even for RoPE`)
+
+  // Rough parameter-count estimate (excluding embedding, which depends on vocab):
+  // per layer: 4 * n_embd^2 (attn QKVO) + 3 * n_embd * n_ff (gate/up/down) + 2*n_embd (norms)
+  const perLayer = 4 * form.tNEmbd * form.tNEmbd + 3 * form.tNEmbd * form.tNFf + 2 * form.tNEmbd
+  const coreParams = perLayer * form.tNLayers + form.tNEmbd
+
+  return (
+    <div className="card" style={{ background: 'var(--bg-input)', margin: 0 }}>
+      <h4>Architecture preview</h4>
+      <div className="flex" style={{ flexWrap: 'wrap' }}>
+        <span className="chip">n_ctx {form.tNCtx}</span>
+        <span className="chip">n_embd {form.tNEmbd}</span>
+        <span className="chip">n_layers {form.tNLayers}</span>
+        <span className="chip">n_heads {form.tNHeads}</span>
+        <span className="chip">head_dim {headDim}</span>
+        <span className="chip">n_ff {form.tNFf}</span>
+        <span className="chip accent">~{coreParams.toLocaleString()} core params (+ vocab × n_embd × 2 for embedding & LM head)</span>
+      </div>
+      {errors.length > 0 && <div className="status error mt-1">{errors.join('; ')}</div>}
     </div>
   )
 }

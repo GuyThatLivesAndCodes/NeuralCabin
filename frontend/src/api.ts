@@ -3,7 +3,17 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 // ─── Network ────────────────────────────────────────────────────────────────
 
-export type NetworkKind = 'feedforward' | 'next_token'
+export type NetworkKind = 'feedforward' | 'next_token' | 'transformer'
+
+export interface TransformerHParams {
+  n_ctx:     number
+  n_embd:    number
+  n_layers:  number
+  n_heads:   number
+  n_ff:      number
+  rope_theta: number
+  rms_eps:   number
+}
 export type Activation = 'identity' | 'relu' | 'sigmoid' | 'tanh' | 'softmax'
 
 export type Layer =
@@ -23,6 +33,7 @@ export interface Network {
   parameter_count: number
   hidden_layers?: Layer[] | null
   context_size?: number | null
+  transformer?: TransformerHParams | null
 }
 
 export interface CreateNetworkRequest {
@@ -32,6 +43,7 @@ export interface CreateNetworkRequest {
   layers: Layer[]
   input_dim?: number | null
   context_size?: number | null
+  transformer?: TransformerHParams | null
 }
 
 export const networks = {
@@ -269,6 +281,81 @@ export interface InferenceFinished {
 }
 
 export interface InferenceError { inference_id: string; message: string }
+
+// ─── Export ─────────────────────────────────────────────────────────────────
+
+export type ExportFormat = 'pytorch' | 'onnx' | 'gguf'
+
+export interface ExportPayload {
+  format: ExportFormat
+  filename: string
+  data_b64: string
+  size_bytes: number
+}
+
+export const exporter = {
+  /** Server-side export to bytes. The frontend converts the base64 payload
+   *  into a Blob and triggers a browser download. */
+  run: (network_id: string, format: ExportFormat) =>
+    invoke<ExportPayload>('export_network', { networkId: network_id, format }),
+}
+
+// ─── Server ─────────────────────────────────────────────────────────────────
+
+export interface ServerPermissions {
+  allow_list: boolean
+  allow_inference: boolean
+  allow_export: boolean
+  allow_upload: boolean
+  allow_train: boolean
+  allow_create: boolean
+  allow_delete: boolean
+}
+
+export interface ServerConfig {
+  id: string
+  name: string
+  port: number
+  localhost_only: boolean
+  auth_token: string
+  permissions: ServerPermissions
+  auto_start: boolean
+  created_at: string
+}
+
+export interface ServerSummary extends ServerConfig {
+  running: boolean
+  request_count: number
+  last_error: string | null
+}
+
+export interface CreateServerRequest {
+  name: string
+  port: number
+  localhost_only?: boolean
+  auth_token?: string
+  permissions?: ServerPermissions
+}
+
+export interface UpdateServerRequest {
+  id: string
+  name?: string
+  port?: number
+  localhost_only?: boolean
+  auth_token?: string
+  permissions?: ServerPermissions
+  auto_start?: boolean
+}
+
+export const servers = {
+  list:   ()                          => invoke<ServerSummary[]>('list_servers'),
+  create: (req: CreateServerRequest)  => invoke<ServerSummary>('create_server', { req }),
+  update: (req: UpdateServerRequest)  => invoke<ServerSummary>('update_server', { req }),
+  delete: (id: string)                => invoke<boolean>('delete_server', { id }),
+  start:  (id: string)                => invoke<ServerSummary>('start_server', { id }),
+  stop:   (id: string)                => invoke<ServerSummary>('stop_server', { id }),
+  status: (id: string)                => invoke<ServerSummary>('server_status', { id }),
+}
 
 export const inference = {
   run:    (req: InferRequest) => invoke<InferResponse>('infer', { req }),

@@ -758,10 +758,14 @@ mod llama_gguf {
         // collapses to "prefer longest match", which is exactly what we want.
         let scores: Vec<f32> = vec![0.0; tokens.len()];
         write_kv_f32_array(&mut meta, "tokenizer.ggml.scores", &scores); kv_count += 1;
-        let token_types: Vec<i32> = tokens.iter().enumerate().map(|(i, _)| {
-            // 0..=5 are our reserved special tokens (pad/unk/bos/eos/user/assistant).
-            if i < neuralcabin_engine::tokenizer::RESERVED { 3 } else { 4 }
-        }).collect();
+        // Mark every token (including the reserved <pad>/<unk>/<bos>/<eos>/
+        // <user>/<assistant>) as USER_DEFINED so llama.cpp's SPM tokenizer
+        // matches them as literal substrings. We used to mark the reserved
+        // ones as CONTROL, but CONTROL tokens are insert-only — when chat
+        // round-tripped the literal string `<eos>` from our tokens table
+        // back through tokenize, llama.cpp couldn't match it and threw,
+        // which surfaced in LM Studio as "Unknown exception during tokenize".
+        let token_types: Vec<i32> = vec![4; tokens.len()];
         write_kv_i32_array(&mut meta, "tokenizer.ggml.token_type", &token_types); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.bos_token_id", neuralcabin_engine::tokenizer::BOS_ID); kv_count += 1;
         write_kv_u32(&mut meta, "tokenizer.ggml.eos_token_id", neuralcabin_engine::tokenizer::EOS_ID); kv_count += 1;
@@ -770,6 +774,11 @@ mod llama_gguf {
         write_kv_bool(&mut meta, "tokenizer.ggml.add_bos_token",   false); kv_count += 1;
         write_kv_bool(&mut meta, "tokenizer.ggml.add_eos_token",   false); kv_count += 1;
         write_kv_bool(&mut meta, "tokenizer.ggml.add_space_prefix", false); kv_count += 1;
+        // Disable byte fallback explicitly — our vocab doesn't include the
+        // 256 `<0xNN>` byte tokens that SPM byte-fallback would look up.
+        // With this off, any character not in vocab tokenizes to <unk>
+        // (id 1) instead of provoking an out-of-range lookup that throws.
+        write_kv_bool(&mut meta, "tokenizer.ggml.byte_fallback", false); kv_count += 1;
         // Chat template (Jinja-style). When the network is fine-tuned we wrap
         // turns in <user>/<assistant> markers; mirror that so LM Studio's chat
         // surface produces well-formed prompts.

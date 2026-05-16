@@ -5,11 +5,12 @@ import VocabTab from './tabs/VocabTab'
 import TrainingTab from './tabs/TrainingTab'
 import InferenceTab from './tabs/InferenceTab'
 import DocsTab from './tabs/DocsTab'
+import ServerTab from './tabs/ServerTab'
 import SettingsTab from './tabs/SettingsTab'
 import { networks, Network } from './api'
 import { applySettings, loadSettings } from './settings'
 
-type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'docs' | 'settings'
+type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'docs' | 'server' | 'settings'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'networks',  label: 'Networks' },
@@ -18,6 +19,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'training',  label: 'Training' },
   { id: 'inference', label: 'Inference' },
   { id: 'docs',      label: 'Documentation' },
+  { id: 'server',    label: 'Server' },
   { id: 'settings',  label: 'Settings' },
 ]
 
@@ -102,6 +104,7 @@ export default function App() {
           {activeTab === 'training'  && <TrainingTab  {...props} />}
           {activeTab === 'inference' && <InferenceTab {...props} />}
           {activeTab === 'docs'      && <DocsTab      networks={list} />}
+          {activeTab === 'server'    && <ServerTab    networks={list} />}
           {activeTab === 'settings'  && <SettingsTab  onChange={() => { /* re-render via state in tab */ }} />}
         </main>
       </div>

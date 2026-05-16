@@ -24,6 +24,7 @@ use neuralcabin_engine::nn::Model;
 use neuralcabin_engine::tokenizer::Vocabulary;
 
 use crate::models::{Corpus, Network, TrainingRun, VocabularyInfo};
+use crate::server::{ServerConfig, ServerRuntime};
 use crate::{AppState, VocabEntry};
 
 pub const STATE_FILENAME: &str = "state.json";
@@ -46,6 +47,8 @@ pub struct PersistedState {
     pub vocabs: HashMap<String, PersistedVocab>,
     #[serde(default)]
     pub training_history: HashMap<String, Vec<TrainingRun>>,
+    #[serde(default)]
+    pub servers: Vec<ServerConfig>,
 }
 
 impl Default for PersistedState {
@@ -56,6 +59,7 @@ impl Default for PersistedState {
             corpora: HashMap::new(),
             vocabs: HashMap::new(),
             training_history: HashMap::new(),
+            servers: Vec::new(),
         }
     }
 }
@@ -136,7 +140,13 @@ pub async fn snapshot(state: &AppState) -> PersistedState {
 
     let training_history = state.training_history.read().await.clone();
 
-    PersistedState { format_version: FORMAT_VERSION, networks, corpora, vocabs, training_history }
+    let servers: Vec<ServerConfig> = state.servers.read().await
+        .values().map(|rt| rt.config.clone()).collect();
+
+    PersistedState {
+        format_version: FORMAT_VERSION,
+        networks, corpora, vocabs, training_history, servers,
+    }
 }
 
 /// Persist the full state: atomically replace `state.json` (no weights), then
@@ -225,6 +235,12 @@ pub async fn apply(state: &AppState, persisted: PersistedState) {
     }
 
     *state.training_history.write().await = persisted.training_history;
+
+    let mut servers = state.servers.write().await;
+    servers.clear();
+    for cfg in persisted.servers {
+        servers.insert(cfg.id.clone(), ServerRuntime::new(cfg));
+    }
     // state.models is intentionally left empty — loaded on demand.
 }
 

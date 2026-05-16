@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { networks, Activation, Layer, Network, NetworkKind } from '../api'
+import { networks, exporter, Activation, ExportFormat, Layer, Network, NetworkKind } from '../api'
 import type { TabProps } from '../App'
 
 const ACTIVATIONS: Activation[] = ['identity', 'relu', 'sigmoid', 'tanh', 'softmax']
@@ -281,9 +281,70 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
               {n.trained ? <> {' '}<span className="chip accent">trained</span></> : null}
             </p>
           </div>
-          <button className="danger" onClick={() => onDelete(n.id)}>Delete</button>
+          <div className="flex">
+            <ExportButton network={n} onError={setError} />
+            <button className="danger" onClick={() => onDelete(n.id)}>Delete</button>
+          </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+function ExportButton({ network, onError }: { network: Network; onError: (e: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState<ExportFormat | null>(null)
+
+  const formats: { id: ExportFormat; label: string; enabled: boolean; reason?: string }[] = [
+    { id: 'pytorch', label: 'PyTorch (.pt)', enabled: true },
+    { id: 'onnx',    label: 'ONNX (.onnx)', enabled: true },
+    {
+      id: 'gguf', label: 'GGUF (.gguf)',
+      enabled: network.kind === 'next_token',
+      reason: network.kind === 'next_token' ? undefined : 'GGUF is only useful for next-token networks',
+    },
+  ]
+
+  const doExport = async (fmt: ExportFormat) => {
+    setBusy(fmt)
+    try {
+      const payload = await exporter.run(network.id, fmt)
+      // Decode base64 → Blob → trigger download.
+      const bin = atob(payload.data_b64)
+      const bytes = new Uint8Array(bin.length)
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+      const blob = new Blob([bytes], { type: 'application/octet-stream' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = payload.filename
+      document.body.appendChild(a); a.click()
+      document.body.removeChild(a); URL.revokeObjectURL(url)
+      setOpen(false)
+    } catch (e) {
+      onError(String(e))
+    } finally { setBusy(null) }
+  }
+
+  if (!open) {
+    return <button className="secondary" onClick={() => setOpen(true)} disabled={!network.trained && network.kind === 'next_token'}>
+      Export
+    </button>
+  }
+
+  return (
+    <div className="flex" style={{ gap: 4 }}>
+      {formats.map(f => (
+        <button
+          key={f.id}
+          className="secondary"
+          disabled={!f.enabled || busy !== null}
+          title={f.reason}
+          onClick={() => doExport(f.id)}
+        >
+          {busy === f.id ? 'Exporting…' : f.label}
+        </button>
+      ))}
+      <button className="secondary" onClick={() => setOpen(false)}>Cancel</button>
     </div>
   )
 }

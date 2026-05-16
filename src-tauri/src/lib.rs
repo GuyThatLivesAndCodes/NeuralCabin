@@ -1,7 +1,10 @@
 mod models;
 mod persistence;
+mod export;
+mod server;
 
 use models::*;
+use server::{ServerConfig, ServerPermissions, ServerRuntime};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +37,7 @@ pub struct AppState {
     pub(crate) trainers:         Arc<RwLock<HashMap<String, TrainerHandle>>>,
     pub(crate) inferrers:        Arc<RwLock<HashMap<String, InferenceHandle>>>,
     pub(crate) training_history: Arc<RwLock<HashMap<String, Vec<TrainingRun>>>>,
+    pub(crate) servers:          Arc<RwLock<HashMap<String, ServerRuntime>>>,
     /// Where to write `state.json`. None disables persistence — used by unit
     /// tests that don't go through the Tauri setup hook.
     pub(crate) data_dir:         Arc<RwLock<Option<PathBuf>>>,
@@ -46,12 +50,12 @@ pub(crate) struct VocabEntry {
 }
 
 #[derive(Clone)]
-struct TrainerHandle {
-    state:  Arc<RwLock<TrainingState>>,
-    cancel: Arc<AtomicBool>,
+pub(crate) struct TrainerHandle {
+    pub(crate) state:  Arc<RwLock<TrainingState>>,
+    pub(crate) cancel: Arc<AtomicBool>,
     /// Set together with `cancel` by `abort_training` — tells the training
     /// loop to restore the pre-training model snapshot on the way out.
-    rollback: Arc<AtomicBool>,
+    pub(crate) rollback: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -69,6 +73,7 @@ impl AppState {
             trainers:         Arc::new(RwLock::new(HashMap::new())),
             inferrers:        Arc::new(RwLock::new(HashMap::new())),
             training_history: Arc::new(RwLock::new(HashMap::new())),
+            servers:          Arc::new(RwLock::new(HashMap::new())),
             data_dir:         Arc::new(RwLock::new(None)),
         }
     }
@@ -282,9 +287,19 @@ fn build_layer_specs(layers: &[LayerDef], input_dim: usize) -> Result<(Vec<Layer
 
 #[tauri::command]
 async fn create_network(
-    state: State<'_, AppState>,
+    app: AppHandle,
     req: CreateNetworkRequest,
 ) -> Result<Network, String> {
+    create_network_internal(&app, req).await
+}
+
+/// Create a network using whatever AppState is held by the given Tauri handle.
+/// Shared between the Tauri command and the HTTP server.
+pub(crate) async fn create_network_internal(
+    app: &AppHandle,
+    req: CreateNetworkRequest,
+) -> Result<Network, String> {
+    let state = app.state::<AppState>();
     if !kinds::all().contains(&req.kind.as_str()) {
         return Err(format!(
             "unknown network kind '{}' (expected one of: {:?})", req.kind, kinds::all()
@@ -348,19 +363,143 @@ async fn get_network(state: State<'_, AppState>, id: String) -> Result<Network, 
 }
 
 #[tauri::command]
-async fn delete_network(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    state.models.write().await.remove(&id);
-    state.vocabs.write().await.remove(&id);
-    state.corpora.write().await.remove(&id);
-    state.training_history.write().await.remove(&id);
+async fn delete_network(app: AppHandle, id: String) -> Result<bool, String> {
+    delete_network_internal(&app, &id).await
+}
+
+pub(crate) async fn delete_network_internal(app: &AppHandle, id: &str) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    state.models.write().await.remove(id);
+    state.vocabs.write().await.remove(id);
+    state.corpora.write().await.remove(id);
+    state.training_history.write().await.remove(id);
     if let Some(dir) = persistence::data_dir(&state).await {
-        if let Err(e) = persistence::delete_model(&id, &dir).await {
+        if let Err(e) = persistence::delete_model(id, &dir).await {
             eprintln!("[neuralcabin] {e}");
         }
     }
-    let removed = state.networks.write().await.remove(&id).is_some();
+    let removed = state.networks.write().await.remove(id).is_some();
     persist(&state).await?;
     Ok(removed)
+}
+
+/// Shared wrapper for the server module: fetch (loading from disk if needed)
+/// an Arc<RwLock<Model>> for the given network.
+pub(crate) async fn get_or_load_model_arc(
+    app: &AppHandle,
+    net: &Network,
+) -> Result<Arc<RwLock<Model>>, String> {
+    let state = app.state::<AppState>();
+    get_or_load_model(&state, net).await
+}
+
+/// Install a model snapshot for a given network. Used by the HTTP upload
+/// endpoint to overwrite the existing weights with a remote-supplied set.
+pub(crate) async fn install_model_for_network(
+    app: &AppHandle,
+    net: &Network,
+    model: Model,
+) {
+    let state = app.state::<AppState>();
+    state.models.write().await.insert(net.id.clone(), Arc::new(RwLock::new(model)));
+    if let Some(n) = state.networks.write().await.get_mut(&net.id) {
+        n.trained = true;
+    }
+    persistence::save_best_effort(&state).await;
+}
+
+/// Synchronous inference helper for the HTTP server. For feed-forward networks
+/// this runs the model and returns the output vector inline. For next-token
+/// networks it runs generation to completion and returns the produced text.
+pub(crate) async fn infer_sync(
+    app: &AppHandle,
+    req: InferRequest,
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let net = state.networks.read().await.get(&req.network_id).cloned()
+        .ok_or_else(|| "Network not found".to_string())?;
+    let model_arc = get_or_load_model(&state, &net).await?;
+
+    if net.kind == kinds::FEEDFORWARD {
+        let model = model_arc.read().await;
+        let features = req.features
+            .ok_or_else(|| "features array required for feedforward inference".to_string())?;
+        if features.len() != net.input_dim {
+            return Err(format!(
+                "features length {} doesn't match input_dim {}",
+                features.len(), net.input_dim
+            ));
+        }
+        let x = Tensor::new(vec![1, net.input_dim], features);
+        let y = model.predict(&x);
+        Ok(serde_json::json!({ "output": y.data }))
+    } else if net.kind == kinds::NEXT_TOKEN {
+        let context_size = net.context_size
+            .ok_or_else(|| "Next-token network missing context_size".to_string())?;
+        let entry = state.vocabs.read().await.get(&req.network_id).cloned()
+            .ok_or_else(|| "Vocabulary missing".to_string())?;
+        let vocab = entry.vocab.read().await.clone();
+        let model = model_arc.read().await;
+        let prompt = req.prompt.unwrap_or_default();
+        let max_new = req.max_new_tokens.unwrap_or(64).min(4096).max(1);
+        let temperature = req.temperature.unwrap_or(0.0).max(0.0);
+
+        let mut ids: Vec<u32> = vocab.encode(&prompt);
+        let initial_len = ids.len();
+        let mut generated = String::new();
+        let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new as u64).wrapping_mul(0x9E3779B1));
+
+        for _ in 0..max_new {
+            let ctx = encode_context(&ids, &vocab, context_size);
+            let logits = model.predict(&ctx);
+            let probs = softmax_rows(&logits);
+            let row = &probs.data[..probs.cols()];
+            let chosen = if temperature <= f32::EPSILON {
+                argmax_local(row)
+            } else {
+                sample_with_temperature_local(row, temperature, &mut rng)
+            };
+            if (chosen as u32) == EOS_ID { break; }
+            if (chosen as u32) >= neuralcabin_engine::tokenizer::RESERVED as u32 {
+                generated.push_str(vocab.token_of(chosen as u32));
+            }
+            ids.push(chosen as u32);
+        }
+        Ok(serde_json::json!({
+            "generated": generated,
+            "token_count": ids.len() - initial_len,
+        }))
+    } else {
+        Err(format!("unsupported network kind '{}'", net.kind))
+    }
+}
+
+fn argmax_local(row: &[f32]) -> usize {
+    let mut best = 0; let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() { if v > bv { bv = v; best = i; } }
+    best
+}
+fn sample_with_temperature_local(probs: &[f32], temperature: f32, rng: &mut SplitMix64) -> usize {
+    let mut logits: Vec<f32> = probs.iter().map(|p| p.max(1e-12).ln() / temperature).collect();
+    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f32;
+    for v in logits.iter_mut() { *v = (*v - mx).exp(); sum += *v; }
+    for v in logits.iter_mut() { *v /= sum; }
+    let r = (rng.next_u64() as f64 / u64::MAX as f64) as f32;
+    let mut acc = 0.0_f32;
+    for (i, &p) in logits.iter().enumerate() {
+        acc += p; if r <= acc { return i; }
+    }
+    logits.len() - 1
+}
+
+/// Start a training run without going through the Tauri command wrapper.
+/// Used by the HTTP server's POST /train endpoint.
+pub(crate) async fn start_training_internal(
+    app: &AppHandle,
+    req: StartTrainingRequest,
+) -> Result<StartTrainingResponse, String> {
+    start_training(app.clone(), app.state::<AppState>(), req).await
 }
 
 // ─── Corpus commands ────────────────────────────────────────────────────────
@@ -1444,6 +1583,12 @@ pub fn run() {
                     }
                 }
             });
+            // Auto-start any servers that were configured with `auto_start`.
+            // This runs after the block_on above so app state is fully populated.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                autostart_saved_servers(&app_handle).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1453,9 +1598,233 @@ pub fn run() {
             start_training, stop_training, abort_training, get_training_status,
             get_training_history, clear_training_history,
             infer, stop_inference,
+            export_network,
+            list_servers, create_server, update_server, delete_server,
+            start_server, stop_server, server_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ─── Export commands ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExportPayload {
+    pub format: String,
+    pub filename: String,
+    /// Base64-encoded file contents. The frontend turns this into a Blob and
+    /// triggers a browser download — no plugin permissions required.
+    pub data_b64: String,
+    pub size_bytes: usize,
+}
+
+#[tauri::command]
+async fn export_network(
+    state: State<'_, AppState>,
+    network_id: String,
+    format: String,
+) -> Result<ExportPayload, String> {
+    use base64::Engine as _;
+    let net = state.networks.read().await.get(&network_id).cloned()
+        .ok_or_else(|| "Network not found".to_string())?;
+    if net.kind != kinds::NEXT_TOKEN && format == "gguf" {
+        return Err("GGUF export is only meaningful for next-token networks".into());
+    }
+    if !export::FORMATS.contains(&format.as_str()) {
+        return Err(format!("unknown format '{format}' (expected pytorch|onnx|gguf)"));
+    }
+    let model_arc = get_or_load_model(&state, &net).await?;
+    let model = model_arc.read().await.clone();
+    let bytes = export::export_model(&format, &net, &model)?;
+    let ext = export::extension_for(&format);
+    let safe_name: String = net.name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Ok(ExportPayload {
+        format,
+        filename: format!("{safe_name}.{ext}"),
+        size_bytes: bytes.len(),
+        data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
+}
+
+// ─── Server commands ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServerSummary {
+    #[serde(flatten)]
+    pub config: ServerConfig,
+    pub running: bool,
+    pub request_count: u64,
+    pub last_error: Option<String>,
+}
+
+async fn summarize(rt: &ServerRuntime) -> ServerSummary {
+    let s = rt.status().await;
+    ServerSummary {
+        config: rt.config.clone(),
+        running: s.running,
+        request_count: s.request_count,
+        last_error: s.last_error,
+    }
+}
+
+#[tauri::command]
+async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerSummary>, String> {
+    let servers = state.servers.read().await;
+    let mut out = Vec::with_capacity(servers.len());
+    for rt in servers.values() { out.push(summarize(rt).await); }
+    out.sort_by(|a, b| a.config.created_at.cmp(&b.config.created_at));
+    Ok(out)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CreateServerRequest {
+    pub name: String,
+    pub port: u16,
+    #[serde(default)] pub localhost_only: Option<bool>,
+    #[serde(default)] pub auth_token: Option<String>,
+    #[serde(default)] pub permissions: Option<ServerPermissions>,
+}
+
+#[tauri::command]
+async fn create_server(
+    state: State<'_, AppState>,
+    req: CreateServerRequest,
+) -> Result<ServerSummary, String> {
+    if req.name.trim().is_empty() { return Err("server name cannot be empty".into()); }
+    if req.port == 0 { return Err("port must be > 0".into()); }
+
+    let mut cfg = server::new_config(req.name.trim().into(), req.port);
+    if let Some(v) = req.localhost_only { cfg.localhost_only = v; }
+    if let Some(v) = req.auth_token { cfg.auth_token = v; }
+    if let Some(v) = req.permissions { cfg.permissions = v; }
+
+    // Port collision check (a server can reuse the port only if not running).
+    {
+        let servers = state.servers.read().await;
+        for rt in servers.values() {
+            if rt.config.port == cfg.port && rt.running.load(Ordering::Relaxed) {
+                return Err(format!("port {} is in use by '{}'", cfg.port, rt.config.name));
+            }
+        }
+    }
+
+    let rt = ServerRuntime::new(cfg.clone());
+    let summary = summarize(&rt).await;
+    state.servers.write().await.insert(cfg.id.clone(), rt);
+    persist(&state).await?;
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UpdateServerRequest {
+    pub id: String,
+    #[serde(default)] pub name: Option<String>,
+    #[serde(default)] pub port: Option<u16>,
+    #[serde(default)] pub localhost_only: Option<bool>,
+    #[serde(default)] pub auth_token: Option<String>,
+    #[serde(default)] pub permissions: Option<ServerPermissions>,
+    #[serde(default)] pub auto_start: Option<bool>,
+}
+
+#[tauri::command]
+async fn update_server(
+    state: State<'_, AppState>,
+    req: UpdateServerRequest,
+) -> Result<ServerSummary, String> {
+    let mut servers = state.servers.write().await;
+    let rt = servers.get_mut(&req.id).ok_or_else(|| "server not found".to_string())?;
+    if rt.running.load(Ordering::Relaxed) {
+        return Err("stop the server before editing it".into());
+    }
+    if let Some(n) = req.name { if !n.trim().is_empty() { rt.config.name = n.trim().into(); } }
+    if let Some(p) = req.port { if p > 0 { rt.config.port = p; } }
+    if let Some(v) = req.localhost_only { rt.config.localhost_only = v; }
+    if let Some(t) = req.auth_token { rt.config.auth_token = t; }
+    if let Some(p) = req.permissions { rt.config.permissions = p; }
+    if let Some(v) = req.auto_start { rt.config.auto_start = v; }
+    let summary = summarize(rt).await;
+    drop(servers);
+    persist(&state).await?;
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn delete_server(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    let mut servers = state.servers.write().await;
+    if let Some(mut rt) = servers.remove(&id) {
+        let _ = server::stop(&mut rt).await;
+        drop(servers);
+        persist(&state).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+async fn start_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ServerSummary, String> {
+    let mut servers = state.servers.write().await;
+    let rt = servers.get_mut(&id).ok_or_else(|| "server not found".to_string())?;
+    server::start(app.clone(), rt).await?;
+    let summary = summarize(rt).await;
+    drop(servers);
+    // Auto-start should be on for any server the user explicitly starts; this
+    // is what makes the server come back on app restart.
+    {
+        let mut servers = state.servers.write().await;
+        if let Some(rt) = servers.get_mut(&id) { rt.config.auto_start = true; }
+    }
+    persist(&state).await?;
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn stop_server(state: State<'_, AppState>, id: String) -> Result<ServerSummary, String> {
+    let mut servers = state.servers.write().await;
+    let rt = servers.get_mut(&id).ok_or_else(|| "server not found".to_string())?;
+    server::stop(rt).await?;
+    rt.config.auto_start = false;
+    let summary = summarize(rt).await;
+    drop(servers);
+    persist(&state).await?;
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn server_status(state: State<'_, AppState>, id: String) -> Result<ServerSummary, String> {
+    let servers = state.servers.read().await;
+    let rt = servers.get(&id).ok_or_else(|| "server not found".to_string())?;
+    Ok(summarize(rt).await)
+}
+
+/// Auto-start servers persisted from a previous session. Only servers that
+/// had `auto_start = true` (i.e., were running when state.json was last
+/// written) are restarted.
+async fn autostart_saved_servers(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let ids: Vec<String> = {
+        let servers = state.servers.read().await;
+        servers.values()
+            .filter(|rt| rt.config.auto_start && rt.config.port != 0)
+            .map(|rt| rt.config.id.clone())
+            .collect()
+    };
+    for id in ids {
+        let mut servers = state.servers.write().await;
+        if let Some(rt) = servers.get_mut(&id) {
+            if let Err(e) = server::start(app.clone(), rt).await {
+                eprintln!("[neuralcabin] autostart server {}: {e}", rt.config.name);
+            } else {
+                eprintln!("[neuralcabin] autostarted server '{}' on port {}", rt.config.name, rt.config.port);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

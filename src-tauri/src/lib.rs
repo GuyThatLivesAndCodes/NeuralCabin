@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use neuralcabin_engine::nn::{Layer, LayerSpec, Model};
 use neuralcabin_engine::optimizer::{Optimizer, OptimizerKind};
 use neuralcabin_engine::tensor::{SplitMix64, Tensor};
@@ -27,15 +27,16 @@ use neuralcabin_engine::{Activation, Loss};
 // ─── State ──────────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    pub(crate) networks:  Arc<RwLock<HashMap<String, Network>>>,
-    pub(crate) models:    Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
-    pub(crate) vocabs:    Arc<RwLock<HashMap<String, VocabEntry>>>,
-    pub(crate) corpora:   Arc<RwLock<HashMap<String, Corpus>>>,
-    pub(crate) trainers:  Arc<RwLock<HashMap<String, TrainerHandle>>>,
-    pub(crate) inferrers: Arc<RwLock<HashMap<String, InferenceHandle>>>,
+    pub(crate) networks:         Arc<RwLock<HashMap<String, Network>>>,
+    pub(crate) models:           Arc<RwLock<HashMap<String, Arc<RwLock<Model>>>>>,
+    pub(crate) vocabs:           Arc<RwLock<HashMap<String, VocabEntry>>>,
+    pub(crate) corpora:          Arc<RwLock<HashMap<String, Corpus>>>,
+    pub(crate) trainers:         Arc<RwLock<HashMap<String, TrainerHandle>>>,
+    pub(crate) inferrers:        Arc<RwLock<HashMap<String, InferenceHandle>>>,
+    pub(crate) training_history: Arc<RwLock<HashMap<String, Vec<TrainingRun>>>>,
     /// Where to write `state.json`. None disables persistence — used by unit
     /// tests that don't go through the Tauri setup hook.
-    pub(crate) data_dir:  Arc<RwLock<Option<PathBuf>>>,
+    pub(crate) data_dir:         Arc<RwLock<Option<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -61,13 +62,14 @@ struct InferenceHandle {
 impl AppState {
     pub(crate) fn new() -> Self {
         Self {
-            networks:  Arc::new(RwLock::new(HashMap::new())),
-            models:    Arc::new(RwLock::new(HashMap::new())),
-            vocabs:    Arc::new(RwLock::new(HashMap::new())),
-            corpora:   Arc::new(RwLock::new(HashMap::new())),
-            trainers:  Arc::new(RwLock::new(HashMap::new())),
-            inferrers: Arc::new(RwLock::new(HashMap::new())),
-            data_dir:  Arc::new(RwLock::new(None)),
+            networks:         Arc::new(RwLock::new(HashMap::new())),
+            models:           Arc::new(RwLock::new(HashMap::new())),
+            vocabs:           Arc::new(RwLock::new(HashMap::new())),
+            corpora:          Arc::new(RwLock::new(HashMap::new())),
+            trainers:         Arc::new(RwLock::new(HashMap::new())),
+            inferrers:        Arc::new(RwLock::new(HashMap::new())),
+            training_history: Arc::new(RwLock::new(HashMap::new())),
+            data_dir:         Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -88,6 +90,101 @@ async fn persist(state: &AppState) -> Result<(), String> {
                   elapsed.as_millis());
     }
     result
+}
+
+// ─── Training history helpers ────────────────────────────────────────────────
+
+/// Downsample a loss history to at most `max_points` evenly-spaced values so
+/// state.json stays compact even for very long runs.
+fn downsample_history(history: &[f32], max_points: usize) -> Vec<f32> {
+    if history.len() <= max_points || max_points < 2 {
+        return history.to_vec();
+    }
+    (0..max_points).map(|i| {
+        let idx = i * (history.len() - 1) / (max_points - 1);
+        history[idx]
+    }).collect()
+}
+
+fn build_training_run_record(
+    id: &str,
+    network_id: &str,
+    cfg: &TrainingConfig,
+    started_at: DateTime<Utc>,
+    epochs_run: usize,
+    final_loss: f32,
+    elapsed_secs: f32,
+    loss_history: &[f32],
+    status: &str,
+) -> TrainingRun {
+    TrainingRun {
+        id: id.to_string(),
+        network_id: network_id.to_string(),
+        started_at,
+        finished_at: Utc::now(),
+        status: status.to_string(),
+        config_summary: TrainingConfigSummary {
+            optimizer: cfg.optimizer.kind.clone(),
+            lr: cfg.optimizer.lr,
+            batch_size: cfg.batch_size,
+            epochs: cfg.epochs,
+        },
+        total_epochs: cfg.epochs,
+        epochs_run,
+        final_loss,
+        elapsed_secs,
+        loss_history: downsample_history(loss_history, 500),
+    }
+}
+
+/// Append a completed run record and flush state to disk. Runs on the
+/// background training task, so we reach AppState through the AppHandle.
+async fn record_and_persist_run(app: &AppHandle, run: TrainingRun) {
+    if let Some(app_state) = app.try_state::<AppState>() {
+        let state = app_state.inner();
+        state.training_history.write().await
+            .entry(run.network_id.clone())
+            .or_default()
+            .push(run);
+        persistence::save_best_effort(state).await;
+    }
+}
+
+// ─── Lazy model loader ───────────────────────────────────────────────────────
+
+/// Produce the appropriate "model not ready" error for a network kind.
+fn model_missing_err(net: &Network) -> String {
+    if net.kind == kinds::NEXT_TOKEN {
+        "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
+    } else {
+        "Model state missing — try recreating the network.".to_string()
+    }
+}
+
+/// Return the in-memory model for `network_id`, loading it from its weight
+/// file on demand if it isn't already cached. Inserts the loaded model into
+/// `AppState.models` for subsequent calls.
+async fn get_or_load_model(
+    state: &AppState,
+    net: &Network,
+) -> Result<Arc<RwLock<Model>>, String> {
+    // Fast path: already in memory (e.g. just trained, or previously loaded).
+    if let Some(m) = state.models.read().await.get(&net.id).cloned() {
+        return Ok(m);
+    }
+    // Slow path: load from the per-network weight file.
+    let Some(data_dir) = persistence::data_dir(state).await else {
+        return Err(model_missing_err(net));
+    };
+    match persistence::load_model(&net.id, &data_dir).await {
+        Ok(Some(model)) => {
+            let arc = Arc::new(RwLock::new(model));
+            state.models.write().await.insert(net.id.clone(), arc.clone());
+            Ok(arc)
+        }
+        Ok(None) => Err(model_missing_err(net)),
+        Err(e)   => Err(format!("failed to load model: {e}")),
+    }
 }
 
 // ─── Parsing helpers ────────────────────────────────────────────────────────
@@ -255,6 +352,12 @@ async fn delete_network(state: State<'_, AppState>, id: String) -> Result<bool, 
     state.models.write().await.remove(&id);
     state.vocabs.write().await.remove(&id);
     state.corpora.write().await.remove(&id);
+    state.training_history.write().await.remove(&id);
+    if let Some(dir) = persistence::data_dir(&state).await {
+        if let Err(e) = persistence::delete_model(&id, &dir).await {
+            eprintln!("[neuralcabin] {e}");
+        }
+    }
     let removed = state.networks.write().await.remove(&id).is_some();
     persist(&state).await?;
     Ok(removed)
@@ -572,7 +675,29 @@ async fn rebuild_next_token_model(
     // weights. Re-building unconditionally on every set_corpus call wipes out
     // trained weights — the user's report ("training disappears after I save
     // the corpus / reopen the app") was exactly this bug.
-    if let Some(existing) = state.models.read().await.get(&net.id).cloned() {
+    //
+    // Models are lazy-loaded, so we check memory first then fall back to the
+    // weight file on disk. This preserves trained weights across restarts even
+    // though we no longer load models eagerly on startup.
+    let existing_arc = state.models.read().await.get(&net.id).cloned()
+        .or(None); // just for clarity; check disk below if None
+
+    let existing_arc = if let Some(a) = existing_arc {
+        Some(a)
+    } else if let Some(dir) = persistence::data_dir(state).await {
+        match persistence::load_model(&net.id, &dir).await {
+            Ok(Some(m)) => {
+                let a = Arc::new(RwLock::new(m));
+                state.models.write().await.insert(net.id.clone(), a.clone());
+                Some(a)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(existing) = existing_arc {
         let m = existing.read().await;
         if m.input_dim == input_dim && layers_match_specs(&m.layers, &specs) {
             return Ok(());
@@ -670,12 +795,7 @@ async fn start_training(
         .ok_or_else(|| "Network not found".to_string())?;
     let corpus = state.corpora.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "No corpus attached. Add training data on the Corpus tab first.".to_string())?;
-    let model_arc = state.models.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| if net.kind == kinds::NEXT_TOKEN {
-            "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
-        } else {
-            "Model state missing".to_string()
-        })?;
+    let model_arc = get_or_load_model(&state, &net).await?;
 
     let (x, y, loss_kind, total_examples) = if net.kind == kinds::FEEDFORWARD {
         let ff = corpus.feedforward.as_ref()
@@ -742,6 +862,7 @@ async fn start_training(
     let batch_size = req.config.batch_size.max(1);
 
     let training_id = Uuid::new_v4().to_string();
+    let started_at = Utc::now();
     let cancel = Arc::new(AtomicBool::new(false));
     let rollback = Arc::new(AtomicBool::new(false));
     let training_state = Arc::new(RwLock::new(TrainingState {
@@ -762,7 +883,7 @@ async fn start_training(
 
     tokio::spawn(async move {
         run_training_loop(
-            app, id_clone, net_id, cfg, model_arc, networks_handle,
+            app, id_clone, net_id, cfg, started_at, model_arc, networks_handle,
             x, y, loss_kind, batch_size, training_state, cancel, rollback,
         ).await;
         // The TrainerHandle stays in `state.trainers` so callers can still
@@ -830,6 +951,7 @@ async fn run_training_loop(
     training_id: String,
     network_id: String,
     cfg: TrainingConfig,
+    started_at: DateTime<Utc>,
     model_arc: Arc<RwLock<Model>>,
     networks_handle: Arc<RwLock<HashMap<String, Network>>>,
     x: Tensor,
@@ -880,12 +1002,15 @@ async fn run_training_loop(
     let mut step_counter: u64 = 0;
 
     /// Run the cleanup path for a cancelled training run. Honours `rollback`
-    /// to decide whether to keep or revert the in-progress weights, persists
-    /// the result, and emits the `training_finished` event.
+    /// to decide whether to keep or revert the in-progress weights, records
+    /// the run in history, persists state, and emits `training_finished`.
     async fn finish_cancelled(
         app: &AppHandle,
         training_id: &str,
-        cfg_epochs: usize,
+        network_id: &str,
+        cfg: &TrainingConfig,
+        started_at: DateTime<Utc>,
+        epochs_run: usize,
         loss_history: &[f32],
         start: std::time::Instant,
         training_state: &Arc<RwLock<TrainingState>>,
@@ -901,20 +1026,22 @@ async fn run_training_loop(
         }
         let elapsed = start.elapsed().as_secs_f32();
         let final_loss = loss_history.last().copied().unwrap_or(0.0);
+        let status = if rollback.load(Ordering::Relaxed) { "aborted" } else { "cancelled" };
         {
             let mut s = training_state.write().await;
             s.running = false; s.stopped = true; s.cancelled = true;
             s.elapsed_secs = elapsed;
         }
-        if let Some(app_state) = app.try_state::<AppState>() {
-            persistence::save_best_effort(app_state.inner()).await;
-        }
+        let run = build_training_run_record(
+            training_id, network_id, cfg, started_at,
+            epochs_run, final_loss, elapsed, loss_history, status,
+        );
+        record_and_persist_run(app, run).await;
         let _ = app.emit("training_finished", TrainingFinished {
             training_id: training_id.to_string(),
-            status: if rollback.load(Ordering::Relaxed) { "aborted".into() }
-                    else { "cancelled".into() },
+            status: status.into(),
             final_loss,
-            total_epochs: cfg_epochs,
+            total_epochs: cfg.epochs,
             elapsed_secs: elapsed,
         });
     }
@@ -922,7 +1049,8 @@ async fn run_training_loop(
     for epoch in 1..=cfg.epochs {
         if cancel.load(Ordering::Relaxed) {
             finish_cancelled(
-                &app, &training_id, cfg.epochs, &loss_history, start,
+                &app, &training_id, &network_id, &cfg, started_at,
+                epoch.saturating_sub(1), &loss_history, start,
                 &training_state, &model_arc, &rollback, &initial_snapshot,
             ).await;
             return;
@@ -957,6 +1085,13 @@ async fn run_training_loop(
                 )
             };
             if !loss.is_finite() {
+                let elapsed = start.elapsed().as_secs_f32();
+                let run = build_training_run_record(
+                    &training_id, &network_id, &cfg, started_at,
+                    epoch, loss_history.last().copied().unwrap_or(0.0),
+                    elapsed, &loss_history, "error",
+                );
+                record_and_persist_run(&app, run).await;
                 mark_error(&training_state, &training_id, &app,
                     format!("Loss diverged to {loss} at epoch {epoch}")).await;
                 return;
@@ -989,6 +1124,7 @@ async fn run_training_loop(
 
     let elapsed = start.elapsed().as_secs_f32();
     let final_loss = loss_history.last().copied().unwrap_or(0.0);
+    let epochs_completed = loss_history.len();
     {
         let mut s = training_state.write().await;
         s.running = false; s.stopped = true;
@@ -997,12 +1133,13 @@ async fn run_training_loop(
     if let Some(net) = networks_handle.write().await.get_mut(&network_id) {
         net.trained = true;
     }
-    // Persist the freshly-trained weights and the `trained = true` flag. We
-    // pull AppState off the AppHandle since the training loop runs on a
-    // detached task and doesn't carry the State<'_, AppState> guard.
-    if let Some(app_state) = app.try_state::<AppState>() {
-        persistence::save_best_effort(app_state.inner()).await;
-    }
+    // Record the run in history and persist everything (trained weights,
+    // `trained = true` flag, and the new history entry) in one shot.
+    let run = build_training_run_record(
+        &training_id, &network_id, &cfg, started_at,
+        epochs_completed, final_loss, elapsed, &loss_history, "completed",
+    );
+    record_and_persist_run(&app, run).await;
     let _ = app.emit("training_finished", TrainingFinished {
         training_id,
         status: "completed".into(),
@@ -1010,6 +1147,28 @@ async fn run_training_loop(
         total_epochs: cfg.epochs,
         elapsed_secs: elapsed,
     });
+}
+
+#[tauri::command]
+async fn get_training_history(
+    state: State<'_, AppState>,
+    network_id: String,
+) -> Result<Vec<TrainingRun>, String> {
+    let history = state.training_history.read().await;
+    let mut runs = history.get(&network_id).cloned().unwrap_or_default();
+    // Return newest first.
+    runs.reverse();
+    Ok(runs)
+}
+
+#[tauri::command]
+async fn clear_training_history(
+    state: State<'_, AppState>,
+    network_id: String,
+) -> Result<(), String> {
+    state.training_history.write().await.remove(&network_id);
+    persist(&state).await?;
+    Ok(())
 }
 
 async fn mark_error(
@@ -1039,12 +1198,7 @@ async fn infer(
 ) -> Result<InferResponse, String> {
     let net = state.networks.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Network not found".to_string())?;
-    let model_arc = state.models.read().await.get(&req.network_id).cloned()
-        .ok_or_else(|| if net.kind == kinds::NEXT_TOKEN {
-            "Model not materialized. Build a vocabulary on the Vocabulary tab first.".to_string()
-        } else {
-            "Model state missing".to_string()
-        })?;
+    let model_arc = get_or_load_model(&state, &net).await?;
 
     if net.kind == kinds::FEEDFORWARD {
         let model = model_arc.read().await;
@@ -1265,6 +1419,19 @@ pub fn run() {
                 match persistence::load_from_dir(&data_dir).await {
                     Ok(Some(persisted)) => {
                         persistence::apply(app_state, persisted).await;
+                        // Cross-check 'trained' flags: if a network is marked
+                        // trained but its weight file is missing, reset the flag
+                        // so the UI reflects reality (models are no longer
+                        // embedded in state.json — they live in models/<id>.json).
+                        persistence::reset_missing_model_flags(app_state, &data_dir).await;
+                        // Re-save immediately in the current compact format.
+                        // This is a one-time migration: if the user had a large
+                        // legacy state.json with inline model weights, this
+                        // replaces it with a small metadata-only file so that
+                        // the next launch loads in milliseconds.
+                        if let Err(e) = persistence::save_to_dir(app_state, &data_dir).await {
+                            eprintln!("[neuralcabin] post-load migration save failed: {e}");
+                        }
                         eprintln!("[neuralcabin] loaded state from {}", data_dir.display());
                     }
                     Ok(None) => {
@@ -1284,6 +1451,7 @@ pub fn run() {
             set_corpus, get_corpus, corpus_stats,
             build_vocabulary, set_advanced_vocabulary, get_vocabulary, tokenize_preview,
             start_training, stop_training, abort_training, get_training_status,
+            get_training_history, clear_training_history,
             infer, stop_inference,
         ])
         .run(tauri::generate_context!())

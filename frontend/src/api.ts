@@ -181,6 +181,29 @@ export interface TrainingFinished {
 
 export interface TrainingError { training_id: string; message: string }
 
+// ─── Training history ────────────────────────────────────────────────────────
+
+export interface TrainingConfigSummary {
+  optimizer: string
+  lr: number
+  batch_size: number
+  epochs: number
+}
+
+export interface TrainingRun {
+  id: string
+  network_id: string
+  started_at: string
+  finished_at: string
+  status: 'completed' | 'cancelled' | 'aborted' | 'error'
+  config_summary: TrainingConfigSummary
+  total_epochs: number
+  epochs_run: number
+  final_loss: number
+  elapsed_secs: number
+  loss_history: number[]
+}
+
 export const training = {
   start:  (req: TrainingRequest) =>
     invoke<{ training_id: string; status: string }>('start_training', { req }),
@@ -192,6 +215,11 @@ export const training = {
     invoke<boolean>('abort_training', { trainingId }),
   status: (trainingId: string) =>
     invoke<TrainingStatus>('get_training_status', { trainingId }),
+
+  history:      (networkId: string) =>
+    invoke<TrainingRun[]>('get_training_history', { networkId }),
+  clearHistory: (networkId: string) =>
+    invoke<void>('clear_training_history', { networkId }),
 
   onUpdate: (handler: (u: TrainingUpdate) => void): Promise<UnlistenFn> =>
     listen<TrainingUpdate>('training_update', (e) => handler(e.payload)),

@@ -366,6 +366,7 @@ mod tests {
             hidden_layers: None,
             context_size: None,
             transformer: None,
+            pretrained: false,
         }
     }
 

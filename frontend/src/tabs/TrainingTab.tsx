@@ -27,6 +27,7 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
   const [lr, setLr] = useState(0.01)
   const [momentum, setMomentum] = useState(0.9)
   const [maskUserTokens, setMaskUserTokens] = useState(true)
+  const [frozenLayers, setFrozenLayers] = useState<Set<string>>(new Set())
 
   const [trainingId, setTrainingId] = useState<string | null>(null)
   const [run, setRun] = useState<RunState>(EMPTY_RUN)
@@ -40,7 +41,16 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
   }, [network])
 
   const isNextToken = network?.kind === 'next_token'
+  const isTransformer = network?.kind === 'transformer'
+  const isFinetune = stats?.stage === 'finetune'
+  const finetuneBlocked = isFinetune && network && !network.pretrained
   const lossLabel = isNextToken ? 'crossentropy (forced for next-token)' : 'mse'
+  const toggleFrozen = (key: string) =>
+    setFrozenLayers(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
 
   // Subscribe to training events whenever a job is active
   useEffect(() => {
@@ -100,6 +110,7 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
           loss: isNextToken ? 'crossentropy' : 'mse',
           seed,
           mask_user_tokens: isNextToken ? maskUserTokens : undefined,
+          frozen_layers: frozenLayers.size > 0 ? Array.from(frozenLayers) : undefined,
         },
       })
       setTrainingId(r.training_id)
@@ -194,9 +205,36 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
               </div>
             )}
           </div>
+          {isTransformer && isFinetune && network?.pretrained && (
+            <div style={{ marginTop: 16, padding: 12, border: '1px solid var(--border-soft)',
+                          borderRadius: 'var(--radius)', background: 'var(--bg-input)' }}>
+              <h4 style={{ margin: 0 }}>Layer locking</h4>
+              <p className="muted small" style={{ marginTop: 6 }}>
+                Freeze parts of the pre-trained network so fine-tuning can't drift them. GPT-style fine-tuning typically freezes the token embedding and early blocks, leaving only the later blocks and LM head trainable.
+              </p>
+              <div className="flex" style={{ flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                <FreezeChip label="Token embedding" k="embedding" frozen={frozenLayers} onToggle={toggleFrozen} />
+                {Array.from({ length: network.transformer?.n_layers ?? 0 }, (_, i) => (
+                  <FreezeChip key={i} label={`Block ${i}`} k={`block:${i}`} frozen={frozenLayers} onToggle={toggleFrozen} />
+                ))}
+                <FreezeChip label="Final norm" k="output_norm" frozen={frozenLayers} onToggle={toggleFrozen} />
+                <FreezeChip label="LM head" k="output" frozen={frozenLayers} onToggle={toggleFrozen} />
+              </div>
+              <p className="muted small" style={{ marginTop: 8 }}>
+                {frozenLayers.size === 0
+                  ? 'All parameters will be updated.'
+                  : `${frozenLayers.size} component${frozenLayers.size === 1 ? '' : 's'} frozen.`}
+              </p>
+            </div>
+          )}
+          {finetuneBlocked && (
+            <div className="status error mt-2">
+              Fine-tuning is locked — complete a pre-training run on this network first.
+            </div>
+          )}
           <div className="flex mt-2">
-            <button onClick={start} disabled={!network || !corpusReady}>
-              Start training
+            <button onClick={start} disabled={!network || !corpusReady || !!finetuneBlocked}>
+              {isFinetune ? 'Start fine-tuning' : 'Start training'}
             </button>
           </div>
         </div>
@@ -279,6 +317,23 @@ function RunView({ run, trainingId, onReset, onError }: {
         <button onClick={onReset}>Start a new run</button>
       )}
     </>
+  )
+}
+
+function FreezeChip({ label, k, frozen, onToggle }: {
+  label: string; k: string; frozen: Set<string>; onToggle: (k: string) => void
+}) {
+  const isFrozen = frozen.has(k)
+  return (
+    <button
+      type="button"
+      className={isFrozen ? '' : 'secondary'}
+      onClick={() => onToggle(k)}
+      style={{ fontSize: 11, padding: '4px 10px', textTransform: 'none', letterSpacing: 0 }}
+      title={isFrozen ? `${label} is frozen (weights won't update)` : `${label} is trainable`}
+    >
+      {isFrozen ? '🔒 ' : ''}{label}
+    </button>
   )
 }
 

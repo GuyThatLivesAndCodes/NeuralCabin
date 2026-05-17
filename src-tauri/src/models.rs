@@ -36,6 +36,14 @@ pub struct Network {
     pub seed: u64,
     pub created_at: DateTime<Utc>,
     pub trained: bool,
+    /// True once at least one pre-training run has completed successfully.
+    /// Fine-tuning is gated on this — you cannot fine-tune a model whose
+    /// base weights and vocabulary haven't been established by pre-training.
+    /// This mirrors how GPT-style models are trained: pre-train on bulk text
+    /// to learn language structure, then fine-tune on instruction pairs while
+    /// preserving the pre-trained representations.
+    #[serde(default)]
+    pub pretrained: bool,
 
     // For feedforward: fully specified at creation.
     // For next_token: zero until a vocabulary is built (then both dims are derived).
@@ -205,6 +213,12 @@ pub struct TrainingConfig {
     pub loss: String, // "mse" | "crossentropy"
     pub seed: u64,
     #[serde(default)] pub mask_user_tokens: Option<bool>,
+    /// Names of layers/components to freeze (weights not updated). Recognised
+    /// keys for transformer networks: "embedding", "output", "output_norm",
+    /// and "block:N" where N is a 0-based block index. Empty / absent means
+    /// train every parameter, as before. Used to preserve pre-training
+    /// knowledge during fine-tuning, GPT-style.
+    #[serde(default)] pub frozen_layers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

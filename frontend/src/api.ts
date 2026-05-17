@@ -27,6 +27,8 @@ export interface Network {
   seed: number
   created_at: string
   trained: boolean
+  /** Set to true once a pre-training run completes; gates fine-tuning. */
+  pretrained?: boolean
   input_dim: number
   output_dim: number
   layers: Layer[]
@@ -159,6 +161,9 @@ export interface TrainingConfig {
   loss: 'mse' | 'crossentropy'
   seed: number
   mask_user_tokens?: boolean
+  /** Names of transformer components to freeze during training.
+   * Recognized: "embedding", "output", "output_norm", "block:N". */
+  frozen_layers?: string[]
 }
 
 export interface TrainingRequest { network_id: string; config: TrainingConfig }

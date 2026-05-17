@@ -1003,6 +1003,7 @@ mod tests {
             input_dim: 4, output_dim: 2,
             layers: vec![], parameter_count: model.parameter_count(),
             hidden_layers: None, context_size: None, transformer: None,
+            pretrained: false,
         };
         (net, model)
     }

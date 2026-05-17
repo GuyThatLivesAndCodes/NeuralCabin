@@ -355,6 +355,63 @@ async fn rebuild_transformer_model(
     Ok(())
 }
 
+/// Snapshot of a set of frozen transformer parameters, taken before an
+/// optimizer step and re-installed after it. Each entry is `(key, tensor)`
+/// where the key matches the scheme described on `TrainingConfig::frozen_layers`.
+struct FrozenSnapshot {
+    /// Whether to preserve the (vocab, n_embd) token embedding.
+    embedding: Option<Tensor>,
+    /// Final RMSNorm scale.
+    output_norm: Option<Tensor>,
+    /// (n_embd, vocab) LM head.
+    output: Option<Tensor>,
+    /// All 9 weight tensors of each frozen block, indexed by block id.
+    blocks: HashMap<usize, neuralcabin_engine::transformer::BlockWeights>,
+}
+
+fn parse_frozen_keys(keys: &[String]) -> (bool, bool, bool, Vec<usize>) {
+    let mut emb = false; let mut out_norm = false; let mut out = false;
+    let mut blocks: Vec<usize> = Vec::new();
+    for k in keys {
+        let k = k.trim();
+        if k.eq_ignore_ascii_case("embedding") || k.eq_ignore_ascii_case("token_embd") {
+            emb = true;
+        } else if k.eq_ignore_ascii_case("output_norm") {
+            out_norm = true;
+        } else if k.eq_ignore_ascii_case("output") || k.eq_ignore_ascii_case("lm_head") {
+            out = true;
+        } else if let Some(rest) = k.strip_prefix("block:").or_else(|| k.strip_prefix("block_")) {
+            if let Ok(idx) = rest.parse::<usize>() { blocks.push(idx); }
+        }
+    }
+    blocks.sort();
+    blocks.dedup();
+    (emb, out_norm, out, blocks)
+}
+
+fn snapshot_frozen_layers(model: &TransformerModel, keys: &[String]) -> FrozenSnapshot {
+    let (emb, out_norm, out, block_ids) = parse_frozen_keys(keys);
+    let mut blocks = HashMap::new();
+    for &i in &block_ids {
+        if let Some(b) = model.blocks.get(i) { blocks.insert(i, b.clone()); }
+    }
+    FrozenSnapshot {
+        embedding:   if emb { Some(model.token_embd.clone()) } else { None },
+        output_norm: if out_norm { Some(model.output_norm.clone()) } else { None },
+        output:      if out { Some(model.output.clone()) } else { None },
+        blocks,
+    }
+}
+
+fn restore_frozen_layers(model: &mut TransformerModel, snap: &FrozenSnapshot) {
+    if let Some(t) = &snap.embedding   { model.token_embd  = t.clone(); }
+    if let Some(t) = &snap.output_norm { model.output_norm = t.clone(); }
+    if let Some(t) = &snap.output      { model.output      = t.clone(); }
+    for (&i, b) in &snap.blocks {
+        if let Some(dst) = model.blocks.get_mut(i) { *dst = b.clone(); }
+    }
+}
+
 fn build_layer_specs(layers: &[LayerDef], input_dim: usize) -> Result<(Vec<LayerSpec>, usize), String> {
     let mut specs = Vec::with_capacity(layers.len());
     let mut cur = input_dim;
@@ -427,6 +484,7 @@ pub(crate) async fn create_network_internal(
             input_dim, output_dim,
             layers: req.layers, parameter_count,
             hidden_layers: None, context_size: None, transformer: None,
+            pretrained: false,
         }
     } else if req.kind == kinds::TRANSFORMER {
         // Transformer: materialise the model now with a vocab placeholder; it
@@ -460,6 +518,7 @@ pub(crate) async fn create_network_internal(
             hidden_layers: None,
             context_size: Some(hp.n_ctx),
             transformer: Some(hp),
+            pretrained: false,
         }
     } else {
         // Next-token (MLP-on-window): only the hidden chain is meaningful at this point.
@@ -475,6 +534,7 @@ pub(crate) async fn create_network_internal(
             hidden_layers: Some(req.layers),
             context_size: Some(context_size),
             transformer: None,
+            pretrained: false,
         }
     };
 
@@ -662,9 +722,43 @@ async fn set_corpus(
         validate_feedforward(&ff, &net)?;
         corpus.feedforward = Some(ff);
     } else if net.kind == kinds::NEXT_TOKEN || net.kind == kinds::TRANSFORMER {
-        corpus.text  = req.text;
-        corpus.pairs = req.pairs;
-        corpus.stage = req.stage;
+        // Fine-tuning is only meaningful on top of a pre-trained model. If
+        // the user hasn't completed pre-training yet, refuse — otherwise we'd
+        // happily wipe whatever weights/vocab exist and pretend we fine-tuned
+        // a never-trained model, which is what the previous code did.
+        if req.stage.as_deref() == Some("finetune") && !net.pretrained {
+            return Err(
+                "Fine-tuning requires a completed pre-training run first. \
+                 Switch to the Pretraining stage, save a text corpus, and run \
+                 training to completion before fine-tuning.".into()
+            );
+        }
+        // Merge with the previously-saved corpus so editing one stage doesn't
+        // wipe data from the other. The user might cycle pretrain → finetune
+        // → edit pretrain → re-pretrain → finetune again without ever
+        // re-uploading the pairs. Each stage save only overwrites the fields
+        // that belong to *that* stage; the other stage's data is preserved.
+        let existing = state.corpora.read().await.get(&net.id).cloned();
+        let stage = req.stage.clone();
+        match stage.as_deref() {
+            Some("pretrain") => {
+                // Pretrain save updates text (and stage). Keep existing pairs.
+                corpus.text  = req.text.or_else(|| existing.as_ref().and_then(|c| c.text.clone()));
+                corpus.pairs = existing.as_ref().and_then(|c| c.pairs.clone());
+            }
+            Some("finetune") => {
+                // Fine-tune save updates pairs. Keep existing text.
+                corpus.pairs = req.pairs.or_else(|| existing.as_ref().and_then(|c| c.pairs.clone()));
+                corpus.text  = existing.as_ref().and_then(|c| c.text.clone());
+            }
+            _ => {
+                // Stage unspecified: fall back to the previous behaviour but
+                // still preserve whichever field the caller didn't supply.
+                corpus.text  = req.text.or_else(|| existing.as_ref().and_then(|c| c.text.clone()));
+                corpus.pairs = req.pairs.or_else(|| existing.as_ref().and_then(|c| c.pairs.clone()));
+            }
+        }
+        corpus.stage = stage;
     } else {
         return Err(format!("unsupported network kind '{}'", net.kind));
     }
@@ -675,7 +769,14 @@ async fn set_corpus(
     // For text-based networks, auto-build the vocabulary from the new corpus
     // so the user doesn't have to do it manually. Without this, training
     // would immediately fail with "no vocabulary" after saving a corpus.
-    if net.kind == kinds::NEXT_TOKEN || net.kind == kinds::TRANSFORMER {
+    // Fine-tuning must NEVER rebuild the vocabulary or the model — that would
+    // discard the pre-trained weights. The vocab established during pretraining
+    // is the canonical one; finetune data is encoded against it (any
+    // characters/words missing from it become the <unk> token, matching how
+    // GPT-style fine-tuning works on a frozen tokenizer).
+    let already_has_vocab = state.vocabs.read().await.contains_key(&net.id);
+    let preserve_vocab = corpus.stage.as_deref() == Some("finetune") && already_has_vocab;
+    if (net.kind == kinds::NEXT_TOKEN || net.kind == kinds::TRANSFORMER) && !preserve_vocab {
         let mode_name = req.vocab_mode.as_deref().unwrap_or("char");
         if let Ok(mode) = parse_tokenizer_mode(mode_name) {
             if !matches!(mode, TokenizerMode::Advanced) {
@@ -1075,10 +1176,21 @@ async fn start_transformer_training(
     req: StartTrainingRequest,
 ) -> Result<StartTrainingResponse, String> {
     if req.config.epochs == 0 { return Err("epochs must be > 0".into()); }
+    let stage = corpus.stage.as_deref().unwrap_or("pretrain").to_string();
+    if stage == "finetune" && !net.pretrained {
+        return Err(
+            "Fine-tuning requires a completed pre-training run on this network. \
+             Pre-train first, then come back to fine-tune.".into()
+        );
+    }
     let entry = state.vocabs.read().await.get(&req.network_id).cloned()
         .ok_or_else(|| "Vocabulary missing — save a corpus first".to_string())?;
     let vocab_size = entry.vocab.read().await.size();
-    rebuild_transformer_model(state, &net, vocab_size).await?;
+    // Only rebuild when not fine-tuning. For fine-tuning we keep the
+    // pre-trained weights at all costs — vocabulary size is already fixed.
+    if stage != "finetune" {
+        rebuild_transformer_model(state, &net, vocab_size).await?;
+    }
     let model_arc = get_or_load_transformer(state, &net).await?;
 
     // Reload network (parameter count may have updated).
@@ -1122,12 +1234,14 @@ async fn start_transformer_training(
     let cfg = req.config.clone();
     let net_id = req.network_id.clone();
     let n_embd = hp.n_embd;
+    let frozen = cfg.frozen_layers.clone().unwrap_or_default();
+    let stage_for_loop = stage.clone();
 
     tokio::spawn(async move {
         run_transformer_training_loop(
             app_clone, id_clone, net_id, cfg, started_at, model_arc, networks_handle,
             sequences, n_ctx, n_embd, opt_kind, batch_size,
-            training_state, cancel, rollback,
+            training_state, cancel, rollback, frozen, stage_for_loop,
         ).await;
     });
 
@@ -1215,6 +1329,8 @@ async fn run_transformer_training_loop(
     training_state: Arc<RwLock<TrainingState>>,
     cancel: Arc<AtomicBool>,
     rollback: Arc<AtomicBool>,
+    frozen_layers: Vec<String>,
+    stage: String,
 ) {
     let initial_snapshot: TransformerModel = model_arc.read().await.clone();
     let start = std::time::Instant::now();
@@ -1255,12 +1371,20 @@ async fn run_transformer_training_loop(
             let loss = {
                 let mut model = model_arc.write().await;
                 step_counter += 1;
-                neuralcabin_engine::transformer::train_step_on_device::<
+                // Snapshot frozen layers before the step. After the optimizer
+                // updates every parameter, we restore these — net effect:
+                // gradient still flows for the loss signal but weights for
+                // frozen layers don't move. Simpler and more robust than
+                // tampering with Burn's GradientsParams internals.
+                let frozen_snapshot = snapshot_frozen_layers(&model, &frozen_layers);
+                let l = neuralcabin_engine::transformer::train_step_on_device::<
                     neuralcabin_engine::GpuAutodiffBackend,
                 >(
                     &mut model, &opt_kind, step_counter,
                     &input_flat, &target_flat, b, n_ctx, &device,
-                )
+                );
+                restore_frozen_layers(&mut model, &frozen_snapshot);
+                l
             };
             if !loss.is_finite() {
                 let elapsed = start.elapsed().as_secs_f32();
@@ -1304,6 +1428,12 @@ async fn run_transformer_training_loop(
     }
     if let Some(net) = networks_handle.write().await.get_mut(&network_id) {
         net.trained = true;
+        // A successful pre-training run unlocks fine-tuning. We only set this
+        // on completion (not on cancel) — a half-finished pre-train shouldn't
+        // count, as the user can always restart it.
+        if stage == "pretrain" && epochs_completed > 0 {
+            net.pretrained = true;
+        }
     }
     let run = build_training_run_record(
         &training_id, &network_id, &cfg, started_at,
@@ -1409,6 +1539,11 @@ async fn start_training(
                     ))?
             }
             "finetune" => {
+                if !net.pretrained {
+                    return Err(
+                        "Fine-tuning requires a completed pre-training run first.".into()
+                    );
+                }
                 let pairs_in = corpus.pairs.as_ref()
                     .ok_or_else(|| "Fine-tuning stage requires input/output pairs".to_string())?;
                 if pairs_in.is_empty() {
@@ -1467,11 +1602,13 @@ async fn start_training(
     let id_clone = training_id.clone();
     let cfg = req.config.clone();
     let net_id = req.network_id.clone();
+    let stage_for_loop = corpus.stage.clone().unwrap_or_else(|| "pretrain".into());
 
     tokio::spawn(async move {
         run_training_loop(
             app, id_clone, net_id, cfg, started_at, model_arc, networks_handle,
             x, y, loss_kind, batch_size, training_state, cancel, rollback,
+            stage_for_loop,
         ).await;
         // The TrainerHandle stays in `state.trainers` so callers can still
         // query its final status. Map cleanup happens at app shutdown.
@@ -1548,6 +1685,7 @@ async fn run_training_loop(
     training_state: Arc<RwLock<TrainingState>>,
     cancel: Arc<AtomicBool>,
     rollback: Arc<AtomicBool>,
+    stage: String,
 ) {
     let n = x.rows();
     let in_dim = x.cols();
@@ -1731,6 +1869,9 @@ async fn run_training_loop(
     }
     if let Some(net) = networks_handle.write().await.get_mut(&network_id) {
         net.trained = true;
+        if stage == "pretrain" && epochs_completed > 0 {
+            net.pretrained = true;
+        }
     }
     // Record the run in history and persist everything (trained weights,
     // `trained = true` flag, and the new history entry) in one shot.

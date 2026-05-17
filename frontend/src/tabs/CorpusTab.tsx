@@ -257,6 +257,12 @@ function NextTokenCorpusEditor({ network, stats, onSaved, onError }: {
     }
   }, [stats?.vocab_mode])
 
+  // If finetune was selected but pre-training hasn't completed, snap back
+  // to pretrain — the backend would reject the save anyway.
+  useEffect(() => {
+    if (!network.pretrained && stage === 'finetune') setStage('pretrain')
+  }, [network.pretrained, stage])
+
   // ─── Pretrain: bulk file upload ───
   const onUploadText = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? [])
@@ -338,15 +344,24 @@ function NextTokenCorpusEditor({ network, stats, onSaved, onError }: {
             >Pretraining</button>
             <button
               className={stage === 'finetune' ? '' : 'secondary'}
-              onClick={() => setStage('finetune')}
-            >Fine-tuning</button>
+              onClick={() => network.pretrained && setStage('finetune')}
+              disabled={!network.pretrained}
+              title={network.pretrained
+                ? 'Fine-tune on input/output pairs'
+                : 'Complete a pre-training run before fine-tuning'}
+            >Fine-tuning {!network.pretrained && '🔒'}</button>
           </div>
         </div>
         <p className="muted" style={{ marginTop: 8 }}>
           {stage === 'pretrain'
-            ? 'Upload one or more plain-text files. The vocabulary will be built from this text and the model will learn to predict the next token from a sliding window.'
-            : 'Provide input → output pairs. The model is trained to produce the assistant output token-by-token, given the user input as context.'}
+            ? 'Upload one or more plain-text files. The vocabulary will be built from this text and the model will learn to predict the next token from a sliding window. Pre-training must complete before fine-tuning is unlocked.'
+            : 'Provide input → output pairs. The model is fine-tuned on top of the pre-trained weights — vocabulary and base representations are preserved. Use layer locking on the Training tab to freeze parts of the network.'}
         </p>
+        {!network.pretrained && (
+          <p className="muted" style={{ marginTop: 6, fontSize: 12 }}>
+            🔒 Fine-tuning is locked until a pre-training run completes. Your pre-training and fine-tuning data are saved independently — editing one doesn't erase the other.
+          </p>
+        )}
       </div>
 
       <div className="card">
